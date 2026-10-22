@@ -20,7 +20,7 @@ run() {
     status=0
     timeout 180 qemu-system-arm -M orangepi-pc -display none -monitor none \
         -serial "file:$log" -nic user -kernel "$image" -initrd "$rootfs" \
-        -append "console=uart0 minikern.halt=poweroff minikern.hangcheck=60 minikern.net=off minikern.netstat=1 minikern.cpufreq=test$1" \
+        -append "console=uart0 minikern.halt=poweroff minikern.hangcheck=60 minikern.net=off minikern.netstat=1 minikern.cpufreq=test${2:-}$1" \
         || status=$?
     cat "$log"
     [ "$status" -eq 0 ] || { echo "FAIL: qemu exited $status (124 = hang)" >&2; exit 1; }
@@ -73,5 +73,37 @@ expect "cpufreq: VDD_CPUX switches on PA10"
 expect "1008000 kHz at 1300 mV"
 expect "freqtest ok"
 echo "ok: with a supply pin, the whole published table is reached"
+
+# ── a sensor whose reading cannot be believed ──────────────────────────────
+#
+# A sensor that cannot be *read* was always treated as the worst case. A
+# sensor that answers with an impossible number was not, and that is the
+# dangerous one: this chip's conversion turns the sample from an absent or
+# unclocked block into -264 °C, and a governor that believes it goes to the
+# top of the table and stays there with nothing watching the temperature.
+#
+# The pair is what makes it a proof. A reading that is cold but **possible**
+# must still boost, or "it stayed at the bottom" would say nothing about
+# rejecting the impossible one.
+log="$tmp/cpufreq-cold.log"
+run " minikern.vddcpux=PA10" "-coldsensor"
+expect "1008000 kHz at 1300 mV"
+grep -q "rejected as impossible" "$log" &&
+    { echo "FAIL: 20 °C was rejected, and it is a temperature a board really reaches" >&2; exit 1; }
+echo "ok: a cold but possible reading still reaches the top of the table"
+
+log="$tmp/cpufreq-bad.log"
+run " minikern.vddcpux=PA10" "-badsensor"
+expect "cpufreq: critical temperature,"
+expect "rejected as impossible"
+# Under a full load, with the supply pin present, and still at the lowest
+# point: the governor refused to act on the reading rather than trusting it.
+grep -qE "cpufreq: 480000 kHz \(point 1 of 5\)" "$log" ||
+    { echo "FAIL: it did not end at the lowest point" >&2; exit 1; }
+for faster in 648000 816000 912000 1008000; do
+    grep -q "cpufreq: $faster kHz at" "$log" &&
+        { echo "FAIL: it sped up to $faster kHz on a reading no die could produce" >&2; exit 1; }
+done
+echo "ok: an impossible reading is refused, and the governor assumes the worst instead"
 
 echo PASS

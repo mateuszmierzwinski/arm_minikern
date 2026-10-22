@@ -22,4 +22,11 @@ struct thermal_port h3_thermal_port(void);
  * per reading, so one boot walks the whole policy. */
 struct thermal_port h3_thermal_fake_port(void);
 
+/* A sensor that answers with a value no silicon could produce, for proving
+ * that the governor does not act on one. `minikern.cpufreq=test-badsensor`
+ * uses it with -264000 mC, which is what this chip's conversion makes of an
+ * all-ones sample — the reading from a sensor block that is absent or has
+ * never been clocked. */
+struct thermal_port h3_thermal_nonsense_port(int32_t mC);
+
 #endif

@@ -629,6 +629,44 @@ cold to past critical. The real thing is **off unless asked for**
 (`minikern.cpufreq=on`), because an untested register write that browns out a core
 is worse than no frequency scaling.
 
+- [x] **P11.5 The clock half of the hardware path, driven for real (2026-10-22).**
+      "QEMU models neither the sensor nor the PLL" was half wrong, and the half that
+      was wrong mattered: QEMU **does** model the clock control unit
+      (`allwinner-h3-ccu`). So `minikern.cpufreq=probe` now drives the real adapter —
+      not the fake — through every published operating point and reads `PLL_CPUX`
+      back, decoding the factors: the arithmetic, the field placement, the
+      clock-source handover and each refusal are all checked against a model of the
+      block. That is the standard the EMAC driver was first held to, and it was
+      available all along.
+      **It found a real bug in the first run.** With only N varied the PLL stops at
+      768 MHz (32 × 24 MHz), so **three of this chip's five published points — 816,
+      912 and 1008 MHz — had been failing with EINVAL**, silently, for as long as the
+      adapter had existed. Nothing had caught it because the governor's tests drive a
+      *fake* clock: the policy was proved and the register arithmetic had never run.
+      K is varied as well now, smallest first, and all five points read back exactly
+      the frequency asked for.
+      Two facts about QEMU's model worth keeping: it **does** raise the PLL lock bit,
+      so the adapter's lock wait is exercised rather than merely compiled; and it
+      accepts the source switch, so the park-on-the-crystal handover is real here too.
+- [x] **P11.6 A sensor reading that cannot be believed (2026-10-22).** A sensor that
+      cannot be *read* was already treated as the worst case. One that answers with an
+      **impossible number** was not — and that is the dangerous direction: this chip's
+      conversion turns the all-ones sample of an absent or unclocked sensor block into
+      **-264 °C**, and the governor answered a reading like that by going to the top of
+      the table and staying there with nothing watching the temperature. On silicon
+      that is the difference between a throttled board and a cooked one, and it would
+      have presented as "the governor works".
+      Two guards, at the two levels that can each be wrong on their own: the adapter
+      now rejects both ends of the field (`0` and `0xfff`) as "no sensor", and the
+      governor rejects any reading outside -40…150 °C from **any** port, counts them,
+      and says so at the end of a run. A rejected reading is treated exactly as a
+      failed one: assume the worst.
+      The test is a pair, because one half alone proves nothing: a reading that is cold
+      but **possible** (20 °C) must still reach 1008 MHz, and the impossible one must
+      stay pinned at 480 MHz under a full load with the supply pin present. Both are
+      asserted, and the second checks that no faster point was ever applied rather
+      than just looking at where it ended.
+
 - [x] **P11.1 Thermal first, and the policy (2026-10-22).** `core/cpufreq.h`
       decides: temperature overrules load, a critical reading goes straight to the
       lowest point, and a hysteresis band below the throttle point stops the CPU

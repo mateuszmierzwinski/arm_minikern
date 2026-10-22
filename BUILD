@@ -970,6 +970,17 @@ sh_test(
     tags = ["manual"],
 )
 
+# P11: the real clock adapter against QEMU's clock block — the half of the
+# frequency-scaling hardware path that does have a model to judge it.
+sh_test(
+    name = "cpuclock_qemu_test",
+    size = "medium",
+    srcs = ["test/cpuclock_qemu_test.sh"],
+    args = ["$(rootpath :minikern.uImage)"],
+    data = [":minikern.uImage"],
+    tags = ["manual"],
+)
+
 # P0.9: the real boot chain from an SD-card image — the one a board uses, and
 # the one `-kernel` skips. Needs a per-machine U-Boot (scripts/build_uboot.sh),
 # whose path comes from toolchain/paths.bzl.
@@ -1289,6 +1300,7 @@ test_suite(
         ":go_abi_qemu_test",
         ":go_hello_qemu_test",
         ":cpufreq_qemu_test",
+        ":cpuclock_qemu_test",
         ":cpuoff_qemu_test",
         ":sdboot_qemu_test",
         ":entropy_qemu_test",

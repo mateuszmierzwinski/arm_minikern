@@ -58,7 +58,7 @@ Step by step: each phase in `TASKS.md` ends with something that boots and is tes
 | P7 Sockets | **Done for UDP and TCP (2026-10-21).** Go's `net` package works: UDP both ways, TCP active and passive open, and a complete HTTP exchange (client *and* server) inside the guest. |
 | P10 SMP | **Done, and idle cores can power off (2026-10-22).** All four Cortex-A7s run user code. One ticket spinlock around the kernel (`kernel/klock.h`) replaces "IRQs masked = locked", taken at `trap_dispatch` and released at `trap_exit`; each core initialises what is its own (vector table, interrupt interface, tick, VFP, address-space regime); TLB maintenance is the broadcast form. Go sees four CPUs and uses them: 4× the work in 1.6× the time, with every core showing kernel entries. With `minikern.cpuoff=1` an idle core powers itself off (PSCI `CPU_OFF`) and is started again when work appears, which on this chip saves more than stepping the clock; the boot core never parks, so a wake that races a power-off is always retried. Seven single-core assumptions turned out to be bugs — they are listed in TASKS.md P10.3, and `minikern.hangcheck` exists because the last one was invisible without it. |
 | P8 fork/exec | **Done (2026-10-22).** Go's `os/exec` runs programs: `clone(CLONE_VM\|CLONE_VFORK)`, own pipes, `execve`, `wait4`, zombies that keep an exit status for their parent. Measured from a real Go binary rather than guessed, including that refusing `CLONE_PIDFD` makes Go fall back on its own. |
-| P11 Thermal/DVFS | **Policy done, idle power done, hardware unverifiable here (2026-10-22).** A pure, host-tested policy (temperature overrules load, hysteresis against flapping) and a governor driven through ports, proved end to end against a ramping fake sensor (`minikern.cpufreq=test`). The H3 sensor and PLL adapters have **never run on silicon** — QEMU models neither — so the real path is off unless `minikern.cpufreq=on`. |
+| P11 Thermal/DVFS | **Policy done, idle power done, the clock adapter driven for real (2026-10-22).** A pure, host-tested policy (temperature overrules load, hysteresis against flapping) and a governor driven through ports, proved end to end against a ramping fake sensor. QEMU **does** model the clock block, so `minikern.cpufreq=probe` drives the real adapter through every operating point and reads `PLL_CPUX` back — which caught three of five published points failing with EINVAL, because varying only N stops at 768 MHz. The **thermal sensor and the regulator pin have no model**, so they remain the board's to settle; a reading that is impossible is now refused rather than believed. |
 | P9 Storage | **NBD, and XFS a program can actually use (2026-10-22): reading, formatting, logged writes, creating files, growing them and removing them.** Our own NBD client over our own TCP, a buffer cache, `/dev/nbd0`, a Go NBD server in-tree — and an XFS v5 reader that mounts filesystems Linux made, lists every directory shape and reads files byte for byte, refusing every feature it does not fully understand and every dirty log. A Go program formats a volume over the network (`userland/internal/xfsmk`) and `mount("/dev/nbd0", "/mnt", "xfs", …)` mounts it; `xfs_repair` finds nothing wrong with what the board writes (`XFS.md`). |
 
 A Go program on the board can now also reach a **network block device** and
@@ -67,7 +67,7 @@ the filesystem one `mkfs.xfs` made — and a write that grows a file into blocks
 it already owns goes through the **log**, as a transaction `xfs_logprint`
 decodes field by field (XFS.md §9).
 
-**The goal is met in QEMU:** a standard `GOOS=linux GOARCH=arm` Go binary, and a TinyGo one, run unchanged on a kernel that copies no Linux code — and a Go program can now fetch its own root filesystem over the network and talk TCP and UDP. 62 Bazel test targets prove it on every change.
+**The goal is met in QEMU:** a standard `GOOS=linux GOARCH=arm` Go binary, and a TinyGo one, run unchanged on a kernel that copies no Linux code — and a Go program can now fetch its own root filesystem over the network and talk TCP and UDP. 63 Bazel test targets prove it on every change.
 
 ---
 
@@ -233,6 +233,7 @@ green. `:qemu_tests` is a `test_suite` naming them all:
 | `entropy_qemu_test` | two boots of one image produce different random bytes |
 | `cpuoff_qemu_test` | idle cores power themselves off and come back, four cores still offered, same result |
 | `cpufreq_qemu_test` | P11: the governor against a ramping fake sensor, with and without a supply pin |
+| `cpuclock_qemu_test` | P11: the **real** clock adapter against QEMU's clock block — every operating point set and read back from `PLL_CPUX`, and every refusal |
 | `sdboot_qemu_test` | P0.9: the real chain — BROM → SPL → U-Boot → `boot.scr` → `bootm` with U-Boot's device tree → a Go program from the ramdisk, all from the card image that would be written to a board |
 
 **Userland programs** live in `userland/cmd/<name>/main.go` and build with rules_go
@@ -250,7 +251,7 @@ Kernel command line (all optional):
 | `minikern.strace=1` | log every syscall with its arguments and result |
 | `minikern.epoch=<seconds>` | the wall clock at boot (default 0: there is no RTC driver yet) |
 | `minikern.selftest=undef\|dabt\|pabt\|dma-alias\|wedge` | take that exception, or wedge the kernel on purpose |
-| `minikern.cpufreq=on\|test` | run the frequency governor against the real hardware, or against a fake sensor that ramps (the real path has never run on silicon) |
+| `minikern.cpufreq=on\|test\|probe\|test-coldsensor\|test-badsensor` | run the governor against the real hardware, or a fake sensor that ramps; `probe` drives the **real clock adapter** through every operating point and reads the PLL back (QEMU models the clock block); the two sensor modes answer with a cold-but-possible and an impossible reading |
 | `minikern.vddcpux=<pin>` | the pin that switches VDD_CPUX, e.g. `PA10` — without it the operating points above 816 MHz are not offered |
 | `minikern.watchdog=<seconds>` | reboot the board if the kernel stops ticking for that long |
 | `minikern.net=off` | leave the network down |
@@ -646,6 +647,20 @@ syscall interface above. No `/proc/sys` tree is wanted.
   `test/tools/netecho`, a Go program, and verify the host side independently first.
 - **`filter-dump` cannot attach to a board's built-in NIC**, so there is no easy
   pcap of the EMAC. `minikern.netstat=1` and the TCP counters exist for that reason.
+- **A fake proves the policy and nothing about the registers.** The frequency
+  governor was tested end to end against a fake clock, so the policy was right and
+  the adapter's arithmetic had never run: varying only N caps `PLL_CPUX` at 768 MHz,
+  and **three of the chip's five published operating points had been failing with
+  EINVAL** the whole time. Nothing noticed because nothing had ever driven the real
+  port. QEMU models the clock block (`allwinner-h3-ccu`), so it could have been
+  caught from the first day — `info qtree` before assuming a device is absent, which
+  is the same lesson the watchdog taught.
+- **Worst-case handling has to cover a reading that is wrong, not just one that is
+  missing.** A sensor that could not be read was treated as critical; a sensor that
+  answered with an impossible number was believed. This chip's conversion turns the
+  all-ones sample of an absent or unclocked sensor into **-264 °C**, which the
+  governor answered by going to the top of the table with nothing watching the
+  temperature — and it would have looked exactly like a working governor.
 - **Zeroing memory is a cache operation.** `dma_init` took its 1 MiB window from
   `page_alloc`, which zeroes through the kernel's **cacheable** linear map, and then
   mapped the same physical memory non-cacheable for the EMAC. Nothing cleaned the

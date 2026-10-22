@@ -3,6 +3,7 @@
 #include "arch/arm/layout.h"
 #include "board/h3/h3.h"
 #include "board/h3/pio.h"
+#include "core/console.h"
 #include "core/errno.h"
 
 /* PLL_CPUX and the CPU clock source. Datasheet addresses, **never run on
@@ -35,16 +36,33 @@ static volatile uint32_t *ccu(uint32_t off) {
     return (volatile uint32_t *)io_virt(H3_CCU_BASE + off);
 }
 
-/* n, k, m and p for a frequency, as PLL_CPUX = 24 MHz * N * K / (M * P).
- * Only N is varied: every published H3 point is a multiple of 24 MHz, so
- * k = m = 1 and p = 1 reach all of them, and a single varying factor cannot
- * produce an out-of-range intermediate frequency. */
-static int pll_factors(uint32_t khz, uint32_t *n) {
+/* N and K for a frequency, as PLL_CPUX = 24 MHz * N * K (M and P left at 1).
+ *
+ * **N alone is not enough**, which is what `minikern.cpufreq=probe` was
+ * written to find out and found immediately: N tops out at 32, so 24 MHz * N
+ * reaches 768 MHz, and three of this chip's five published points —  816,
+ * 912 and 1008 MHz — are above that. They had all been failing with EINVAL,
+ * invisibly, because the governor's tests drive a fake adapter and nothing
+ * had ever run this arithmetic against the register it writes.
+ *
+ * K is tried in ascending order, so the smallest multiplier that brings N
+ * into range is the one used and the common points keep the factors they
+ * had. M and P stay at 1: a divider that is never anything but 1 cannot
+ * produce an out-of-range intermediate frequency while the PLL settles. */
+static int pll_factors(uint32_t khz, uint32_t *n, uint32_t *k) {
+    uint32_t product;
     if (khz < OSC_KHZ || khz % OSC_KHZ != 0) {
         return KERR_INVAL;
     }
-    *n = khz / OSC_KHZ;
-    return *n >= 1u && *n <= 32u ? KERR_OK : KERR_INVAL;
+    product = khz / OSC_KHZ; /* N * K */
+    for (uint32_t try_k = 1; try_k <= 4u; try_k++) {
+        if (product % try_k == 0 && product / try_k >= 1u && product / try_k <= 32u) {
+            *n = product / try_k;
+            *k = try_k;
+            return KERR_OK;
+        }
+    }
+    return KERR_INVAL;
 }
 
 /* Waits for the PLL to report lock. A PLL that never locks must not be
@@ -104,8 +122,8 @@ static bool can_supply(uint32_t mv) {
  * cores on the crystal if the caller forgot the second half (Rule 11,
  * Control flow). */
 static int cpux_set(void *self, uint32_t khz, uint32_t mv) {
-    uint32_t n = 0, ctrl;
-    int rc = pll_factors(khz, &n);
+    uint32_t n = 0, k = 1, ctrl;
+    int rc = pll_factors(khz, &n, &k);
     (void)self;
     if (rc != KERR_OK) {
         return rc;
@@ -119,7 +137,7 @@ static int cpux_set(void *self, uint32_t khz, uint32_t mv) {
     cpu_source(CPU_SRC_OSC24);
     ctrl = *ccu(PLL_CPUX_CTRL);
     ctrl &= ~((31u << PLL_N_SHIFT) | (3u << PLL_K_SHIFT) | (3u << PLL_M_SHIFT) | (3u << PLL_P_SHIFT));
-    ctrl |= ((n - 1u) << PLL_N_SHIFT) | PLL_ENABLE;
+    ctrl |= ((n - 1u) << PLL_N_SHIFT) | ((k - 1u) << PLL_K_SHIFT) | PLL_ENABLE;
     *ccu(PLL_CPUX_CTRL) = ctrl;
     rc = pll_wait_lock();
     if (rc != KERR_OK) {
@@ -131,6 +149,37 @@ static int cpux_set(void *self, uint32_t khz, uint32_t mv) {
         set_supply(VDD_LOW_MV); /* down after the frequency */
     }
     return KERR_OK;
+}
+
+/* What the PLL register says it is set to, decoded back into kHz.
+ *
+ * PLL_CPUX = 24 MHz * N * K / (M * P), with every field stored one less
+ * than its value except P, which is a shift. Reading it back is the only
+ * way to check that a write landed where it was aimed. */
+static uint32_t pll_khz_from(uint32_t ctrl) {
+    uint32_t n = ((ctrl >> PLL_N_SHIFT) & 31u) + 1u;
+    uint32_t k = ((ctrl >> PLL_K_SHIFT) & 3u) + 1u;
+    uint32_t m = ((ctrl >> PLL_M_SHIFT) & 3u) + 1u;
+    uint32_t pdiv = 1u << ((ctrl >> PLL_P_SHIFT) & 3u);
+    return OSC_KHZ * n * k / (m * pdiv);
+}
+
+void h3_cpuclock_probe(const uint32_t *khz, const uint32_t *mv, uint32_t n) {
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t ctrl;
+        int rc = cpux_set(NULL, khz[i], mv[i]);
+        ctrl = *ccu(PLL_CPUX_CTRL);
+        kprintf("cpuclock: asked %u kHz at %u mV -> %d, pll ctrl %08x = %u kHz, src %u, enabled %u, locked %u\n",
+                khz[i], mv[i], rc, ctrl, pll_khz_from(ctrl),
+                (*ccu(CPU_AXI_CFG) >> CPU_SRC_SHIFT) & 3u, (ctrl & PLL_ENABLE) != 0 ? 1u : 0u,
+                (ctrl & PLL_LOCK) != 0 ? 1u : 0u);
+    }
+    /* The refusals, which are as much a part of the adapter as the writes:
+     * below the crystal, not a multiple of it, and past what N and K
+     * together can reach (32 * 4 * 24 MHz = 3072 MHz). */
+    kprintf("cpuclock: 12000 kHz (below the crystal) -> %d\n", cpux_set(NULL, 12000, 1040));
+    kprintf("cpuclock: 500000 kHz (not a multiple of 24 MHz) -> %d\n", cpux_set(NULL, 500000, 1040));
+    kprintf("cpuclock: 3096000 kHz (no N and K reach it) -> %d\n", cpux_set(NULL, 3096000, 1300));
 }
 
 struct cpuclock_port h3_cpuclock_port(void) {

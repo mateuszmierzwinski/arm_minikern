@@ -46,8 +46,16 @@ static int32_t raw_to_mC(uint32_t raw) {
 static int ths_read(void *self, int32_t *mC) {
     uint32_t raw = *ths(THS_DATA0) & THS_DATA_MASK;
     (void)self;
-    if (raw == 0) {
-        return KERR_AGAIN; /* no sample yet: not a temperature */
+    /* Both ends of the field mean "no sensor", not a temperature. Zero is a
+     * block that has not sampled yet; all ones is one that is **not there**
+     * — unclocked, held in reset, or absent from the model you are running
+     * on — and through this chip's formula that reads as -264 °C, which the
+     * governor would act on by boosting to the top point with no thermal
+     * protection at all. A sensor whose reading cannot be believed must
+     * report a failure, which the governor already treats as the worst
+     * case (kernel/thermal.c). */
+    if (raw == 0 || raw == THS_DATA_MASK) {
+        return KERR_AGAIN;
     }
     *mC = raw_to_mC(raw);
     return KERR_OK;
@@ -75,6 +83,25 @@ static struct {
     int32_t mC;
     bool falling;
 } ramp = {.mC = FAKE_FLOOR_mC};
+
+/* A fake that answers with a reading no silicon could produce, which is what
+ * a sensor block that is absent or unclocked actually gives: this chip's
+ * formula turns an all-ones sample into -264 °C. It exists so that a test
+ * can prove the governor refuses to act on it rather than boosting to the
+ * top of the table with nothing watching the temperature. */
+static int32_t nonsense_mC = 0;
+
+static int nonsense_read(void *self, int32_t *mC) {
+    (void)self;
+    *mC = nonsense_mC;
+    return KERR_OK;
+}
+
+struct thermal_port h3_thermal_nonsense_port(int32_t mC) {
+    struct thermal_port p = {.read_mC = nonsense_read, .self = NULL};
+    nonsense_mC = mC;
+    return p;
+}
 
 static int fake_read(void *self, int32_t *mC) {
     (void)self;

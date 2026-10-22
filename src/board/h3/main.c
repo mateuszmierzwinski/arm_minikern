@@ -531,17 +531,52 @@ static bool use_vdd_pin(bool drive) {
  * runs the same governor and policy against a ramping fake sensor, which
  * proves everything except the two register writes; `on` drives the real
  * hardware and wants the board in front of you. */
+/* Drives the real clock adapter through every point and prints what the
+ * registers took (`minikern.cpufreq=probe`).
+ *
+ * This is the clock half of the hardware path, and QEMU's CCU model can
+ * judge it: the factor arithmetic, the field placement, the source handover
+ * and the refusals are all real writes to a real model of the block. The
+ * sensor and the regulator pin have no model, so they stay the board's to
+ * settle (board/h3/cpux.h). */
+static void probe_cpuclock(void) {
+    struct cpufreq_policy policy = h3_cpu_policy(use_vdd_pin(true));
+    uint32_t khz[CPUFREQ_MAX_OPPS], mv[CPUFREQ_MAX_OPPS];
+    for (uint32_t i = 0; i < policy.nopps; i++) {
+        khz[i] = policy.opps[i].khz;
+        mv[i] = policy.opps[i].mv;
+    }
+    kprintf("cpuclock: probing %u points through the real adapter\n", policy.nopps);
+    h3_cpuclock_probe(khz, mv, policy.nopps);
+    kprintf("cpuclock: probe done\n");
+}
+
 static void bring_up_cpufreq(void) {
     struct cpufreq_policy policy;
     struct thermal_port sensor;
     struct cpuclock_port clock;
-    bool fake = cmdline_equals(boot_cmdline, "minikern.cpufreq", "test");
+    bool bad = cmdline_equals(boot_cmdline, "minikern.cpufreq", "test-badsensor");
+    /* The other half of the pair: a reading that is cold but **possible**.
+     * It must still boost, or "it stayed at the bottom" would prove nothing
+     * about rejecting the impossible one. */
+    bool cold = cmdline_equals(boot_cmdline, "minikern.cpufreq", "test-coldsensor");
+    bool fake = bad || cold || cmdline_equals(boot_cmdline, "minikern.cpufreq", "test");
     int rc;
+    if (cmdline_equals(boot_cmdline, "minikern.cpufreq", "probe")) {
+        probe_cpuclock();
+        return;
+    }
     if (!fake && !cmdline_equals(boot_cmdline, "minikern.cpufreq", "on")) {
         return;
     }
     policy = h3_cpu_policy(use_vdd_pin(!fake));
-    sensor = fake ? h3_thermal_fake_port() : h3_thermal_port();
+    /* -264000 mC is not a choice of test value: it is what this chip's
+     * conversion makes of the sample an absent or unclocked sensor gives
+     * (board/h3/ths.h). */
+    sensor = bad ? h3_thermal_nonsense_port(-264000)
+           : cold ? h3_thermal_nonsense_port(20000)
+           : fake ? h3_thermal_fake_port()
+                  : h3_thermal_port();
     clock = fake ? h3_cpuclock_fake_port() : h3_cpuclock_port();
     rc = thermal_start(&sensor, &clock, &policy, CPUFREQ_INTERVAL_MS);
     kprintf("cpufreq: %s governor %s\n", fake ? "test" : "hardware",
@@ -559,6 +594,10 @@ static void init_exited(void *self, const struct proc *p) {
         knet_report();
         knbd_report();
         klock_report();
+        if (thermal_unbelievable_readings() > 0) {
+            kprintf("cpufreq: %u sensor readings rejected as impossible; the governor assumed the worst\n",
+                    thermal_unbelievable_readings());
+        }
         thermal_report();
     }
     if ((p->exit_status & 0x7f) != 0) {

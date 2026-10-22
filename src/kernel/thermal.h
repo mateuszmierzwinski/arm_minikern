@@ -38,4 +38,10 @@ void thermal_state(int32_t *temp_mC, uint32_t *khz, uint32_t *opp);
 /* Prints where the governor is, like the other report functions. */
 void thermal_report(void);
 
+/* How many sensor readings have been rejected as impossible. A board that
+ * reports any of these has a sensor that is not wired, not clocked or not
+ * calibrated, and has been running on the worst-case assumption since the
+ * first one — which is safe, and worth saying out loud. */
+uint32_t thermal_unbelievable_readings(void);
+
 #endif

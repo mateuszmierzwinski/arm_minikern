@@ -17,6 +17,7 @@ static struct {
     uint32_t total_ticks;
     uint32_t opp;
     int32_t temp_mC;
+    uint32_t unbelievable; /* readings no die could produce (see plausible) */
     bool running;
     bool critical;        /* already reported: a hot chip must not flood the log */
 } gov;
@@ -60,12 +61,28 @@ static void report_if_critical(enum cpufreq_reason why) {
     }
 }
 
+/* True when a reading could have come from a real die.
+ *
+ * A read that *fails* was always treated as the worst case; a read that
+ * **succeeds with an impossible number** was not, and that is the dangerous
+ * one: this chip's conversion turns the sample from an absent or unclocked
+ * sensor into -264 °C, and the governor would have answered that by going to
+ * the top of the table and leaving it there with nothing watching the
+ * temperature. The band is deliberately wide — a board can legitimately be
+ * cold — and only excludes what no silicon reports. */
+static bool plausible(int32_t mC) {
+    return mC > -40000 && mC < 150000;
+}
+
 void thermal_step(void) {
     enum cpufreq_reason why;
     uint32_t want;
-    if (gov.sensor.read_mC(gov.sensor.self, &gov.temp_mC) != KERR_OK) {
-        /* A sensor that cannot be read is treated as the worst case: the
-         * one thing worse than throttling needlessly is not throttling. */
+    if (gov.sensor.read_mC(gov.sensor.self, &gov.temp_mC) != KERR_OK ||
+        !plausible(gov.temp_mC)) {
+        /* A sensor that cannot be read, or cannot be believed, is treated as
+         * the worst case: the one thing worse than throttling needlessly is
+         * not throttling. */
+        gov.unbelievable += plausible(gov.temp_mC) ? 0u : 1u;
         gov.temp_mC = gov.policy.critical_mC;
     }
     want = cpufreq_decide(&gov.policy, gov.opp, gov.temp_mC, load_pct(), &why);
@@ -87,6 +104,10 @@ static void on_tick(void *self, uint64_t now_ns) {
         gov.ticks_left = gov.interval_ms;
         thermal_step();
     }
+}
+
+uint32_t thermal_unbelievable_readings(void) {
+    return gov.unbelievable;
 }
 
 int thermal_start(const struct thermal_port *sensor, const struct cpuclock_port *clock,
