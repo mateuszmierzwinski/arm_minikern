@@ -243,6 +243,7 @@ Kernel command line (all optional):
 | `minikern.selftest=undef\|dabt\|pabt` | take that exception on purpose |
 | `minikern.net=off` | leave the network down |
 | `minikern.netboot[=<ip>]` | fetch the root filesystem over the network; with an address, probe only that one and never sweep |
+| `minikern.rootfs.sha256=<hex>` | accept only a netbooted root filesystem with this digest, refusing every other offer — so answering the sweep first decides nothing |
 | `minikern.nbd=<ip>[:<port>][/<export>]` | attach a network block device as `/dev/nbd0` before init runs (port 10809 by default) |
 | `minikern.dns=<ip>` | the resolver `/etc/resolv.conf` should name, instead of the lease's |
 | `minikern.hangcheck=<seconds>` | panic with the task table when every core has been idle this long and something is still asleep — a lost wakeup reported instead of a silent hang |
@@ -651,6 +652,13 @@ syscall interface above. No `/proc/sys` tree is wanted.
   mapping for the physical address it is entered at. It gets its own table
   (`smp_l1`), mapping RAM identically and high, and joins the kernel's regime
   after the jump.
+- **A check against random data must compare, not inspect.** The XFS write test
+  asserted that the sixteen bytes before its range did not *contain* the byte it
+  was about to write — over random file contents, which is a one-in-sixteen
+  failure for no reason, and the NBD test had made the same mistake before it.
+  Record the neighbours first and assert they are **unchanged**. Both were caught
+  by running the suite in the exported tree (§11) rather than by the monorepo,
+  because a fresh random file is what finally hits a 6% flake.
 - **A test that does nothing must not pass.** `net_sanitized_test.sh` found its
   include roots by walking up to a directory named `minikern`, and picked the test
   mains out of its arguments with `/test/`. Both assumed the monorepo's path.

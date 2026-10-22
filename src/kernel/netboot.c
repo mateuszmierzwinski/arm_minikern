@@ -81,6 +81,11 @@ static uint8_t *reserve_image(void) {
 }
 
 /* Starts a session with everything it needs. */
+/* The pin, kept here until a session exists to apply it to: netboot_start
+ * clears the session, so handing it the digest earlier would lose it. */
+static uint8_t expected[32];
+static bool expected_set;
+
 static int begin(struct netif *nif, const uint32_t board_id[4], ip4_t pinned, uint8_t *buf) {
     uint8_t id[MKNB_BOARD_ID];
     uint32_t xid;
@@ -89,7 +94,38 @@ static int begin(struct netif *nif, const uint32_t board_id[4], ip4_t pinned, ui
     random_fill(&xid, sizeof xid);
     kprintf("netboot: looking for a server %s\n",
             pinned != 0 ? ip4_format(pinned, ip) : "on the local subnet (unicast sweep)");
-    return netboot_start(&client, nif, buf, IMAGE_CAPACITY, bitmap, xid, nif->mac, id, pinned);
+    int rc = netboot_start(&client, nif, buf, IMAGE_CAPACITY, bitmap, xid, nif->mac, id, pinned);
+    if (rc == KERR_OK && expected_set) {
+        netboot_expect_digest(&client, expected); /* after the start, which clears the session */
+    }
+    return rc;
+}
+
+/* One hex digit, or -1. */
+static int unhex(char c) {
+    if (c >= '0' && c <= '9') {
+        return c - '0';
+    }
+    if (c >= 'a' && c <= 'f') {
+        return c - 'a' + 10;
+    }
+    return c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+}
+
+int knetboot_expect(const char *hex, size_t len) {
+    uint8_t *digest = expected;
+    if (len != 64u) {
+        return KERR_INVAL;
+    }
+    for (uint32_t i = 0; i < 32u; i++) {
+        int hi = unhex(hex[i * 2u]), lo = unhex(hex[i * 2u + 1u]);
+        if (hi < 0 || lo < 0) {
+            return KERR_INVAL;
+        }
+        digest[i] = (uint8_t)((hi << 4) | lo);
+    }
+    expected_set = true;
+    return KERR_OK;
 }
 
 int knetboot_fetch(const uint32_t board_id[4], ip4_t pinned, const uint8_t **image, uint32_t *len) {

@@ -190,6 +190,13 @@ static void take_offer(struct netboot *nb, const struct udp_datagram *d, uint32_
         fail(nb, NETBOOT_ERR_TOO_BIG);
         return;
     }
+    if (nb->pinned_digest && !sha256_equal(body + 4, nb->expected)) {
+        /* Not the image this board accepts. Refusing the offer rather than
+         * the transfer means the sweep carries on, so answering first buys
+         * an impostor nothing at all. */
+        nb->stats.offers_refused++;
+        return;
+    }
     nb->server = d->src;
     nb->image_len = len;
     nb->blocks = (len + MKNB_BLOCK - 1u) / MKNB_BLOCK;
@@ -341,4 +348,9 @@ const char *netboot_error_text(enum netboot_error e) {
     static const char *const texts[] = {"none", "no server answered", "image too large for the buffer",
                                         "digest mismatch", "transfer timed out", "the server refused"};
     return e <= NETBOOT_ERR_SERVER ? texts[e] : "?";
+}
+
+void netboot_expect_digest(struct netboot *nb, const uint8_t digest[32]) {
+    net_copy(nb->expected, digest, 32);
+    nb->pinned_digest = true;
 }

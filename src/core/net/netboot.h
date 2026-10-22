@@ -98,6 +98,8 @@ struct netboot {
     uint32_t blocks;
     uint32_t have;
     uint8_t digest[32];
+    uint8_t expected[32];       /* the only image this board will accept */
+    bool pinned_digest;         /* ...when one was given */
     uint32_t *bitmap;           /* one bit per block, the caller's */
     uint32_t window_base;
     uint32_t window_end;
@@ -116,6 +118,23 @@ struct netboot {
  * error. */
 int netboot_start(struct netboot *nb, struct netif *nif, uint8_t *image, uint32_t capacity, uint32_t *bitmap,
                   uint32_t xid, const uint8_t mac[ETH_ALEN], const uint8_t board_id[MKNB_BOARD_ID], ip4_t pinned);
+
+/* Accepts only an image with this digest.
+ *
+ * The digest in an offer proves the *transfer*, not the server: it is the
+ * server's own claim about what it is about to send, so a machine that
+ * answers the sweep first decides what the board runs. Pinning the digest
+ * the board expects closes that, and closes it **at the offer** rather than
+ * after the transfer — so a rogue server cannot deny service either; the
+ * board refuses its offer and goes on sweeping for one it will accept.
+ *
+ * What this is not is a signature: it pins one image rather than
+ * authenticating a server, so a new root filesystem means a new pin. An
+ * Ed25519 signature over the offer is the next step and would let the
+ * server change what it serves (TASKS.md P5.5).
+ *
+ * **Called after `netboot_start`**, which begins a session by clearing it. */
+void netboot_expect_digest(struct netboot *nb, const uint8_t digest[32]);
 
 /* Drives the sweep, the window re-requests and the deadline. */
 void netboot_tick(struct netboot *nb, uint64_t now_ms);

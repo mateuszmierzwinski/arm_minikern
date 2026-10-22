@@ -82,7 +82,7 @@ func writePhase() {
 // The file the host made, and what this writes into it.
 const (
 	target    = mount + "/data.bin"
-	writeAt   = 4096
+	writeAt   = int64(4096)
 	writeByte = 0x7e
 	writeLen  = 40000
 	// The host made the file 262000 bytes, which is not a whole number of
@@ -106,12 +106,35 @@ func readExisting() error {
 	return nil
 }
 
+// neighbours holds the bytes on either side of the range about to be
+// written, read before the write happens.
+//
+// They are **compared**, not inspected for the written byte: the file is
+// random, so asserting that sixteen random bytes do not happen to contain
+// 0x7e is a test that fails about one run in sixteen for no reason — which
+// it duly did. What matters is that they did not change.
+var neighbours struct {
+	before [16]byte
+	after  [16]byte
+}
+
+func recordNeighbours(f *os.File) error {
+	if _, err := f.ReadAt(neighbours.before[:], writeAt-int64(len(neighbours.before))); err != nil {
+		return err
+	}
+	_, err := f.ReadAt(neighbours.after[:], writeAt+writeLen)
+	return err
+}
+
 func writeData() error {
 	f, err := os.OpenFile(target, os.O_RDWR, 0)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = f.Close() }()
+	if err = recordNeighbours(f); err != nil {
+		return err
+	}
 	block := bytes.Repeat([]byte{writeByte}, writeLen)
 	if _, err := f.WriteAt(block, writeAt); err != nil {
 		return err
@@ -127,24 +150,21 @@ func readBack() error {
 		return err
 	}
 	defer func() { _ = f.Close() }()
-	buf := make([]byte, writeLen+32)
-	if _, err := f.ReadAt(buf, writeAt-16); err != nil {
+	const edge = 16
+	buf := make([]byte, writeLen+2*edge)
+	if _, err := f.ReadAt(buf, writeAt-edge); err != nil {
 		return err
 	}
-	for i := 0; i < 16; i++ {
-		if buf[i] == writeByte {
-			return fmt.Errorf("the write reached %d bytes before its start", 16-i)
-		}
+	if !bytes.Equal(buf[:edge], neighbours.before[:]) {
+		return fmt.Errorf("the write changed the bytes before its start")
 	}
-	for i := 16; i < 16+writeLen; i++ {
+	for i := edge; i < edge+writeLen; i++ {
 		if buf[i] != writeByte {
-			return fmt.Errorf("byte %d of the write is %#02x", i-16, buf[i])
+			return fmt.Errorf("byte %d of the write is %#02x", i-edge, buf[i])
 		}
 	}
-	for i := 16 + writeLen; i < len(buf); i++ {
-		if buf[i] == writeByte {
-			return fmt.Errorf("the write reached past its end")
-		}
+	if !bytes.Equal(buf[edge+writeLen:], neighbours.after[:]) {
+		return fmt.Errorf("the write changed the bytes past its end")
 	}
 	return nil
 }

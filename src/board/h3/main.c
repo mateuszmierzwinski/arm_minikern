@@ -408,6 +408,25 @@ static void init_path(char *path, uint32_t cap) {
     path[n < cap ? n : cap - 1] = '\0';
 }
 
+/* Applies minikern.rootfs.sha256, if it is there.
+ *
+ * A pin that cannot be parsed stops the boot rather than being ignored: the
+ * whole point of it is that this board runs one known image, and a boot that
+ * looked protected and was not would be worse than no pin. */
+static bool pin_root_digest(void) {
+    size_t len = 0;
+    const char *v = cmdline_value(boot_cmdline, "minikern.rootfs.sha256", &len);
+    if (v == NULL) {
+        return true;
+    }
+    if (knetboot_expect(v, len) != KERR_OK) {
+        kprintf("netboot: minikern.rootfs.sha256 must be 64 hex characters, refusing to boot\n");
+        return false;
+    }
+    kprintf("netboot: accepting only the image whose sha256 is %.*s\n", (int)len, v);
+    return true;
+}
+
 /* The root filesystem: the netbooted one when minikern.netboot asked for
  * it and it arrived, else the initrd the loader passed. Returns false when
  * there is no root to mount. */
@@ -418,6 +437,9 @@ static bool mount_root(const struct bootinfo *info) {
     uint32_t bytes;
     ip4_t pinned = 0;
     if (v != NULL && (len == 0 || ip4_parse(v, (uint32_t)len, &pinned) == KERR_OK)) {
+        if (!pin_root_digest()) {
+            return false; /* the pin was asked for and is unusable: do not boot */
+        }
         if (knetboot_fetch(chip_id, pinned, &image, &bytes) == KERR_OK) {
             vfs_mount_root(image, bytes);
             return true;

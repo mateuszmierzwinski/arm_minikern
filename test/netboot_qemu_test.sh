@@ -33,9 +33,15 @@ for _ in $(seq 1 50); do
     sleep 0.1
 done
 
+# The digest of the image the server will offer. Pinning it is what stops
+# the first machine to answer the sweep deciding what the board runs, so the
+# ordinary path is tested **with** the pin: it must change nothing.
+digest="$(sha256sum "$images/default.tar" | cut -d" " -f1)"
+
 status=0
 timeout 120 qemu-system-arm -M orangepi-pc -display none -monitor none -serial "file:$log" \
-    -nic user -kernel "$image" -append "console=uart0 minikern.netboot minikern.halt=poweroff" || status=$?
+    -nic user -kernel "$image" \
+    -append "console=uart0 minikern.netboot minikern.halt=poweroff minikern.rootfs.sha256=$digest" || status=$?
 
 fail() {
     echo "---- console"; cat "$log" 2>/dev/null || true
@@ -57,6 +63,26 @@ expect "netbooted init running on gc"
 expect 'motd: "hello from the tar root"'
 expect "NETBOOT INIT OK"
 expect "init exited with status 0"
+expect "netboot: accepting only the image whose sha256 is $digest"
+
+# And the attack it exists for: an offer of anything else is refused at the
+# offer, so nothing is fetched and nothing is mounted. The board is told the
+# digest of an image that is not the one on offer, which is indistinguishable
+# from an impostor answering the sweep.
+wrong="0000000000000000000000000000000000000000000000000000000000000000"
+log2="$tmp/console-wrong.log"
+status=0
+timeout 120 qemu-system-arm -M orangepi-pc -display none -monitor none -serial "file:$log2" \
+    -nic user -kernel "$image" \
+    -append "console=uart0 minikern.netboot minikern.halt=poweroff minikern.rootfs.sha256=$wrong" || status=$?
+echo "---- console (a pin that matches nothing on offer)"
+cat "$log2"
+[ "$status" -eq 0 ] || { echo "FAIL: qemu exited $status with the wrong pin" >&2; exit 1; }
+grep -q "netbooted init running" "$log2" &&
+    { echo "FAIL: the board ran an image whose digest it was not expecting" >&2; exit 1; }
+grep -qE "netboot: (giving up|falling back)" "$log2" ||
+    { echo "FAIL: the board did not report refusing every offer" >&2; exit 1; }
+echo "ok: an image the board was not expecting was refused at the offer"
 ! grep -qF "PANIC" "$log" || fail "the kernel panicked"
 ! grep -qF "falling back" "$log" || fail "netboot failed and fell back to an initrd"
 ! grep -qF "digest" "$log" || fail "a digest problem was reported"

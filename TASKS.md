@@ -150,10 +150,24 @@ Legend: `[x]` done · `[ ]` to do · `[~]` partial
       abandons a server that offers and then stalls, and falls back to the initrd.
 - [x] **P5.4 End-to-end test**, `netboot_qemu_test`: the real server on the host, the
       board with no initrd at all, a Go init running from the fetched archive.
-- [ ] **P5.5 Signing.** The digest proves the transfer, not the server: the first
-      machine to answer the sweep decides what the board runs. Carry an Ed25519
-      signature over (xid, length, digest) in the OFFER and ship the public key in
-      the kernel. Until then netboot is for a network you control (NETBOOT.md §5).
+- [~] **P5.5 Who decides what the board runs.**
+      - [x] **A pinned root digest (2026-10-22).** `minikern.rootfs.sha256=<hex>`
+            accepts only the image with that digest, and refuses every other
+            **at the offer** — so a machine that answers the sweep first cannot
+            substitute an image *or* deny service: the board refuses it and goes
+            on sweeping. Proved both ways on the board: with the right pin the
+            ordinary path is unchanged (8 offers, 1740 blocks), with a wrong one
+            763 probes bring 0 offers accepted and 7 refused, and it falls back to
+            the initrd. A pin that will not parse **stops the boot** rather than
+            being ignored, because a boot that looked protected and was not would
+            be worse than no pin.
+      - [ ] **An Ed25519 signature over the offer**, which is the thing a pin is
+            not: it authenticates the *server* rather than one image, so the
+            server can change what it serves without every board being
+            reconfigured. It needs Ed25519 verification written from scratch here
+            (SHA-512 and the field arithmetic), with RFC 8032's vectors as the
+            judge. The pin is what makes that a convenience rather than a
+            prerequisite.
 - [ ] P5.6 Two-QEMU test over `-netdev socket,mcast=`, so discovery is proven
       between two guests rather than through slirp's NAT.
 

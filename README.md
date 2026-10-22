@@ -17,7 +17,8 @@ and runs a **standard gc Go 1.26 binary** — or a TinyGo one — as `/init`: go
 threads, timers, garbage collection, signals and async preemption included. A Go
 program on it can use the `net` package over UDP and TCP, serve and speak HTTP, and
 **fetch its own root filesystem over the network** with this project's own protocol
-([`NETBOOT.md`](NETBOOT.md)).
+([`NETBOOT.md`](NETBOOT.md)) — accepting only the image whose digest it was told to
+expect, so the first machine to answer the sweep decides nothing.
 
 ```
 minikern 1.0.0 (NanoPi NEO / Allwinner H3), machine 0

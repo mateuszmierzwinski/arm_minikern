@@ -10,6 +10,7 @@
 #ifndef MINIKERN_KERNEL_NETBOOT_H
 #define MINIKERN_KERNEL_NETBOOT_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #include "core/net/net.h"
@@ -20,5 +21,14 @@
  * addresses, valid forever), or a negative errno; it logs its own progress
  * and the reason for a failure. */
 int knetboot_fetch(const uint32_t board_id[4], ip4_t pinned, const uint8_t **image, uint32_t *len);
+
+/* Accepts only a root filesystem with this digest, given as 64 hex
+ * characters (`minikern.rootfs.sha256=`). Returns KERR_INVAL for anything
+ * that is not exactly that, because a pin that silently did not parse would
+ * be worse than no pin at all: the boot would look protected and not be.
+ *
+ * What it protects against is the one that matters — the first machine to
+ * answer the sweep deciding what the board runs (core/net/netboot.h). */
+int knetboot_expect(const char *hex, size_t len);
 
 #endif

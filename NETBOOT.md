@@ -137,3 +137,23 @@ The fix is an operator-held key: the OFFER carries an Ed25519 signature over
 and until it is done netboot is for a network you control. `minikern.netboot=<ip>`
 narrows the exposure meanwhile, because then no sweep happens and only that address
 is believed.
+
+## Pinning what the board will accept
+
+The digest in an OFFER proves the **transfer**, not the server: it is the
+server's own claim about what it is about to send. Any machine on the subnet
+can answer the sweep, and the first one to answer decides what the board
+runs.
+
+`minikern.rootfs.sha256=<64 hex characters>` closes that. The board then
+accepts only an offer whose digest matches, and refuses every other **at the
+offer** — before a byte is transferred — so an impostor gains nothing, not
+even a denial of service: the sweep carries on until a server offers the
+image the board is expecting. A pin that cannot be parsed stops the boot,
+because a boot that looks protected and is not would be worse than none.
+
+What a pin is not is a signature. It names one image, so a new root
+filesystem means a new pin on every board. Authenticating the *server*
+instead — an Ed25519 signature over (xid, length, digest), with the public
+key in the kernel — is `TASKS.md` P5.5, and the pin is what makes it a
+convenience rather than a prerequisite.

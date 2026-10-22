@@ -370,6 +370,35 @@ static void test_data_from_another_host_is_refused(void) {
     KTEST_CHECK(nb.stats.blocks_refused > 0);
 }
 
+/* With a digest pinned, only the image that matches it is accepted — and the
+ * refusal happens at the **offer**, before a byte is transferred. */
+static void test_a_pinned_digest_accepts_the_right_image(void) {
+    fresh(IP4(255, 255, 255, 0));
+    KTEST_CHECK(start(0) == KERR_OK);
+    netboot_expect_digest(&nb, source_digest); /* after the start: it clears the session */
+    run(5000);
+    KTEST_CHECK(nb.state == NETBOOT_READY);
+    KTEST_CHECK(nb.stats.offers_refused == 0);
+}
+
+/* The attack the pin exists for: a machine that answers the sweep first and
+ * offers something else. Its offer is refused, nothing is fetched from it,
+ * and the client stays in the sweep rather than failing — so answering
+ * first buys an impostor nothing, not even a denial of service. */
+static void test_a_pinned_digest_refuses_another_image(void) {
+    uint8_t other[32];
+    fresh(IP4(255, 255, 255, 0));
+    memcpy(other, source_digest, sizeof other);
+    other[0] ^= 0xff;
+    KTEST_CHECK(start(0) == KERR_OK);
+    netboot_expect_digest(&nb, other);
+    run(5000);
+    KTEST_CHECK(nb.state != NETBOOT_READY);
+    KTEST_CHECK(nb.have == 0);
+    KTEST_CHECK(nb.stats.offers_refused > 0);
+    KTEST_CHECK(nb.stats.offers_seen == 0); /* it never became the server */
+}
+
 /* Takes the real offer, then checks what the client refuses afterwards. */
 static void offered(void) {
     fresh(IP4(255, 255, 255, 0));
@@ -503,6 +532,8 @@ int main(void) {
     KTEST_RUN(test_lost_blocks_are_refetched);
     KTEST_RUN(test_duplicates_are_ignored);
     KTEST_RUN(test_digest_mismatch_is_refused);
+    KTEST_RUN(test_a_pinned_digest_accepts_the_right_image);
+    KTEST_RUN(test_a_pinned_digest_refuses_another_image);
     KTEST_RUN(test_corrupt_block_fails_the_digest);
     KTEST_RUN(test_oversized_offer_is_refused);
     KTEST_RUN(test_bad_block_size_is_refused);
