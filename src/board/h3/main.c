@@ -1,0 +1,372 @@
+/* main.c — the composition root for the NanoPi NEO. The only file that
+ * names concrete adapters: it builds them, hands them to the core as ports,
+ * and runs the boot sequence. */
+#include <stdbool.h>
+#include <stdint.h>
+
+#include "arch/arm/cpu.h"
+#include "arch/arm/gic.h"
+#include "arch/arm/layout.h"
+#include "arch/arm/mmu.h"
+#include "arch/arm/psci.h"
+#include "arch/arm/timer.h"
+#include "arch/arm/trap.h"
+#include "board/h3/emac.h"
+#include "board/h3/h3.h"
+#include "board/h3/sid.h"
+#include "board/h3/uart.h"
+#include "core/bootinfo.h"
+#include "core/cmdline.h"
+#include "core/console.h"
+#include "core/errno.h"
+#include "kernel/devfs.h"
+#include "kernel/dma.h"
+#include "kernel/exec.h"
+#include "kernel/fault.h"
+#include "kernel/irq.h"
+#include "kernel/mem.h"
+#include "kernel/net.h"
+#include "kernel/netboot.h"
+#include "kernel/panic.h"
+#include "kernel/proc.h"
+#include "kernel/random.h"
+#include "kernel/sched.h"
+#include "kernel/selftest.h"
+#include "kernel/signal.h"
+#include "kernel/syscall.h"
+#include "kernel/time.h"
+#include "kernel/tty.h"
+#include "kernel/vfs.h"
+
+#ifndef MINIKERN_VERSION
+#define MINIKERN_VERSION "0.0.0"
+#endif
+
+/* 16 KiB — the most an ATAG list may span from r2 before we stop reading. */
+#define BOOTINFO_MAX_WORDS 4096u
+/* 1 MiB — far above any real board's tree (the NEO's is ~25 KiB). */
+#define BOOTINFO_MAX_FDT 0x100000u
+/* minikern.env.NAME=VALUE puts NAME=VALUE in init's environment. */
+#define ENV_PREFIX "minikern.env."
+#define ENV_MAX 16u
+#define ENV_TEXT_BYTES 512u
+
+void kmain(uint32_t r0, uint32_t machine, uint32_t r2, uint32_t entry_cpsr);
+
+static void report_cpu(uint32_t entry_cpsr) {
+    uint32_t hz = arm_cntfrq();
+    kprintf("cpu: midr %08x, entered in %s mode, timer %u.%03u MHz\n", arm_midr(),
+            arm_mode_name(entry_cpsr), hz / 1000000u, (hz / 1000u) % 1000u);
+}
+
+/* Parses the block by its kind; returns KERR_OK or the parser's error. */
+static int parse_bootinfo(const uint32_t *words, enum bootinfo_source kind, struct bootinfo *info) {
+    if (kind == BOOTINFO_ATAGS) {
+        return bootinfo_from_atags(words, BOOTINFO_MAX_WORDS, info);
+    }
+    if (kind == BOOTINFO_FDT) {
+        return bootinfo_from_fdt(words, BOOTINFO_MAX_FDT, info);
+    }
+    return KERR_OK;
+}
+
+/* The kernel's pointer to the boot block at physical r2, or NULL when r2 is
+ * not in RAM (QEMU's ELF boot passes 0). */
+static const uint32_t *bootinfo_block(uint32_t r2) {
+    return phys_in_ram(r2, 8) ? phys_to_virt(r2) : NULL;
+}
+
+/* Reads what the loader passed in r2; unknown or malformed forms leave the
+ * board defaults, and a loader that did not name the memory base gets ours. */
+static struct bootinfo read_bootinfo(uint32_t r2) {
+    const uint32_t *words = bootinfo_block(r2);
+    enum bootinfo_source kind = bootinfo_classify(words);
+    struct bootinfo info = {.source = kind, .cmdline = ""};
+    if (parse_bootinfo(words, kind, &info) != KERR_OK) {
+        kprintf("boot: malformed %s at %08x, ignored\n", kind == BOOTINFO_FDT ? "device tree" : "ATAG list", r2);
+        info = (struct bootinfo){.source = BOOTINFO_NONE, .cmdline = ""};
+    }
+    if (info.mem_size == 0) {
+        info.mem_base = H3_DRAM_BASE;
+    }
+    bootinfo_clamp_memory(&info, NANOPI_NEO_DRAM_SIZE);
+    return info;
+}
+
+static const char *source_name(enum bootinfo_source s) {
+    static const char *const names[] = {"none", "atags", "fdt"};
+    return names[s];
+}
+
+static void report_boot(const struct bootinfo *info, uint32_t r2) {
+    kprintf("boot: info %s at %08x\n", source_name(info->source), r2);
+    kprintf("mem: %u MiB at %08x\n", info->mem_size >> 20, info->mem_base);
+    kprintf("cmdline: \"%s\"\n", info->cmdline);
+    if (info->initrd_end > info->initrd_start) {
+        kprintf("initrd: %u bytes at %08x\n", info->initrd_end - info->initrd_start, info->initrd_start);
+    }
+}
+
+/* Runs minikern.selftest=<name> when the command line asks for one. */
+static void maybe_selftest(const char *cmdline) {
+    size_t len = 0;
+    const char *name = cmdline_value(cmdline, "minikern.selftest", &len);
+    if (name != NULL) {
+        selftest_run(name, (unsigned)len);
+    }
+}
+
+static struct power_port power;
+static const char *boot_cmdline = "";
+
+static bool halt_requested(void) {
+    return cmdline_equals(boot_cmdline, "minikern.halt", "poweroff");
+}
+
+/* The end of the boot with nothing to run: power off when asked (tests),
+ * otherwise idle forever. */
+static void finish(void) {
+    if (halt_requested()) {
+        kprintf("minikern: powering off\n");
+        power.poweroff(power.self);
+        kprintf("minikern: firmware refused power-off\n");
+    }
+    for (;;) {
+        power.idle(power.self);
+    }
+}
+
+/* Translation and exceptions: everything after this may fault safely. */
+static void bring_up_cpu(void) {
+    static const struct trap_handlers no_handlers;
+    mmu_init();
+    trap_init(&no_handlers);
+    arm_vfp_enable();
+}
+
+/* The trap layer's return-to-user hook: preemption, then signals. */
+static void return_to_user(struct trapframe *tf) {
+    sched_preempt_point();
+    signal_deliver(tf);
+}
+
+static void irq_entry(struct trapframe *tf) {
+    (void)tf;
+    irq_dispatch();
+}
+
+static uint32_t chip_id[4];
+
+/* The chip's unique ID: entropy now, the MAC address later. */
+static void seed_from_chip_id(void) {
+    if (h3_sid_read(chip_id) != KERR_OK) {
+        kprintf("sid: chip ID unreadable\n");
+    }
+    kprintf("sid: %08x %08x %08x %08x\n", chip_id[0], chip_id[1], chip_id[2], chip_id[3]);
+    random_seed(chip_id, sizeof chip_id);
+}
+
+/* Interrupts, the tick, the scheduler and every trap handler. */
+static void bring_up_kernel(uint32_t epoch) {
+    static const struct trap_handlers handlers = {
+        .syscall = syscall_dispatch, .irq = irq_entry, .fault = fault_handle,
+        .undef = fault_undefined, .return_to_user = return_to_user,
+    };
+    struct irq_chip_port gic = gic_init(io_virt(H3_GIC_DIST), io_virt(H3_GIC_CPU));
+    uint64_t now = timer_count();
+    irq_init(&gic);
+    trap_init(&handlers);
+    sched_init();
+    syscall_init();
+    time_init(epoch);
+    random_seed(&now, sizeof now);
+    seed_from_chip_id();
+}
+
+static void bring_up_console_input(const struct console_port *uart) {
+    struct console_input_port in = tty_input_port();
+    devfs_set_console(uart, &in);
+    h3_uart0_enable_rx(tty_receive);
+}
+
+/* True when the command-line word starts with prefix. */
+static bool cmdline_word_has_prefix(const char *word, size_t len, const char *prefix) {
+    for (size_t i = 0; prefix[i] != '\0'; i++) {
+        if (i >= len || word[i] != prefix[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* A number-valued command-line option, or fallback. */
+static uint32_t cmdline_number(const char *key, uint32_t fallback) {
+    size_t len = 0;
+    const char *v = cmdline_value(boot_cmdline, key, &len);
+    uint32_t n = 0;
+    if (v == NULL || len == 0) {
+        return fallback;
+    }
+    for (size_t i = 0; i < len && v[i] >= '0' && v[i] <= '9'; i++) {
+        n = n * 10u + (uint32_t)(v[i] - '0');
+    }
+    return n;
+}
+
+/* The network: the EMAC under the stack, then DHCP in the background.
+ * minikern.net=off leaves it down. */
+static void bring_up_network(void) {
+    struct netdev_port dev = h3_emac_netdev();
+    struct emac_link link;
+    struct frame_sink sink;
+    uint8_t mac[6];
+    uint32_t xid;
+    int rc;
+    if (cmdline_equals(boot_cmdline, "minikern.net", "off") || dma_init() != KERR_OK) {
+        return;
+    }
+    h3_emac_mac_from_id(chip_id, mac);
+    sink = knet_init(mac, &dev);
+    rc = h3_emac_init(mac, &sink, &link);
+    if (rc != KERR_OK) {
+        kprintf("net: eth0 not up (error %d)\n", rc);
+        return;
+    }
+    kprintf("net: eth0 %02x:%02x:%02x:%02x:%02x:%02x, phy %04x:%04x at %u, link up %s %s duplex\n", mac[0],
+            mac[1], mac[2], mac[3], mac[4], mac[5], link.phy_id >> 16, link.phy_id & 0xffffu, link.phy_addr,
+            link.speed_100 ? "100M" : "10M", link.full_duplex ? "full" : "half");
+    random_fill(&xid, sizeof xid);
+    knet_start(xid);
+}
+
+/* Reports how init ended, then ends the boot the way the command line asks. */
+static void init_exited(void *self, const struct proc *p) {
+    (void)self;
+    if (cmdline_equals(boot_cmdline, "minikern.netstat", "1")) {
+        knet_report();
+    }
+    if ((p->exit_status & 0x7f) != 0) {
+        kprintf("minikern: init killed by signal %d\n", p->exit_status & 0x7f);
+    } else {
+        kprintf("minikern: init exited with status %d\n", (p->exit_status >> 8) & 0xff);
+    }
+    if (halt_requested()) {
+        finish();
+    }
+}
+
+/* The init path from minikern.init=, copied into path (defaults to /init). */
+static void init_path(char *path, uint32_t cap) {
+    size_t len = 0;
+    const char *v = cmdline_value(boot_cmdline, "minikern.init", &len);
+    const char *src = v != NULL && len > 0 ? v : "/init";
+    uint32_t n = v != NULL && len > 0 ? (uint32_t)len : 5u;
+    for (uint32_t i = 0; i < n && i + 1 < cap; i++) {
+        path[i] = src[i];
+    }
+    path[n < cap ? n : cap - 1] = '\0';
+}
+
+/* The root filesystem: the netbooted one when minikern.netboot asked for
+ * it and it arrived, else the initrd the loader passed. Returns false when
+ * there is no root to mount. */
+static bool mount_root(const struct bootinfo *info) {
+    size_t len = 0;
+    const char *v = cmdline_value(boot_cmdline, "minikern.netboot", &len);
+    const uint8_t *image;
+    uint32_t bytes;
+    ip4_t pinned = 0;
+    if (v != NULL && (len == 0 || ip4_parse(v, (uint32_t)len, &pinned) == KERR_OK)) {
+        if (knetboot_fetch(chip_id, pinned, &image, &bytes) == KERR_OK) {
+            vfs_mount_root(image, bytes);
+            return true;
+        }
+        kprintf("netboot: falling back to the initrd\n");
+    } else if (v != NULL) {
+        kprintf("netboot: minikern.netboot=\"%.*s\" is not an address, ignored\n", (int)len, v);
+    }
+    if (info->initrd_end <= info->initrd_start) {
+        return false;
+    }
+    vfs_mount_root(phys_to_virt(info->initrd_start), info->initrd_end - info->initrd_start);
+    return true;
+}
+
+/* Mounts the root filesystem and starts init; false when there is none. */
+/* init's environment: the fixed entries, plus one for every
+ * minikern.env.NAME=VALUE on the command line. */
+static uint32_t build_env(const char **envp, uint32_t cap) {
+    static char text[ENV_TEXT_BYTES];
+    static const char *const fixed[] = {"HOME=/", "PATH=/bin:/", "TERM=linux"};
+    const char *word;
+    size_t at = 0, len = 0, used = 0;
+    uint32_t n = 0;
+    for (; n < 3u && n < cap; n++) {
+        envp[n] = fixed[n];
+    }
+    for (word = cmdline_next(boot_cmdline, &at, &len); word != NULL && n < cap;
+         word = cmdline_next(boot_cmdline, &at, &len)) {
+        size_t prefix = sizeof ENV_PREFIX - 1u;
+        if (len <= prefix || !cmdline_word_has_prefix(word, len, ENV_PREFIX) ||
+            used + (len - prefix) + 1u > sizeof text) {
+            continue;
+        }
+        envp[n++] = &text[used];
+        for (size_t i = prefix; i < len; i++) {
+            text[used++] = word[i];
+        }
+        text[used++] = '\0';
+    }
+    return n;
+}
+
+static bool start_init(const struct bootinfo *info) {
+    static const struct proc_exit_hook hook = {.exited = init_exited};
+    static char path[64];
+    const char *envp[ENV_MAX];
+    const char *argv[] = {path};
+    uint32_t envc;
+    struct proc *p;
+    int rc;
+    if (!mount_root(info)) {
+        kprintf("minikern: no root filesystem, nothing to run\n");
+        return false;
+    }
+    init_path(path, sizeof path);
+    proc_set_exit_hook(&hook);
+    envc = build_env(envp, ENV_MAX);
+    rc = exec_start(path, argv, 1, envp, envc, &p);
+    if (rc != KERR_OK) {
+        kprintf("minikern: cannot start %s: error %d\n", path, rc);
+        return false;
+    }
+    kprintf("minikern: started %s as pid %u\n", path, p->pid);
+    return true;
+}
+
+void kmain(uint32_t r0, uint32_t machine, uint32_t r2, uint32_t entry_cpsr) {
+    struct console_port uart = h3_uart0_console();
+    struct bootinfo info;
+    (void)r0;
+    power = psci_power_port();
+    console_attach(&uart);
+    kprintf("\nminikern %s (NanoPi NEO / Allwinner H3), machine %u\n", MINIKERN_VERSION, machine);
+    report_cpu(entry_cpsr);
+    info = read_bootinfo(r2);
+    boot_cmdline = info.cmdline;
+    panic_attach(&power, halt_requested());
+    bring_up_cpu();
+    mem_init(&info, r2, info.block_size);
+    report_boot(&info, r2);
+    kprintf("mem: %u KiB free\n", mem_free_pages() * 4u);
+    bring_up_kernel(cmdline_number("minikern.epoch", 0));
+    bring_up_console_input(&uart);
+    bring_up_network();
+    syscall_set_trace(cmdline_equals(boot_cmdline, "minikern.strace", "1"));
+    maybe_selftest(boot_cmdline);
+    kprintf("minikern: boot complete\n");
+    if (!start_init(&info) && halt_requested()) {
+        finish();
+    }
+    sched_idle_loop();
+}

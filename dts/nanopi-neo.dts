@@ -1,0 +1,20 @@
+/* The NanoPi NEO's device tree, trimmed to the nodes minikern reads. Written
+ * here from the board's documented facts (512 MiB at 0x40000000); it is used
+ * to boot QEMU through the device-tree path that real U-Boot takes. QEMU
+ * rewrites /memory and /chosen (bootargs, initrd) itself. */
+/dts-v1/;
+
+/ {
+	#address-cells = <1>;
+	#size-cells = <1>;
+	model = "FriendlyElec NanoPi NEO";
+	compatible = "friendlyarm,nanopi-neo", "allwinner,sun8i-h3";
+
+	chosen {
+	};
+
+	memory@40000000 {
+		device_type = "memory";
+		reg = <0x40000000 0x20000000>;
+	};
+};
