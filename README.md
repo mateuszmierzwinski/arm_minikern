@@ -197,8 +197,11 @@ TRANS: tid:0x6d6b7472  #items:1
 ```
 
 That is `xfs_logprint` decoding a transaction the board wrote: the file's new size,
-logged before it was written in place. Writes stay narrow and the reader **refuses**
-anything it does not fully understand — an unknown feature flag, a dirty log, a
+logged before it was written in place. A program on the board can create a file,
+write into blocks it does not have yet, and remove it again — and the host then
+finds the free-inode and free-block counts exactly where they started, so a leak
+of one block would show. The reader still **refuses** anything it does not fully
+understand — an unknown feature flag, a dirty log, a
 btree-format fork — because refusing is what keeps it non-destructive.
 [`XFS.md`](XFS.md) has the measured on-disk facts, the support matrix, and the four
 log facts that came out of `xfs_logprint` rather than any document.

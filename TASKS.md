@@ -342,9 +342,24 @@ after every test.**
             *Refused, each with its own errno rather than worked around:* the last
             free inode of a chunk, a new chunk, a tree with branches, a directory
             that has outgrown its inode, `O_TRUNC`.
-      - [ ] **P9.4d Removing a file and growing one past its own blocks**, which
-            need what is still missing: deleting a btree record, and the free-space
-            btrees with their AGF counters.
+      - [x] **P9.4d Removing a file, and growing one past its own blocks
+            (2026-10-22).** The free-space btrees, both of them, with their group
+            header and the superblock counter: a growing file asks for the block
+            after its last one so that it stays a single extent, and a removed
+            file gives its extents back joined to whatever they abut.
+            The test counts: the board creates a file, writes 9000 bytes into
+            blocks it did not have, reads them back and removes it, and the host
+            finds **60 free inodes where there were 60 and 114596 free blocks
+            where there were 114596**, with `xfs_repair -n` clean. A leak of one
+            block would show.
+            *The bug worth remembering:* an inode btree's records are keyed by the
+            group-relative inode number, and **a chunk does not start at a
+            multiple of its own size** — mkfs.xfs's first starts at inode 96 — so
+            a chunk is found by range, not by masking. Masking made every remove
+            fail with EIO (XFS.md §11).
+            *Still refused:* filling a hole or an unwritten extent inside a file,
+            a directory that has outgrown its inode, a leaf that would have to
+            split, a tree with branches.
 
 ---
 

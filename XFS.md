@@ -416,3 +416,52 @@ room for them, and says which of those it hit when it cannot.
 - Clearing that window zeroed **5632 bytes of a 4096-byte buffer**, over
   whatever static followed it, which came back as a kernel that spun
   instead of finishing. The window is now written in passes that fit.
+
+---
+
+## 11. The free-space btrees, and what a file costs
+
+Two trees describe the same free extents, one ordered by **where** they are
+(`AB3B`) and one by **how big** they are (`AB3C`), with 8-byte records of
+`startblock, blockcount` at the same offset 56. The group's free-space
+header (`XAGF`) is sector 1 of its first block, and carries the free-block
+count and the largest extent.
+
+The second ordering is the part that catches people out: **a record whose
+count changes usually has to move**, because the tree it is in is sorted by
+that count. Within a single leaf — which is all these trees are at this
+size — moving a record is sorting the leaf, and that is what this does. A
+tree with branches is refused rather than half-walked.
+
+Both directions are implemented, because a filesystem needs both to be
+usable:
+
+- **Growing a file** asks for the block immediately after its last one.
+  When that block is free the file's last extent simply gets longer, so a
+  file written in order stays a single extent; only when it is not does the
+  file collect another. Nine thousand bytes written into a file with no
+  blocks at all comes back byte for byte, and `xfs_repair` is clean.
+- **Removing a file** gives its extents back, each joined to whatever it
+  abuts — free space in XFS is kept as maximal extents, and two adjacent
+  free records are something `xfs_repair` will tell you about. The
+  by-count tree is then rebuilt from the by-block one rather than patched,
+  because after a merge it is no longer a simple function of what was
+  added, and copying is both shorter and impossible to get subtly wrong.
+
+The test that matters is the one that counts: the board creates a file,
+writes into blocks it did not have, reads them back and removes it, and the
+host then finds **60 free inodes where there were 60, and 114596 free
+blocks where there were 114596**. Not one block or inode leaked, and the
+whole filesystem still passes `xfs_repair -n`.
+
+**The bug worth remembering** is the one that cost an hour: an inode btree's
+records are keyed by the **group-relative** inode number, and a chunk does
+not start at a multiple of its own size — `mkfs.xfs`'s first chunk starts
+at inode 96, which is not a multiple of 64. So a chunk cannot be found by
+masking an inode number down; it has to be found by **range**. Masking it
+made every remove fail with EIO, which is the least informative way to be
+wrong.
+
+Still refused, and honestly: filling a hole or an unwritten extent inside a
+file (the extent would have to be split), a directory that has outgrown its
+inode, a leaf that would have to split, and a tree with branches.

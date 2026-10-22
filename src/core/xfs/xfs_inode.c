@@ -26,6 +26,35 @@ static void locate(const struct xfs *fs, uint64_t ino, uint64_t *fsb, uint32_t *
     *slot = (uint32_t)(ino & (((uint64_t)1 << fs->inopblog) - 1u));
 }
 
+/* The inverse of xfs_extent_unpack: the same four fields back into their
+ * sixteen packed bytes. Written as a bit loop rather than as shifts across
+ * byte boundaries, because the boundaries are where the fields do not fall
+ * and a shift that is one bit out survives most tests. */
+void xfs_extent_pack(uint8_t *p, const struct xfs_extent *e) {
+    uint8_t bits[128];
+    for (uint32_t i = 0; i < 128; i++) {
+        bits[i] = 0;
+    }
+    bits[127] = e->unwritten ? 1u : 0u;
+    for (uint32_t i = 0; i < 54u; i++) {
+        bits[73u + i] = (uint8_t)((e->startoff >> i) & 1u);
+    }
+    for (uint32_t i = 0; i < 52u; i++) {
+        bits[21u + i] = (uint8_t)((e->startblock >> i) & 1u);
+    }
+    for (uint32_t i = 0; i < 21u; i++) {
+        bits[i] = (uint8_t)((e->blockcount >> i) & 1u);
+    }
+    for (uint32_t byte = 0; byte < 16u; byte++) {
+        uint8_t v = 0;
+        for (uint32_t bit = 0; bit < 8u; bit++) {
+            /* The record is big-endian: bit 127 is the top bit of byte 0. */
+            v |= (uint8_t)(bits[127u - (byte * 8u + bit)] << (7u - bit));
+        }
+        p[byte] = v;
+    }
+}
+
 void xfs_inode_place(const struct xfs *fs, uint64_t ino, uint64_t *device_block, uint32_t *boffset) {
     uint64_t fsb;
     uint32_t slot;

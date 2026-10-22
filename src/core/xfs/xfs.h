@@ -179,6 +179,15 @@ int xfs_file_read(struct xfs *fs, const struct xfs_inode *ip, uint64_t off, void
 int xfs_create(struct xfs *fs, const struct xfs_inode *dir, const char *name, uint32_t namelen, uint16_t mode,
                uint64_t now_s, uint64_t *ino_out);
 
+/* Removes a regular file called name from dir.
+ *
+ * It refuses what it cannot do cleanly rather than doing it badly: a file
+ * that owns blocks (they would be leaked), a directory, a hard link, a
+ * parent that has outgrown its inode, and a chunk the free-inode tree does
+ * not describe (core/xfs/xfs_free.c). */
+int xfs_unlink(struct xfs *fs, const struct xfs_inode *dir, const char *name, uint32_t namelen,
+               uint64_t now_s);
+
 int xfs_file_write(struct xfs *fs, struct xfs_inode *ip, uint64_t off, const void *buf,
                    uint32_t len, uint32_t *put);
 

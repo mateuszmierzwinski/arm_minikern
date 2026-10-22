@@ -882,7 +882,34 @@ static void test_fuzz_does_not_crash(void) {
     KTEST_CHECK(reads_outside == 0);
 }
 
+/* Packing an extent and unpacking it must give back exactly what went in,
+ * over the whole range of each field — the boundaries are where the fields
+ * do not fall on byte lines, and a shift one bit out survives any single
+ * example. */
+static void an_extent_round_trips(void) {
+    static const struct xfs_extent CASES[] = {
+        {0, 0, 1, false},
+        {0, 0, 1, true},
+        {1, 2, 3, false},
+        {(1ull << 54) - 1u, (1ull << 52) - 1u, (1u << 21) - 1u, true},
+        {(1ull << 53), (1ull << 51), (1u << 20), false},
+        {0x2aaaaaaaaaaaaull, 0x555555555555ull, 0x15555u, true},
+        {123456789, 987654321, 49, false},
+    };
+    for (uint32_t i = 0; i < sizeof CASES / sizeof CASES[0]; i++) {
+        uint8_t packed[XFS_EXTENT_BYTES];
+        struct xfs_extent back;
+        xfs_extent_pack(packed, &CASES[i]);
+        xfs_extent_unpack(packed, &back);
+        KTEST_CHECK(back.startoff == CASES[i].startoff);
+        KTEST_CHECK(back.startblock == CASES[i].startblock);
+        KTEST_CHECK(back.blockcount == CASES[i].blockcount);
+        KTEST_CHECK(back.unwritten == CASES[i].unwritten);
+    }
+}
+
 int main(void) {
+    KTEST_RUN(an_extent_round_trips);
     KTEST_RUN(test_mount_and_geometry);
     KTEST_RUN(test_list_the_root);
     KTEST_RUN(test_lookup_and_read);

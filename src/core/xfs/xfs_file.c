@@ -166,6 +166,83 @@ static uint64_t allocated_bytes(const struct xfs *fs, const struct xfs_inode *ip
     return end > ip->size ? end : ip->size;
 }
 
+/* Puts one more block into the inode's extent list: onto the end of the
+ * last extent when it is the block that follows it, and as a new extent
+ * otherwise. The inode's own copy of the fork is updated too, because the
+ * loop above reads it back to decide where the next block should go. */
+static int extend_fork(struct xfs_inode *ip, uint8_t *di, const struct xfs_extent *last, uint64_t fsb) {
+    struct xfs_extent e;
+    uint32_t at = ip->nextents;
+    if (ip->nextents > 0 && last->startblock + last->blockcount == fsb) {
+        e = *last;
+        e.blockcount++;
+        at = ip->nextents - 1u;
+    } else {
+        e.startoff = ip->nblocks;
+        e.startblock = fsb;
+        e.blockcount = 1;
+        e.unwritten = false;
+        if ((at + 1u) * XFS_EXTENT_BYTES > ip->fork_len) {
+            return KERR_NOSPC; /* the fork would have to become a btree */
+        }
+        ip->nextents++;
+    }
+    xfs_extent_pack(ip->fork + at * XFS_EXTENT_BYTES, &e);
+    xfs_extent_pack(di + XFS_DI_V3_SIZE + at * XFS_EXTENT_BYTES, &e);
+    ip->nblocks++;
+    return KERR_OK;
+}
+
+/* Gives the file enough blocks to hold `end` bytes.
+ *
+ * One block at a time, each asked for immediately after the file's last
+ * one: when that block is free the file's last extent simply gets longer,
+ * and only when it is not does the file collect another extent. A file
+ * written in order therefore stays a single extent, which is what the
+ * reader walks quickest and what `xfs_repair` expects to see.
+ *
+ * Runs to 29 lines: it is one loop over a derivation whose steps have no
+ * meaning apart — where the next block should be, what came back, and
+ * which of the two shapes the extent list then takes — and splitting it
+ * would pass four values across the boundary to say half of it (Rule 11,
+ * Parameters/Single derivation). */
+static int grow_file(struct xfs *fs, struct xfs_inode *ip, uint64_t end) {
+    uint64_t block;
+    uint32_t boffset;
+    struct bbuf *b;
+    uint8_t *di;
+    int rc = KERR_OK;
+    xfs_inode_place(fs, ip->ino, &block, &boffset);
+    rc = bcache_get(fs->cache, block, &b);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    di = b->data + boffset;
+    while (rc == KERR_OK && allocated_bytes(fs, ip) < end) {
+        struct xfs_extent last = {0, 0, 0, false};
+        uint32_t want = 0, got = 0, agno = xfs_fsb_ag(fs, ip->ino >> fs->inopblog);
+        uint64_t mask = ((uint64_t)1 << fs->agblklog) - 1u;
+        if (ip->nextents > 0) {
+            xfs_extent_unpack(ip->fork + (ip->nextents - 1u) * XFS_EXTENT_BYTES, &last);
+            agno = xfs_fsb_ag(fs, last.startblock);
+            want = (uint32_t)((last.startblock + last.blockcount) & mask);
+        }
+        rc = xfs_alloc_block(fs, agno, want, &got);
+        if (rc != KERR_OK) {
+            break;
+        }
+        rc = extend_fork(ip, di, &last, ((uint64_t)agno << fs->agblklog) | got);
+    }
+    if (rc == KERR_OK) {
+        xfs_put_be64(di + XFS_DI_NBLOCKS, ip->nblocks);
+        xfs_put_be32(di + XFS_DI_NEXTENTS, ip->nextents);
+        xfs_reseal(di, fs->inodesize, XFS_DI_CRC);
+        bcache_dirty(b);
+    }
+    bcache_put(fs->cache, b);
+    return rc;
+}
+
 /* Checks a write before any of it happens: all of it must be possible, or
  * none of it is done. A half-written range would be worse than a refusal,
  * because the caller would have no way to know where it stopped. */
@@ -185,12 +262,21 @@ static int write_is_possible(struct xfs *fs, const struct xfs_inode *ip, uint64_
     if (off > ip->size) {
         return KERR_NOSPC; /* a hole past the end: that is the allocator's */
     }
-    if (len > allocated_bytes(fs, ip) - off) {
-        return KERR_NOSPC; /* past the blocks the file already has */
-    }
+    /* Past the blocks the file has is allowed now: grow_file takes more
+     * from the group first (xfs_alloc.c). What is still refused is a hole
+     * in the middle, above. */
+    /* Every block the write touches must either already hold data or be
+     * past the end, where grow_file will get it. A block *inside* the file
+     * that is a hole or an unwritten extent is the one case left: filling
+     * one needs the extent split in two, which is not implemented. */
+    uint64_t have = allocated_bytes(fs, ip) >> fs->blocklog;
     for (uint64_t block = off >> fs->blocklog; block <= (off + len - 1u) >> fs->blocklog; block++) {
         struct xfs_extent e;
-        int rc = xfs_bmap(fs, ip, block, &e);
+        int rc;
+        if (block >= have) {
+            break; /* and everything after it: the allocator's */
+        }
+        rc = xfs_bmap(fs, ip, block, &e);
         if (rc == KERR_NOENT || (rc == KERR_OK && e.unwritten)) {
             return KERR_NOTSUP;
         }
@@ -247,6 +333,9 @@ int xfs_file_write(struct xfs *fs, struct xfs_inode *ip, uint64_t off, const voi
         return KERR_OK;
     }
     if ((rc = write_is_possible(fs, ip, off, len)) != KERR_OK) {
+        return rc;
+    }
+    if (off + len > allocated_bytes(fs, ip) && (rc = grow_file(fs, ip, off + len)) != KERR_OK) {
         return rc;
     }
     while (done < len) {

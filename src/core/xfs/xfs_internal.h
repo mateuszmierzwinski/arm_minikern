@@ -74,6 +74,44 @@ struct xfs_log_inode_item {
 
 #define XFS_LOG_MAX_ITEMS 2u
 
+/* ── the group headers and the btrees (xfs_create.c) ───────────────────── */
+
+/* The group's first block, where its four header sectors live. */
+uint64_t xfs_group_block(const struct xfs *fs, uint32_t agno);
+
+/* Recomputes a self-describing structure's checksum over len bytes. */
+void xfs_reseal(uint8_t *at, uint32_t len, uint32_t crc_off);
+
+/* The group's inode header, with its magic, checksum and UUID checked. */
+int xfs_agi_get(struct xfs *fs, uint32_t agno, struct bbuf **out, uint8_t **agi);
+
+/* One of a group's btree roots, which must be a lone leaf: KERR_NOTSUP for
+ * a tree with branches, because walking one is not implemented. */
+int xfs_tree_get(struct xfs *fs, uint32_t agno, uint32_t block, uint32_t magic, struct bbuf **out);
+
+/* The inode-btree record whose chunk holds this group-relative inode, or
+ * NULL. Found by range: a chunk does not begin at a multiple of its size. */
+uint8_t *xfs_tree_record_for(const struct bbuf *b, uint32_t agino);
+
+/* The superblock's free-inode counter, moved by delta. */
+int xfs_count_inodes_free(struct xfs *fs, int32_t delta);
+
+/* Big-endian writers, shared by everything that changes metadata. */
+void xfs_put_be16(uint8_t *p, uint16_t v);
+void xfs_put_be32(uint8_t *p, uint32_t v);
+void xfs_put_be64(uint8_t *p, uint64_t v);
+
+/* ── the free-space btrees (xfs_alloc.c) ───────────────────────────────── */
+
+/* Takes one block from a group: `want`, if that block is free, and
+ * otherwise the first block of the largest free extent. *got is the block
+ * it took. KERR_NOSPC when the group has none, KERR_NOTSUP for a tree with
+ * branches. */
+int xfs_alloc_block(struct xfs *fs, uint32_t agno, uint32_t want, uint32_t *got);
+
+/* Gives an extent back, joined to whatever it abuts. */
+int xfs_free_extent(struct xfs *fs, uint32_t agno, uint32_t start, uint32_t count);
+
 /* Writes these inodes to the log as one committed transaction, then an
  * unmount record after it so the log is clean again (xfs_logwrite.c).
  *
@@ -92,6 +130,9 @@ struct xfs_extent {
 
 /* Unpacks the sixteen-byte record at p. */
 void xfs_extent_unpack(const uint8_t *p, struct xfs_extent *out);
+
+/* Packs one back, which is the exact inverse (there is a round-trip test). */
+void xfs_extent_pack(uint8_t *p, const struct xfs_extent *e);
 
 /* The extent covering logical block off, or KERR_NOENT when off is in a
  * hole. Walks the inode's inline extent list. */

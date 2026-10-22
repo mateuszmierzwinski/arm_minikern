@@ -198,6 +198,37 @@ __attribute__((noinline)) static int create_then_open(char *path, uint32_t len, 
     return rc == KERR_OK ? file_for(&node, flags, out) : rc;
 }
 
+/* Not inlined, for the reason create_then_open is not: two inode
+ * structures and a path do not fit one kernel stack frame beside its
+ * caller's (CLAUDE.md §10). */
+__attribute__((noinline)) int xfsfs_unlink(const char *rest) {
+    struct xfs_inode node;
+    char path[XFS_NAME_MAX + 2];
+    const char *name;
+    uint32_t i = 0, namelen, dirlen;
+    char keep;
+    int rc;
+    if (!mounted.up) {
+        return KERR_NODEV;
+    }
+    if (mounted.read_only) {
+        return KERR_ROFS;
+    }
+    path[i++] = '/';
+    for (const char *p = rest; *p != '\0' && i + 1 < sizeof path; p++) {
+        path[i++] = *p;
+    }
+    path[i] = '\0';
+    dirlen = split_parent(path, i, &name, &namelen);
+    keep = path[dirlen];
+    path[dirlen] = '\0';
+    rc = xfs_path_lookup(&mounted.fs, path, &node);
+    path[dirlen] = keep;
+    return rc != KERR_OK ? rc
+                         : xfs_unlink(&mounted.fs, &node, name, namelen,
+                                      time_realtime_ns() / 1000000000ull);
+}
+
 int xfsfs_open(const char *rest, uint32_t flags, struct file **out) {
     struct xfs_inode ip;
     char path[XFS_NAME_MAX + 2];

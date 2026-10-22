@@ -175,6 +175,30 @@
 #define XFS_SB_ICOUNT  128u /* u64 */
 #define XFS_SB_IFREE   136u /* u64 */
 
+/* The group's free-space header, in sector 1 of its first block. */
+#define XFS_AGF_MAGIC  0x58414746u /* "XAGF" */
+#define XFS_AGF_SECTOR 1u
+
+#define XFS_AGF_ROOTS     16u  /* three u32: by block, by count, by owner */
+#define XFS_AGF_LEVELS    28u  /* three u32 */
+#define XFS_AGF_FREEBLKS  52u  /* u32: free blocks in this group */
+#define XFS_AGF_LONGEST   56u  /* u32: the largest free extent in it */
+#define XFS_AGF_UUID      64u  /* 16 bytes */
+#define XFS_AGF_CRC       216u /* u32, little-endian */
+
+/* The free-space btrees: the same shape as the inode ones, with 8-byte
+ * records. One is ordered by block, the other by count — and that second
+ * ordering is what makes a changed record have to move. */
+#define XFS_BNOBT_MAGIC 0x41423342u /* "AB3B" */
+#define XFS_CNTBT_MAGIC 0x41423343u /* "AB3C" */
+
+#define XFS_ALLOC_REC_SIZE       8u
+#define XFS_ALLOC_REC_STARTBLOCK 0u /* u32 */
+#define XFS_ALLOC_REC_BLOCKCOUNT 4u /* u32 */
+
+/* The superblock's free-block counter, which a change has to keep in step. */
+#define XFS_SB_FDBLOCKS 144u /* u64 */
+
 /* ── the inode btrees ────────────────────────────────────────────────────
  * Two trees of the same shape: every inode chunk (`IAB3`), and the chunks
  * that still have a free inode (`FIB3`). A short-form btree block is a

@@ -132,6 +132,10 @@ xfs_repair -n "$vol" >/dev/null 2>&1 || fail "mkfs.xfs made an image xfs_repair 
 # How many 0x7e bytes the volume holds before the board writes 40000 of
 # them: the file is random, so a few are there by chance.
 pattern_before="$(tr -dc '\176' <"$vol" | wc -c)"
+# What the filesystem holds before the board touches it, so that creating a
+# file and removing it again can be shown to have left no trace.
+ifree_before="$(xfs_db -r -c "sb 0" -c "print ifree" "$vol" | awk '{print $3}')"
+fdblocks_before="$(xfs_db -r -c "sb 0" -c "print fdblocks" "$vol" | awk '{print $3}')"
 
 log="$tmp/console2.log"
 timeout 300 qemu-system-arm -M orangepi-pc -display none -monitor none -serial "file:$log" \
@@ -149,6 +153,10 @@ expect "PASS read-back"
 expect "PASS create-file"
 expect "PASS list-after-create"
 expect "PASS create-twice"
+expect "PASS remove-file"
+expect "PASS remove-twice"
+expect "PASS write-into-a-new-file"
+expect "PASS remove-a-file-with-blocks"
 expect "PASS grow-into-own-block"
 expect "PASS refuse-grow"
 expect "ALL XFS PASS"
@@ -214,14 +222,20 @@ log_daddr=$(xfs_logprint -t "$vol" | sed -n 's/.*daddr: \([0-9]*\).*/\1/p')
 echo "the log starts at fsb $log_bb, daddr $log_daddr; its first three blocks:"
 dd if="$vol" bs=512 skip="$log_daddr" count=3 2>/dev/null | hexdump -C | head -36
 
-echo "---- and the file the board created is really there"
-xfs_db -r -c "path /made-on-the-board" -c "print core.magic core.mode core.format core.size core.nlinkv2" \
-    "$vol" >"$tmp/created.log" 2>&1 || fail "xfs_db cannot find the file the board created"
+echo "---- and the file the board created and then removed is gone"
+# The board created it, listed it, and removed it again, so what the host
+# must see is an absence — and a free-inode count back where it started.
+xfs_db -r -c "path /made-on-the-board" "$vol" >"$tmp/created.log" 2>&1 &&
+    fail "the file the board removed is still in the filesystem"
 cat "$tmp/created.log"
-grep -q "core.magic = 0x494e" "$tmp/created.log" || fail "the created inode is not an inode"
-grep -q "core.mode = 0100644" "$tmp/created.log" || fail "the created inode has the wrong mode"
-grep -q "core.size = 0" "$tmp/created.log" || fail "the created inode is not empty"
-grep -q "core.nlinkv2 = 1" "$tmp/created.log" || fail "the created inode has the wrong link count"
+ifree_after="$(xfs_db -r -c "sb 0" -c "print ifree" "$vol" | awk '{print $3}')"
+echo "free inodes: $ifree_before before the board ran, $ifree_after after"
+[ "$ifree_after" = "$ifree_before" ] ||
+    fail "the inode the board used was not given back ($ifree_before -> $ifree_after)"
+fdblocks_after="$(xfs_db -r -c "sb 0" -c "print fdblocks" "$vol" | awk '{print $3}')"
+echo "free blocks: $fdblocks_before before the board ran, $fdblocks_after after"
+[ "$fdblocks_after" = "$fdblocks_before" ] ||
+    fail "the blocks the board used were not given back ($fdblocks_before -> $fdblocks_after)"
 
 echo "---- and xfs_db agrees about the size the board recorded"
 xfs_db -r -c "path /data.bin" -c "print core.size" "$vol" >"$tmp/size.log" 2>&1 ||

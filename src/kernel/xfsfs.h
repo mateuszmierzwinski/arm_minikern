@@ -53,6 +53,11 @@ bool xfsfs_owns(const struct file *f);
  * data instead of its hash index (XFS.md §3). */
 int32_t xfsfs_getdents(struct file *f, uint8_t *buf, uint32_t cap, uint32_t *advanced);
 
+/* Removes a file from the mounted filesystem. `rest` is the path past the
+ * mount point, as xfsfs_open takes it. Refuses what the filesystem refuses,
+ * each with its own errno (core/xfs/xfs.h). */
+int xfsfs_unlink(const char *rest);
+
 /* Writes back anything the filesystem still holds, if one is mounted.
  *
  * Called when the machine is stopping: a filesystem left dirty because the

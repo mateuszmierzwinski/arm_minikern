@@ -157,12 +157,18 @@ repair_clean rw.img
 cmp <(dd if=mid.bin bs=1 count=9000 status=none) <(dd if=after_mid.bin bs=1 skip=5000 count=9000 status=none) ||
     fail "the unaligned write did not land where it was asked to"
 
-echo "---- what writing must refuse"
-# Past the end of the file: growing it would change the inode.
-if "$probe" rw.img write /hello.txt 0 payload.bin 2>past.log; then
-    fail "a write past the end of a file succeeded"
-fi
-grep -q "writing 100000 bytes at 0" past.log || { cat past.log; fail "the refusal is unclear"; }
+echo "---- growing a file past the blocks it has"
+# 100000 bytes into a file that holds a line: the free-space btrees have to
+# give up the blocks and the extent list has to grow. xfs_repair then says
+# whether any of that was done properly, and the bytes must read back.
+"$probe" rw.img write /hello.txt 0 payload.bin || fail "a write that needs new blocks failed"
+repair_clean rw.img
+"$probe" rw.img cat /hello.txt grown.bin
+cmp payload.bin grown.bin || fail "what the grown file holds is not what was written"
+grown_size="$(xfs_db -r -c "path /hello.txt" -c "print core.size" rw.img | awk '{print $3}')"
+[ "$grown_size" = "100000" ] || fail "the grown file's size is $grown_size, not 100000"
+
+echo "---- what writing must still refuse"
 # A directory is not a file.
 if "$probe" rw.img write /sub 0 payload.bin 2>dir.log; then
     fail "writing to a directory succeeded"

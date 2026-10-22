@@ -77,6 +77,10 @@ func writePhase() {
 	check("create-file", createFile())
 	check("list-after-create", listAfterCreate())
 	check("create-twice", createTwice())
+	check("remove-file", removeFile())
+	check("remove-twice", removeTwice())
+	check("write-into-a-new-file", writeIntoNewFile())
+	check("remove-a-file-with-blocks", removeFileWithBlocks())
 	check("grow-into-own-block", growIntoOwnBlock())
 	check("refuse-grow", refuseGrow())
 }
@@ -171,9 +175,8 @@ func readBack() error {
 	return nil
 }
 
-// refuseGrow checks the line this kernel still draws: a write may reach the
-// end of the blocks a file already owns, and no further, because growing
-// past them needs the block allocator.
+// refuseGrow checks the one shape still refused: a write that would leave a
+// hole, which needs an unwritten extent rather than more blocks.
 // The file this creates, and what it writes into it.
 const created = mount + "/made-on-the-board"
 
@@ -260,6 +263,100 @@ func growIntoOwnBlock() error {
 	return nil
 }
 
+// removeFile takes the created file away again: the entry leaves the
+// directory, the inode goes back to the inode btrees, and the host's
+// xfs_repair is what says whether any of that was done properly.
+func removeFile() error {
+	if err := os.Remove(created); err != nil {
+		return err
+	}
+	if _, err := os.Stat(created); err == nil {
+		return fmt.Errorf("the file is still there")
+	}
+	names, err := os.ReadDir(mount)
+	if err != nil {
+		return err
+	}
+	for _, e := range names {
+		if e.Name() == "made-on-the-board" {
+			return fmt.Errorf("the entry is still in the listing")
+		}
+	}
+	return nil
+}
+
+// removeTwice must fail: there is nothing left to remove.
+func removeTwice() error {
+	if err := os.Remove(created); err == nil {
+		return fmt.Errorf("removing it twice succeeded")
+	}
+	return nil
+}
+
+// refuseRemovingDataFile checks the line this still draws: a file that owns
+// blocks would leak them, because returning blocks needs the free-space
+// btrees. The refusal must be clean and the file must still be there.
+func refuseRemovingDataFile() error {
+	if err := os.Remove(target); err == nil {
+		return fmt.Errorf("removing a file with blocks succeeded")
+	}
+	if _, err := os.Stat(target); err != nil {
+		return fmt.Errorf("the file went away anyway: %w", err)
+	}
+	return nil
+}
+
+// writeIntoNewFile creates a file and writes enough into it to need blocks
+// it does not have: the free-space btrees have to give them up, and the
+// inode's extent list has to grow. The host's xfs_repair judges the result.
+func writeIntoNewFile() error {
+	const grown = mount + "/grown-on-the-board"
+	want := make([]byte, 9000) // three blocks' worth, so it needs more than one
+	for i := range want {
+		want[i] = byte(i*7 + 1)
+	}
+	f, err := os.OpenFile(grown, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = f.Close() }()
+	if _, err = f.WriteAt(want, 0); err != nil {
+		return fmt.Errorf("writing into a file with no blocks: %w", err)
+	}
+	if err = f.Sync(); err != nil {
+		return err
+	}
+	info, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if info.Size() != int64(len(want)) {
+		return fmt.Errorf("size is %d, want %d", info.Size(), len(want))
+	}
+	got := make([]byte, len(want))
+	if _, err = f.ReadAt(got, 0); err != nil {
+		return err
+	}
+	if string(got) != string(want) {
+		return fmt.Errorf("what came back is not what went in")
+	}
+	return nil
+}
+
+// removeFileWithBlocks takes away a file that owns blocks, which must give
+// them back: the test's host side checks the free-block count is where it
+// started, so a leak would show.
+func removeFileWithBlocks() error {
+	const grown = mount + "/grown-on-the-board"
+	if err := os.Remove(grown); err != nil {
+		return err
+	}
+	if _, err := os.Stat(grown); err == nil {
+		return fmt.Errorf("it is still there")
+	}
+	return nil
+}
+
 func refuseGrow() error {
 	f, err := os.OpenFile(target, os.O_RDWR, 0)
 	if err != nil {
@@ -270,10 +367,10 @@ func refuseGrow() error {
 	if err != nil {
 		return err
 	}
-	// Past the end of the blocks the file owns, which needs the allocator
-	// and must still be refused.
-	if _, err := f.WriteAt(make([]byte, 4096), info.Size()); err == nil {
-		return fmt.Errorf("a write past the file's own blocks succeeded")
+	// A hole: starting a write well past the end leaves unwritten space
+	// behind it, which needs an unwritten extent.
+	if _, err := f.WriteAt(make([]byte, 16), info.Size()+8192); err == nil {
+		return fmt.Errorf("a write that leaves a hole succeeded")
 	}
 	return nil
 }

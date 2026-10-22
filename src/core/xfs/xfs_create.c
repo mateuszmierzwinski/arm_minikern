@@ -38,19 +38,19 @@
 
 #define XFS_DI_V3_GEN_START 1u
 
-static void put_be16(uint8_t *p, uint16_t v) {
+void xfs_put_be16(uint8_t *p, uint16_t v) {
     p[0] = (uint8_t)(v >> 8);
     p[1] = (uint8_t)v;
 }
 
-static void put_be32(uint8_t *p, uint32_t v) {
-    put_be16(p, (uint16_t)(v >> 16));
-    put_be16(p + 2, (uint16_t)v);
+void xfs_put_be32(uint8_t *p, uint32_t v) {
+    xfs_put_be16(p, (uint16_t)(v >> 16));
+    xfs_put_be16(p + 2, (uint16_t)v);
 }
 
-static void put_be64(uint8_t *p, uint64_t v) {
-    put_be32(p, (uint32_t)(v >> 32));
-    put_be32(p + 4, (uint32_t)v);
+void xfs_put_be64(uint8_t *p, uint64_t v) {
+    xfs_put_be32(p, (uint32_t)(v >> 32));
+    xfs_put_be32(p + 4, (uint32_t)v);
 }
 
 static void put_le32(uint8_t *p, uint32_t v) {
@@ -72,21 +72,21 @@ static void copy(uint8_t *dst, const uint8_t *src, uint32_t n) {
 }
 
 /* Recomputes a self-describing structure's checksum over len bytes. */
-static void reseal(uint8_t *at, uint32_t len, uint32_t crc_off) {
+void xfs_reseal(uint8_t *at, uint32_t len, uint32_t crc_off) {
     put_le32(at + crc_off, 0);
     put_le32(at + crc_off, crc32c(at, len));
 }
 
 /* The group's first block, where its four header sectors live. */
-static uint64_t group_block(const struct xfs *fs, uint32_t agno) {
+uint64_t xfs_group_block(const struct xfs *fs, uint32_t agno) {
     return (uint64_t)agno * fs->agblocks;
 }
 
 /* The group's inode header, checked the way everything else here is
  * checked: its magic, its checksum and the filesystem's own UUID. */
-static int agi_get(struct xfs *fs, uint32_t agno, struct bbuf **out, uint8_t **agi) {
+int xfs_agi_get(struct xfs *fs, uint32_t agno, struct bbuf **out, uint8_t **agi) {
     uint8_t *at;
-    int rc = bcache_get(fs->cache, group_block(fs, agno), out);
+    int rc = bcache_get(fs->cache, xfs_group_block(fs, agno), out);
     if (rc != KERR_OK) {
         return rc;
     }
@@ -101,7 +101,7 @@ static int agi_get(struct xfs *fs, uint32_t agno, struct bbuf **out, uint8_t **a
 }
 
 /* One of the inode btrees' root blocks, which must be a lone leaf. */
-static int tree_get(struct xfs *fs, uint32_t agno, uint32_t block, uint32_t magic, struct bbuf **out) {
+int xfs_tree_get(struct xfs *fs, uint32_t agno, uint32_t block, uint32_t magic, struct bbuf **out) {
     uint64_t fsb = ((uint64_t)agno << fs->agblklog) | block;
     int rc = xfs_meta_block(fs, fsb, magic, 0, XFS_BTREE_CRC, XFS_BTREE_UUID, out);
     if (rc != KERR_OK) {
@@ -114,12 +114,19 @@ static int tree_get(struct xfs *fs, uint32_t agno, uint32_t block, uint32_t magi
     return KERR_OK;
 }
 
-/* The record covering startino, or NULL. */
-static uint8_t *tree_record_for(const struct bbuf *b, uint32_t startino) {
+/* The record whose chunk holds this group-relative inode, or NULL.
+ *
+ * By range rather than by a mask: a chunk begins wherever the allocator put
+ * it — mkfs.xfs's first one starts at inode 96, which is not a multiple of
+ * 64 — so rounding an inode number down to a multiple of the chunk size
+ * names no chunk at all. Masking it did, and a remove failed with EIO
+ * because nothing matched. */
+uint8_t *xfs_tree_record_for(const struct bbuf *b, uint32_t agino) {
     uint32_t n = xfs_be16(b->data + XFS_BTREE_NUMRECS);
     for (uint32_t i = 0; i < n; i++) {
         uint8_t *rec = b->data + XFS_BTREE_RECORDS + i * XFS_INOBT_REC_SIZE;
-        if (xfs_be32(rec + XFS_INOBT_REC_STARTINO) == startino) {
+        uint32_t start = xfs_be32(rec + XFS_INOBT_REC_STARTINO);
+        if (agino >= start && agino - start < XFS_INODES_PER_CHUNK) {
             return rec;
         }
     }
@@ -150,8 +157,8 @@ static uint8_t *pick_record(const struct bbuf *b, uint32_t *bit) {
 /* Marks one inode of a record used: its bit cleared, its count down. */
 static void take_from_record(uint8_t *rec, uint32_t bit) {
     uint64_t free = xfs_be64(rec + XFS_INOBT_REC_FREE) & ~((uint64_t)1 << bit);
-    put_be32(rec + XFS_INOBT_REC_FREECOUNT, xfs_be32(rec + XFS_INOBT_REC_FREECOUNT) - 1u);
-    put_be64(rec + XFS_INOBT_REC_FREE, free);
+    xfs_put_be32(rec + XFS_INOBT_REC_FREECOUNT, xfs_be32(rec + XFS_INOBT_REC_FREECOUNT) - 1u);
+    xfs_put_be64(rec + XFS_INOBT_REC_FREE, free);
 }
 
 /* Takes a free inode from this group, marking it used in both trees and in
@@ -166,25 +173,25 @@ static int take_inode(struct xfs *fs, uint32_t agno, uint64_t *ino) {
     struct bbuf *agib, *inob, *finob;
     uint8_t *agi, *rec, *frec;
     uint32_t bit = 0, startino;
-    int rc = agi_get(fs, agno, &agib, &agi);
+    int rc = xfs_agi_get(fs, agno, &agib, &agi);
     if (rc != KERR_OK) {
         return rc;
     }
-    rc = tree_get(fs, agno, xfs_be32(agi + XFS_AGI_ROOT), XFS_INOBT_MAGIC, &inob);
+    rc = xfs_tree_get(fs, agno, xfs_be32(agi + XFS_AGI_ROOT), XFS_INOBT_MAGIC, &inob);
     if (rc != KERR_OK) {
         bcache_put(fs->cache, agib);
         return rc;
     }
     rec = pick_record(inob, &bit);
     startino = rec != NULL ? xfs_be32(rec + XFS_INOBT_REC_STARTINO) : 0;
-    rc = rec == NULL ? KERR_NOSPC : tree_get(fs, agno, xfs_be32(agi + XFS_AGI_FREE_ROOT), XFS_FINOBT_MAGIC,
+    rc = rec == NULL ? KERR_NOSPC : xfs_tree_get(fs, agno, xfs_be32(agi + XFS_AGI_FREE_ROOT), XFS_FINOBT_MAGIC,
                                              &finob);
     if (rc != KERR_OK) {
         bcache_put(fs->cache, inob);
         bcache_put(fs->cache, agib);
         return rc;
     }
-    frec = tree_record_for(finob, startino);
+    frec = xfs_tree_record_for(finob, startino + bit);
     if (frec == NULL) {
         bcache_put(fs->cache, finob);
         bcache_put(fs->cache, inob);
@@ -193,10 +200,10 @@ static int take_inode(struct xfs *fs, uint32_t agno, uint64_t *ino) {
     }
     take_from_record(rec, bit);
     take_from_record(frec, bit);
-    put_be32(agi + XFS_AGI_FREECOUNT, xfs_be32(agi + XFS_AGI_FREECOUNT) - 1u);
-    reseal(inob->data, fs->blocksize, XFS_BTREE_CRC);
-    reseal(finob->data, fs->blocksize, XFS_BTREE_CRC);
-    reseal(agi, fs->sectsize, XFS_AGI_CRC);
+    xfs_put_be32(agi + XFS_AGI_FREECOUNT, xfs_be32(agi + XFS_AGI_FREECOUNT) - 1u);
+    xfs_reseal(inob->data, fs->blocksize, XFS_BTREE_CRC);
+    xfs_reseal(finob->data, fs->blocksize, XFS_BTREE_CRC);
+    xfs_reseal(agi, fs->sectsize, XFS_AGI_CRC);
     bcache_dirty(inob);
     bcache_dirty(finob);
     bcache_dirty(agib);
@@ -208,14 +215,14 @@ static int take_inode(struct xfs *fs, uint32_t agno, uint64_t *ino) {
 }
 
 /* The superblock's free-inode counter, which must follow the groups'. */
-static int count_one_inode_used(struct xfs *fs) {
+int xfs_count_inodes_free(struct xfs *fs, int32_t delta) {
     struct bbuf *b;
     int rc = bcache_get(fs->cache, 0, &b);
     if (rc != KERR_OK) {
         return rc;
     }
-    put_be64(b->data + XFS_SB_IFREE, xfs_be64(b->data + XFS_SB_IFREE) - 1u);
-    reseal(b->data, fs->sectsize, XFS_SB_CRC);
+    xfs_put_be64(b->data + XFS_SB_IFREE, xfs_be64(b->data + XFS_SB_IFREE) + (uint64_t)(int64_t)delta);
+    xfs_reseal(b->data, fs->sectsize, XFS_SB_CRC);
     bcache_dirty(b);
     bcache_put(fs->cache, b);
     return KERR_OK;
@@ -241,25 +248,25 @@ static int write_new_inode(struct xfs *fs, uint64_t ino, uint16_t mode, uint64_t
     }
     di = b->data + boffset;
     zero(di, fs->inodesize);
-    put_be16(di + XFS_DI_MAGIC, XFS_DINODE_MAGIC);
-    put_be16(di + XFS_DI_MODE, mode);
+    xfs_put_be16(di + XFS_DI_MAGIC, XFS_DINODE_MAGIC);
+    xfs_put_be16(di + XFS_DI_MODE, mode);
     di[XFS_DI_VERSION] = XFS_DI_VERSION_3;
     di[XFS_DI_FORMAT] = XFS_DINODE_FMT_EXTENTS;
     di[XFS_DI_AFORMAT] = XFS_DINODE_FMT_EXTENTS;
-    put_be32(di + XFS_DI_NLINK, 1);
-    put_be32(di + XFS_DI_GEN, XFS_DI_V3_GEN_START);
+    xfs_put_be32(di + XFS_DI_NLINK, 1);
+    xfs_put_be32(di + XFS_DI_GEN, XFS_DI_V3_GEN_START);
     /* Not zero: this field is the unlinked-inode list's link, and zero
      * means "inode 0 follows" rather than "nothing does". xfs_repair said
      * so — "bad next_unlinked 0x0 on inode 100" — and would have cleared
      * the inode for it. */
-    put_be32(di + XFS_DI_NEXT_UNLINKED, XFS_NULL_AGINO);
-    put_be64(di + XFS_DI_INO, ino);
+    xfs_put_be32(di + XFS_DI_NEXT_UNLINKED, XFS_NULL_AGINO);
+    xfs_put_be64(di + XFS_DI_INO, ino);
     copy(di + XFS_DI_UUID, fs->uuid, 16);
     for (uint32_t t = 0; t < 3; t++) {
-        put_be32(di + XFS_DI_ATIME + t * 8u, (uint32_t)now_s);
+        xfs_put_be32(di + XFS_DI_ATIME + t * 8u, (uint32_t)now_s);
     }
-    put_be32(di + XFS_DI_CRTIME, (uint32_t)now_s);
-    reseal(di, fs->inodesize, XFS_DI_CRC);
+    xfs_put_be32(di + XFS_DI_CRTIME, (uint32_t)now_s);
+    xfs_reseal(di, fs->inodesize, XFS_DI_CRC);
     bcache_dirty(b);
     bcache_put(fs->cache, b);
     return KERR_OK;
@@ -349,15 +356,15 @@ static int sf_add(struct xfs *fs, const struct xfs_inode *dir, const char *name,
     }
     e = sf + used;
     e[0] = (uint8_t)namelen;
-    put_be16(e + 1, (uint16_t)sf_next_offset(sf, count));
+    xfs_put_be16(e + 1, (uint16_t)sf_next_offset(sf, count));
     copy(e + 3, (const uint8_t *)name, namelen);
     e[3 + namelen] = ftype;
-    put_be32(e + 4 + namelen, (uint32_t)ino);
+    xfs_put_be32(e + 4 + namelen, (uint32_t)ino);
     sf[XFS_DIR_SF_COUNT_OFF] = (uint8_t)(count + 1u);
-    put_be64(di + XFS_DI_SIZE, used + sf_entry_bytes(namelen));
-    put_be32(di + XFS_DI_MTIME, (uint32_t)now_s);
-    put_be32(di + XFS_DI_CTIME, (uint32_t)now_s);
-    reseal(di, fs->inodesize, XFS_DI_CRC);
+    xfs_put_be64(di + XFS_DI_SIZE, used + sf_entry_bytes(namelen));
+    xfs_put_be32(di + XFS_DI_MTIME, (uint32_t)now_s);
+    xfs_put_be32(di + XFS_DI_CTIME, (uint32_t)now_s);
+    xfs_reseal(di, fs->inodesize, XFS_DI_CRC);
     bcache_dirty(b);
     bcache_put(fs->cache, b);
     return KERR_OK;
@@ -429,7 +436,7 @@ int xfs_create(struct xfs *fs, const struct xfs_inode *dir, const char *name, ui
     }
     rc = take_inode(fs, xfs_fsb_ag(fs, dir->ino >> fs->inopblog), &ino);
     if (rc == KERR_OK) {
-        rc = count_one_inode_used(fs);
+        rc = xfs_count_inodes_free(fs, -1);
     }
     if (rc == KERR_OK) {
         rc = write_new_inode(fs, ino, mode, now_s);

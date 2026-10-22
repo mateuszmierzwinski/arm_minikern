@@ -405,10 +405,13 @@ static bool same_string(const char *a, const char *b) {
  * rather than a silent success. */
 static int32_t unlink_path(const char *path) {
     const char *rest;
-    if (!path_under(path, "/tmp", &rest)) {
-        return KERR_ROFS;
+    if (path_under(path, "/tmp", &rest)) {
+        return tmpfs_unlink(rest);
     }
-    return tmpfs_unlink(rest);
+    if (xfsfs_mounted() && path_under(path, xfsfs_prefix(), &rest)) {
+        return xfsfs_unlink(rest);
+    }
+    return KERR_ROFS;
 }
 
 static int32_t sys_unlink(struct trapframe *tf) {

@@ -59,7 +59,7 @@ Step by step: each phase in `TASKS.md` ends with something that boots and is tes
 | P10 SMP | **Done (2026-10-22).** All four Cortex-A7s run user code. One ticket spinlock around the kernel (`kernel/klock.h`) replaces "IRQs masked = locked", taken at `trap_dispatch` and released at `trap_exit`; each core initialises what is its own (vector table, interrupt interface, tick, VFP, address-space regime); TLB maintenance is the broadcast form. Go sees four CPUs and uses them: 4× the work in 1.6× the time, with every core showing kernel entries. Seven single-core assumptions turned out to be bugs — they are listed in TASKS.md P10.3, and `minikern.hangcheck` exists because the last one was invisible without it. |
 | P8 fork/exec | **Done (2026-10-22).** Go's `os/exec` runs programs: `clone(CLONE_VM\|CLONE_VFORK)`, own pipes, `execve`, `wait4`, zombies that keep an exit status for their parent. Measured from a real Go binary rather than guessed, including that refusing `CLONE_PIDFD` makes Go fall back on its own. |
 | P11 Thermal/DVFS | **Policy done, hardware unverifiable here (2026-10-22).** A pure, host-tested policy (temperature overrules load, hysteresis against flapping) and a governor driven through ports, proved end to end against a ramping fake sensor (`minikern.cpufreq=test`). The H3 sensor and PLL adapters have **never run on silicon** — QEMU models neither — so the real path is off unless `minikern.cpufreq=on`. |
-| P9 Storage | **NBD, XFS reading, formatting, logged writes and creating files (2026-10-22).** Our own NBD client over our own TCP, a buffer cache, `/dev/nbd0`, a Go NBD server in-tree — and an XFS v5 reader that mounts filesystems Linux made, lists every directory shape and reads files byte for byte, refusing every feature it does not fully understand and every dirty log. A Go program formats a volume over the network (`userland/internal/xfsmk`) and `mount("/dev/nbd0", "/mnt", "xfs", …)` mounts it; `xfs_repair` finds nothing wrong with what the board writes (`XFS.md`). |
+| P9 Storage | **NBD, and XFS a program can actually use (2026-10-22): reading, formatting, logged writes, creating files, growing them and removing them.** Our own NBD client over our own TCP, a buffer cache, `/dev/nbd0`, a Go NBD server in-tree — and an XFS v5 reader that mounts filesystems Linux made, lists every directory shape and reads files byte for byte, refusing every feature it does not fully understand and every dirty log. A Go program formats a volume over the network (`userland/internal/xfsmk`) and `mount("/dev/nbd0", "/mnt", "xfs", …)` mounts it; `xfs_repair` finds nothing wrong with what the board writes (`XFS.md`). |
 
 A Go program on the board can now also reach a **network block device** and
 read an **XFS filesystem** off it — the volume being a file on a server, and
@@ -284,8 +284,9 @@ src/
 │   ├── bcache.*    a buffer cache over one, because the device is a network away
 │   ├── nbd.*       the NBD client: a volume that is a file on a server
 │   ├── xfs/        XFS v5 (XFS.md): superblock, inodes, extents, directories
-│   │               in all three shapes, a clean-log check, writing the log,
-│   │               and creating a file from the inode btrees
+│   │               in all three shapes, the log (checked and written), and
+│   │               the inode and free-space btrees — creating a file,
+│   │               growing it and removing it
 │   └── net/        the IPv4 stack, all pure and host-tested
 │       ├── net.h       the one public header (netif, ports, UDP, ICMP)
 │       ├── net_eth.c   Ethernet II framing and the input entry point
