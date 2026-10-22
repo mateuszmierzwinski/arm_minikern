@@ -142,6 +142,18 @@ kernel on 2026-10-21:
   powers it up and sets its MDIO address (1). The bit layout must be checked against
   the datasheet. This register is the difference between "link up" and "nothing" on
   real hardware, while QEMU does not model it at all.
+- **Thermal sensor (`0x01C25000`)**: needs its bus clock ungated (`0x068` bit 8), its
+  reset released (`0x2D0` bit 8) and its module clock enabled (`0x074` bit 31, divider
+  0 for 24 MHz) before any of its registers mean anything. **This kernel did none of
+  it until 2026-10-22** — see §10. All three are verified against QEMU's clock model
+  (`hwreport_qemu_test`); the sensor itself has no model.
+  **Its conversion constants are disputed.** The datasheet's are
+  `223000 - raw * 119100 / 1000`; an implementation that runs on this hardware uses
+  `217000 - raw * 1211 / 10`, about 9 °C cooler at a room-temperature sample. The
+  datasheet's are in force, because the rule is that the datasheet and a measurement
+  decide, and because they read hotter, so the error throttles early. The hardware
+  report prints both for every sample, so one reading from a room of a known
+  temperature settles it.
 - SID (`0x01C14200`) holds the chip's unique ID. U-Boot derives the NEO's MAC address
   from it, and we will do the same (a locally administered MAC built from the SID), so
   a board keeps one MAC across reboots.
@@ -237,7 +249,7 @@ green. `:qemu_tests` is a `test_suite` naming them all:
 | `entropy_qemu_test` | two boots of one image produce different random bytes |
 | `cpuoff_qemu_test` | idle cores power themselves off and come back, four cores still offered, same result |
 | `cpufreq_qemu_test` | P11: the governor against a ramping fake sensor, with and without a supply pin |
-| `hwreport_qemu_test` | P0.9: the hardware report is complete, and the EMAC's four clock/reset bits read back as the datasheet says |
+| `hwreport_qemu_test` | P0.9: the hardware report is complete, and seven clock/reset bits read back as documented — the EMAC's four and the thermal sensor's three |
 | `cpuclock_qemu_test` | P11: the **real** clock adapter against QEMU's clock block — every operating point set and read back from `PLL_CPUX`, and every refusal |
 | `sdboot_qemu_test` | P0.9: the real chain — BROM → SPL → U-Boot → `boot.scr` → `bootm` with U-Boot's device tree → a Go program from the ramdisk, all from the card image that would be written to a board |
 
@@ -653,6 +665,18 @@ syscall interface above. No `/proc/sys` tree is wanted.
   `test/tools/netecho`, a Go program, and verify the host side independently first.
 - **`filter-dump` cannot attach to a board's built-in NIC**, so there is no easy
   pcap of the EMAC. `minikern.netstat=1` and the TCP counters exist for that reason.
+- **A driver can be complete and still never have been switched on.** `ths.c` wrote
+  the thermal sensor's control registers without ungating its bus clock, releasing its
+  reset or starting its module clock — none of which QEMU models, so nothing could show
+  it. On a board the block would have been unclocked and held in reset: every write
+  ignored, every reading refused, and the governor running for ever on the worst-case
+  assumption **while looking like it worked**. What found it was reading the device tree
+  of an implementation that runs on these boards and noticing it declares two clocks
+  and a reset for a node this driver touched neither of. A peripheral's clocks and
+  resets are part of its contract, and "the registers are right" is not the same as
+  "the block is awake". The same cross-check independently confirmed this kernel's
+  existing EMAC numbers (reset `0x2c0` bit 17, PHY reset `0x2c8` bit 2) and exposed the
+  disputed temperature constants in §3.
 - **A fake proves the policy and nothing about the registers.** The frequency
   governor was tested end to end against a fake clock, so the policy was right and
   the adapter's arithmetic had never run: varying only N caps `PLL_CPUX` at 768 MHz,

@@ -101,13 +101,29 @@ Legend: `[x]` done · `[ ]` to do · `[~]` partial
       bits the driver sets are now read back and compared with the datasheet in
       `hwreport_qemu_test` — all four correct. Only the **system-control register that
       selects the internal PHY** (`01c00030`) has no model.
-      **What is left, and why it cannot be done here** — three registers and a pin:
-      the syscon PHY-select register, the thermal sensor's constants (QEMU models no
-      sensor; both `0` and `0xfff` are refused as "no sensor", which is what it reads
-      here), and the PIO pin for VDD_CPUX (QEMU models no PIO). So
-      `minikern.cpufreq=on` has still never read a real temperature or moved a real
-      regulator, and the banner has never appeared on the NEO's own header. That needs
-      the board, a 3.3 V serial adapter and root to write a card — and then one
+      **And writing the report found a bug that the board would have shown as a dead
+      sensor.** `ths.c` wrote the sensor's control registers without ungating its bus
+      clock, releasing its reset or starting its module clock. QEMU models no sensor,
+      so nothing here could reveal it; what did was reading the device tree of an
+      implementation that runs on these boards, which declares two clocks and a reset
+      for a node this driver touched neither of. On silicon the block would have been
+      unclocked and held in reset — every write ignored, every reading refused, and the
+      governor running for ever on the worst case **while appearing to work**. All
+      three are now set and verified against QEMU's clock model, which also
+      independently confirmed this kernel's existing EMAC reset numbers.
+      That cross-check also turned up a **disputed conversion**: the datasheet's
+      constants and a hardware-tested implementation's differ by about 9 °C at room
+      temperature. The datasheet's stay in force — the rule is that the datasheet and a
+      measurement decide, and they read hotter, so the error throttles early — and the
+      report prints **both** for every sample, so one reading from a room of a known
+      temperature settles it rather than leaving it to be argued.
+      **What is left, and why it cannot be done here** — two registers, one constant
+      and a pin: the syscon PHY-select register (`01c00030`, QEMU stubs that block),
+      which of the two temperature conversions the silicon actually means, whether the
+      sensor then produces samples at all, and the PIO pin for VDD_CPUX (QEMU models no
+      PIO). So `minikern.cpufreq=on` has still never read a real temperature or moved a
+      real regulator, and the banner has never appeared on the NEO's own header. That
+      needs the board, a 3.3 V serial adapter and root to write a card — and then one
       command: boot the card with `minikern.hwreport=1` and read the report.
 - [x] **P0.10 Version stamp (2026-10-22).** The build part of `MAJOR.MINOR.BUILD`
       is Bazel's own build timestamp, written into a generated C file by the

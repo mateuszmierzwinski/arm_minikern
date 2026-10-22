@@ -298,9 +298,18 @@ no model to check them against:
   and sets its MDIO address. On a board this register is the difference between "link
   up" and nothing. (The EMAC's clock gates and resets are *not* in this category —
   they live in the clock block, which QEMU does model, and all four are verified.)
-- **The thermal sensor's offset and slope.** QEMU models no sensor, so the constants
-  have never been compared with a real temperature. Both `0` and `0xfff` are refused
-  as "no sensor", so a wrong reading cannot quietly drive the governor.
+- **Which of two temperature conversions the silicon means.** The datasheet gives
+  `223000 - raw * 119100 / 1000`; an implementation that runs on this hardware uses
+  `217000 - raw * 1211 / 10`, about 9 °C cooler at a room-temperature sample. The
+  datasheet's is in force (it reads hotter, so the error throttles early) and the
+  report prints **both** for every sample — so one reading in a room whose temperature
+  you know settles it. Whether the sensor produces samples at all is the same
+  question: QEMU models no sensor, and both `0` and `0xfff` are refused as "no
+  sensor", so a wrong reading cannot quietly drive the governor.
+  (Its clock gate, reset and module clock are *not* in this category any more —
+  they live in the clock block, which QEMU models, and all three are verified. They
+  were also missing entirely until 2026-10-22, which would have presented on a board
+  as a sensor that never produced a reading.)
 - **The PIO pin that switches VDD_CPUX** (`minikern.vddcpux=`), since QEMU models no
   PIO. Without it the operating points above 816 MHz are not offered at all, which is
   the safe direction to be wrong in.

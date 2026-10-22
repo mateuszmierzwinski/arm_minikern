@@ -766,10 +766,15 @@ void kmain(uint32_t r0, uint32_t machine, uint32_t r2, uint32_t entry_cpsr) {
     bring_up_network();
     syscall_set_trace(cmdline_equals(boot_cmdline, "minikern.strace", "1"));
     sched_set_hangcheck((uint32_t)cmdline_number("minikern.hangcheck", 0));
+    bring_up_cpufreq();
+    /* After everything else has been brought up, so that the gates, resets
+     * and control registers it prints are the ones the drivers actually set
+     * rather than the values they were found at. The first version ran
+     * before the governor and reported the sensor's clock as ungated, which
+     * is true and useless. */
     if (cmdline_equals(boot_cmdline, "minikern.hwreport", "1")) {
         h3_hwreport();
     }
-    bring_up_cpufreq();
     bring_up_watchdog();
     maybe_selftest(boot_cmdline);
     kprintf("minikern: boot complete\n");

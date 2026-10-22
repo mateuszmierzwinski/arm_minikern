@@ -25,18 +25,66 @@
 #define THS_DATA_MASK 0xfffu
 #define THS_PERIOD    0x0100u
 
+/* The sensor needs its bus clock ungated, its reset released and its module
+ * clock running before any of its registers mean anything. **This was
+ * missing**, and on a board it would have left the block unclocked and held
+ * in reset: every write ignored, every read a stale or floating value, and
+ * a governor running for ever on the worst-case assumption while looking
+ * like it worked. QEMU models no sensor, so nothing here could have shown
+ * it; the device tree of an implementation that runs on these boards did —
+ * it declares two clocks and a reset for this node, and this driver touched
+ * neither.
+ *
+ * Offsets corroborated against that implementation's clock table
+ * (CLAUDE.md §3), which also agrees with this kernel's existing EMAC
+ * numbers — the same table gives the EMAC reset as 0x2c0 bit 17 and the
+ * internal PHY's as 0x2c8 bit 2, which is what emac.c already used. */
+#define CCU_BUS_GATE2  0x0068u
+#define CCU_BUS_RST3   0x02d0u
+#define CCU_THS_CLK    0x0074u
+#define CCU_THS_BIT    (1u << 8)   /* in both the gate and the reset register */
+#define THS_CLK_ENABLE (1u << 31)
+#define THS_CLK_DIV1   0u          /* 24 MHz: the rate the sensor's timing assumes */
+
 /* Raw sample to milli-degrees, as the H3's datasheet gives it:
  *
  *     T(°C) = (OFFSET_mC - raw * SLOPE_uC_per_lsb / 1000) / 1000
  *
- * The constants are the part that must be checked on the board (CLAUDE.md
- * §3). A sample of zero means the sensor has not produced one yet, which is
- * not 223 °C and is reported as a failure instead. */
+ * **The constants are disputed, and the board decides.** These are the
+ * datasheet's. An implementation that runs on this hardware uses
+ * `217000 - raw * 1211 / 10` instead — an offset 6 °C lower and a slope of
+ * 121.1 rather than 119.1 µC per LSB, which at a room-temperature sample
+ * differs by about 9 °C. The datasheet's are kept, because the rule here is
+ * that the datasheet and a measurement decide rather than another
+ * implementation (CLAUDE.md §0), and because they read *hotter*, so the
+ * error throttles early rather than late. `minikern.hwreport=1` prints both
+ * conversions for every sample, so the first reading from a board in a room
+ * of a known temperature settles it.
+ *
+ * A sample of zero means the sensor has not produced one yet, which is not
+ * 223 °C and is reported as a failure instead — the same choice that
+ * implementation makes. */
 #define THS_OFFSET_mC 223000
 #define THS_SLOPE_uC  119100
 
 static volatile uint32_t *ths(uint32_t off) {
     return (volatile uint32_t *)io_virt(H3_THS_BASE + off);
+}
+
+static volatile uint32_t *ccu(uint32_t off) {
+    return (volatile uint32_t *)io_virt(H3_CCU_BASE + off);
+}
+
+/* Ungates the sensor, releases its reset and starts its module clock.
+ *
+ * Only ever **sets** bits, never clears them: these offsets are hardware
+ * facts this kernel has not yet checked on silicon, and setting a gate or
+ * releasing a reset for the wrong block costs nothing, where clearing one
+ * could stop a peripheral something else depends on. */
+static void ths_clock_on(void) {
+    *ccu(CCU_BUS_GATE2) |= CCU_THS_BIT;
+    *ccu(CCU_BUS_RST3) |= CCU_THS_BIT;
+    *ccu(CCU_THS_CLK) |= THS_CLK_ENABLE | THS_CLK_DIV1;
 }
 
 static int32_t raw_to_mC(uint32_t raw) {
@@ -63,6 +111,7 @@ static int ths_read(void *self, int32_t *mC) {
 
 struct thermal_port h3_thermal_port(void) {
     struct thermal_port p = {.read_mC = ths_read, .self = NULL};
+    ths_clock_on();
     *ths(THS_CTRL0) = THS_ACQ0;
     *ths(THS_CTRL2) = THS_SENSE_EN | (THS_ACQ0 << THS_ACQ1_SHIFT);
     *ths(THS_FILTER) = THS_FILTER_EN | THS_FILTER_2;

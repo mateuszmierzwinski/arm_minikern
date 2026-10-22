@@ -16,6 +16,9 @@
 #define CCU_BUS_GATE4   0x0070u
 #define CCU_BUS_RST0    0x02c0u
 #define CCU_BUS_RST2    0x02c8u
+#define CCU_BUS_GATE2   0x0068u
+#define CCU_BUS_RST3    0x02d0u
+#define CCU_THS_CLK     0x0074u
 #define THS_CTRL2       0x0040u
 #define THS_FILTER      0x0070u
 #define THS_DATA0       0x0080u
@@ -63,17 +66,34 @@ static void report_clocks(void) {
 /* Eight samples, because the first one after enabling the sensor is not
  * trustworthy and a single reading cannot show whether the block is
  * producing anything at all. */
+/* The sensor's own clocking, which has to be right before a sample means
+ * anything, and which this kernel did not touch until the device tree of an
+ * implementation that runs on these boards said it must. */
+static void report_thermal_clocks(void) {
+    kprintf("hw: ccu bus_gate2 %08x (THS gate is bit 8, expected set)\n", mmio(H3_CCU_BASE, CCU_BUS_GATE2));
+    kprintf("hw: ccu bus_rst3  %08x (THS reset is bit 8, expected set = released)\n",
+            mmio(H3_CCU_BASE, CCU_BUS_RST3));
+    kprintf("hw: ccu ths_clk   %08x (enable is bit 31, divider bits 1-0 = 0 for 24 MHz)\n",
+            mmio(H3_CCU_BASE, CCU_THS_CLK));
+}
+
 static void report_thermal(void) {
+    report_thermal_clocks();
     kprintf("hw: ths ctrl2 %08x filter %08x — **QEMU models no thermal sensor**; "
             "a stub reads 0, an unclocked block reads 0xfff, and both are refused\n",
             mmio(H3_THS_BASE, THS_CTRL2), mmio(H3_THS_BASE, THS_FILTER));
     for (uint32_t i = 0; i < 8u; i++) {
         uint32_t raw = mmio(H3_THS_BASE, THS_DATA0) & 0xfffu;
+        /* Both candidate conversions, because they disagree by about 9 °C at
+         * room temperature and one reading from a room of a known
+         * temperature settles which is right (board/h3/ths.c). */
         int32_t mC = 223000 - (int32_t)((raw * 119100u) / 1000u);
-        kprintf("hw: ths sample %u: raw %03x -> %d mC%s\n", i, raw, mC,
+        int32_t alt = 217000 - (int32_t)((raw * 1211u) / 10u);
+        kprintf("hw: ths sample %u: raw %03x -> %d mC (datasheet) / %d mC (the other formula)%s\n",
+                i, raw, mC, alt,
                 raw == 0 ? " — raw 0 means no sample, refused by the driver"
                 : raw == 0xfffu ? " — raw 0xfff means no sensor, refused by the driver"
-                                : " (plausible at room temperature: 20000-45000)");
+                                : " — plausible in a room: 20000-45000");
         for (volatile uint32_t spin = 0; spin < 200000u; spin++) {
         }
     }
@@ -89,6 +109,6 @@ void h3_hwreport(void) {
     kprintf("hw: ---- end of report ----\n");
     kprintf("hw: the PHY's own answer is on the `net: eth0` line above: its ID, its MDIO address, "
             "and whether the link came up\n");
-    kprintf("hw: what only a board can settle: the ephy_clk register above, the ths samples above, "
-            "and the VDD_CPUX pin (minikern.vddcpux=, QEMU models no PIO)\n");
+    kprintf("hw: what only a board can settle: the ephy_clk register above; which of the two "
+            "ths conversions is right; and the VDD_CPUX pin (minikern.vddcpux=, QEMU models no PIO)\n");
 }

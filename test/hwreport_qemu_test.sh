@@ -27,7 +27,7 @@ command -v qemu-system-arm >/dev/null || { echo "qemu-system-arm is not installe
 status=0
 timeout 120 qemu-system-arm -M orangepi-pc -display none -monitor none -serial "file:$log" \
     -nic user -kernel "$image" \
-    -append "console=uart0 minikern.halt=poweroff minikern.hwreport=1" || status=$?
+    -append "console=uart0 minikern.halt=poweroff minikern.cpufreq=on minikern.hwreport=1" || status=$?
 grep '^hw:' "$log" || true
 [ "$status" -eq 0 ] || { cat "$log"; echo "FAIL: qemu exited $status" >&2; exit 1; }
 
@@ -60,6 +60,25 @@ check_bit "bus_gate0" 17 "the EMAC's clock gate"
 check_bit "bus_rst0" 17 "the EMAC's reset release"
 check_bit "bus_gate4" 0 "the internal PHY's clock gate"
 check_bit "bus_rst2" 2 "the internal PHY's reset release"
+
+# The thermal sensor's own clocking, which this kernel did not do at all
+# until an implementation that runs on these boards was consulted: it
+# declares two clocks and a reset for the sensor, and the driver touched
+# neither, so on a board the block would have been unclocked and held in
+# reset — every write ignored and every reading refused, with the governor
+# running for ever on the worst-case assumption while appearing to work.
+# QEMU models no sensor, but it does model the clock block, so the sequence
+# that wakes the sensor is checkable even though the sensor is not.
+check_bit "bus_gate2" 8 "the thermal sensor's clock gate"
+check_bit "bus_rst3" 8 "the thermal sensor's reset release"
+check_bit "ths_clk" 31 "the thermal sensor's module clock"
+
+# The two candidate conversions must both be printed: they differ by about
+# 9 °C at room temperature, and one reading from a board settles which the
+# datasheet actually means.
+grep -qF "(datasheet) /" "$log" ||
+    fail "the report does not print both candidate temperature conversions"
+echo "ok: both candidate conversions are reported, for a board to decide between"
 
 # And the sensor, which is the opposite case: no model at all, so the only
 # correct behaviour is to refuse what it reads.
