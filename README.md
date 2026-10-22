@@ -235,10 +235,53 @@ network stack, the allocators and the page-table encoding are all tested on the 
 
 ## Real hardware
 
-Not tried yet (`TASKS.md` P0.9). The boot chain is BROM → U-Boot SPL → mainline
-U-Boot (`nanopi_neo_defconfig`) → `bootm`, and the recipe is in `CLAUDE.md` §3. The
-EMAC's clock, reset and PHY-select bits are the part QEMU does not model at all, so
-they are the first thing that will need a scope and a serial cable.
+**The card image is built and the boot chain is tested; what is left needs the board
+in hand.** The chain is BROM → U-Boot SPL → mainline U-Boot → `boot.scr` → `bootm`
+with U-Boot's own device tree, and `sdboot_qemu_test` boots exactly that — the same
+image you would write to a card — rather than using QEMU's `-kernel` shortcut.
+
+Two things only that path shows, and both matter on silicon:
+
+- **The generic timer runs at 24 MHz**, the real H3 frequency, where `-kernel`
+  reports 62.5 MHz. A kernel that hard-coded either number would be wrong on one
+  path and right on the other; this one reads `CNTFRQ`.
+- **U-Boot's PSCI implements `CPU_ON` but refuses `SYSTEM_OFF`.** All four cores come
+  up, and the board cannot power itself off — so the kernel reports the refusal and
+  idles, which is what it should do.
+
+### Making a card
+
+Fedora 43 ships no armv7 U-Boot any more (`uboot-images-armv7` is gone; only the
+armv8 package remains), so build one first — no root required:
+
+```bash
+scripts/build_uboot.sh nanopi_neo          # or orangepi_pc, which QEMU emulates
+bazel build //:minikern.uImage //:goabi_rootfs
+scripts/mksdcard.sh \
+    -u ../../../../tools/uboot/nanopi_neo/u-boot-sunxi-with-spl.bin \
+    -k bazel-bin/minikern.uImage \
+    -r bazel-bin/goabi_rootfs.tar \
+    -a "console=uart0" \
+    -o /tmp/minikern-sd.img
+sudo dd if=/tmp/minikern-sd.img of=/dev/sdX bs=4M conv=fsync   # the card, not a disk
+```
+
+Then connect the NEO's 3-pin debug header (UART0, **3.3 V**, 115200 8N1 — not 5 V),
+power up, and the banner appears:
+
+```bash
+picocom -b 115200 /dev/ttyUSB0
+```
+
+The card's layout is U-Boot at 8 KiB (sector 16, where the BROM looks), and one FAT
+partition at 1 MiB holding `minikern.uImage`, `rootfs.uImage` and `boot.scr`.
+
+### What the board still has to settle
+
+The EMAC's clock, reset and PHY-select bits (`EMAC_EPHY_CLK_REG`) are not modelled by
+QEMU at all, and neither is the thermal sensor or the PIO, so the frequency
+governor's hardware path (`minikern.cpufreq=on`) and the VDD_CPUX pin have never run
+on silicon. Those are the measurements the board is for.
 
 ## Documentation
 

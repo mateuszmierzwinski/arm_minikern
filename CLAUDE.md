@@ -48,7 +48,7 @@ Step by step: each phase in `TASKS.md` ends with something that boots and is tes
 
 | Phase | State |
 |---|---|
-| P0 Boot | **Done in QEMU (2026-10-21).** HYP/SVC entry, high-half kernel with MMU and caches, exception vectors and panic, ATAG *and* FDT boot info, PSCI power-off. Not yet tried on the NEO (the operator has one, plus a USB-serial adapter: P0.9). |
+| P0 Boot | **Done in QEMU (2026-10-21).** HYP/SVC entry, high-half kernel with MMU and caches, exception vectors and panic, ATAG *and* FDT boot info, PSCI power-off. **The real boot chain is tested from an SD-card image** (BROM → SPL → U-Boot → `boot.scr` → `bootm` with U-Boot's device tree), which is where the timer turns out to run at 24 MHz rather than QEMU's 62.5 and where PSCI refuses `SYSTEM_OFF`. Not yet run on the NEO itself: that needs the board and a 3.3 V serial adapter (P0.9). |
 | P1 Network | **Done in QEMU (2026-10-21).** Own EMAC driver, own IPv4 stack: DHCP lease, ARP, ICMP echo, UDP, and a hardened posture against the classes that have hit other small stacks. |
 | P2 Kernel core | **Done (2026-10-21).** Page allocator, kernel heap, user address spaces with lazy faults, GIC + generic-timer tick, preemptive scheduler, threads. |
 | P3 Syscalls / TinyGo | **Done (2026-10-21).** TinyGo 0.39 binaries run unchanged. |
@@ -67,7 +67,7 @@ the filesystem one `mkfs.xfs` made — and a write that grows a file into blocks
 it already owns goes through the **log**, as a transaction `xfs_logprint`
 decodes field by field (XFS.md §9).
 
-**The goal is met in QEMU:** a standard `GOOS=linux GOARCH=arm` Go binary, and a TinyGo one, run unchanged on a kernel that copies no Linux code — and a Go program can now fetch its own root filesystem over the network and talk TCP and UDP. 61 Bazel test targets prove it on every change.
+**The goal is met in QEMU:** a standard `GOOS=linux GOARCH=arm` Go binary, and a TinyGo one, run unchanged on a kernel that copies no Linux code — and a Go program can now fetch its own root filesystem over the network and talk TCP and UDP. 62 Bazel test targets prove it on every change.
 
 ---
 
@@ -116,7 +116,9 @@ kernel on 2026-10-21:
 | ATAGs QEMU passes | CORE, MEM (1 GiB at `0x40000000`), CMDLINE (from `-append`), INITRD2 with `-initrd` | `core/bootinfo.c` reads them |
 | `-dtb` / `-initrd` placement | initrd at `0x48000000` (DRAM + 128 MiB), the DTB right after it (`0x48001000` for a small initrd); QEMU fills `/chosen` bootargs and `linux,initrd-*` itself | both lie in the RAM the pmm reserves at boot |
 | RAM | **QEMU refuses anything but 1 GiB** for this machine | the kernel clamps memory to the NEO's 512 MiB |
-| Generic timer | CNTFRQ = **62.5 MHz under QEMU** (24 MHz on real H3 silicon) | always read CNTFRQ; never hard-code it |
+| Generic timer | CNTFRQ = **62.5 MHz** entered with `-kernel`, and **24.000 MHz** — the real H3 frequency — when the same kernel is booted from an SD card through U-Boot (measured 2026-10-22, `sdboot_qemu_test`) | always read CNTFRQ; never hard-code it. One number is wrong on each path, and only the card path shows it |
+| PSCI through U-Boot | `CPU_ON` works (all four cores come up), **`SYSTEM_OFF` is refused** | a board booted from a card cannot power itself off: the kernel reports the refusal and idles. QEMU's own PSCI, on the `-kernel` path, does power off |
+| SD boot | QEMU's BROM reads the SPL from **sector 16** and U-Boot finds its payload 32 KiB further on (`SYS_MMCSD_RAW_MODE_U_BOOT_SECTOR = 0x40`); `boot.scr` on the first FAT partition is run by the default `bootcmd` | `scripts/mksdcard.sh` builds the card, and the image that boots in QEMU is the one written to hardware |
 | UART0 | `0x01C28000`, 16550-style, registers 4 bytes apart, LSR at `+0x14` | works without setup under QEMU; U-Boot sets it up on hardware |
 | EMAC MDIO | `0x01C30000` + `0x48` (MII_CMD) / `+0x4C` (MII_DATA) | the internal PHY answers at **address 1**, ID `0x0044:0x1400` (it also appears at `0x11`; QEMU decodes only 4 address bits) |
 | PSCI | `smc #0` with r0 = `0x84000008` (SYSTEM_OFF) ends QEMU, exit status 0, in about 40 ms | the boot test powers off instead of timing out |
@@ -168,6 +170,8 @@ Host tools. Each is checked before use (master Rule 27.7 in spirit):
 | `arm-linux-gnu-gcc` 15.2, binutils 2.45 | `gcc-arm-linux-gnu`, `binutils-arm-linux-gnu` | the kernel. This is a bare cross compiler with no libc, which suits a freestanding kernel. `libgcc.a` provides `__aeabi_uldivmod` |
 | `mkimage` | `uboot-tools` | the uImage wrapper for `bootm` / QEMU |
 | `qemu-system-arm` 10.1.5 | `qemu-system-arm` | running and testing the kernel |
+| U-Boot 2025.07 for `orangepi_pc` | **built by `scripts/build_uboot.sh`** into the monorepo's gitignored `tools/uboot/` | the SD-card boot test. Fedora 43 ships **no** armv7 U-Boot (`uboot-images-armv7` is gone, only armv8 remains), and packages need root, so it is built as a per-machine host tool — the same convention Rule 29 uses for the scanners. Three config knobs have to go off (`TOOLS_LIBCRYPTO`, `TOOLS_KWBIMAGE`, `TOOLS_MKEFICAPSULE`: Fedora 43's openssl-devel has no `engine.h` and there is no gnutls), and `binman` cannot run (setuptools 81 dropped `pkg_resources`), so the script assembles the final file itself |
+| `sfdisk`, `mkfs.vfat`, `mcopy` | `util-linux`, `dosfstools`, `mtools` | building the SD-card image without root |
 | `qemu-arm` (user mode) | `qemu-user` | **measuring** what a Go binary asks of Linux: `qemu-arm -strace ./bin` |
 | `tinygo` 0.39.0 (LLVM 19, Go 1.25.5) | `tinygo` | `/init` (P4) |
 | `go` 1.26 | host | the `gc` comparison binaries (§7) |
@@ -229,6 +233,7 @@ green. `:qemu_tests` is a `test_suite` naming them all:
 | `entropy_qemu_test` | two boots of one image produce different random bytes |
 | `cpuoff_qemu_test` | idle cores power themselves off and come back, four cores still offered, same result |
 | `cpufreq_qemu_test` | P11: the governor against a ramping fake sensor, with and without a supply pin |
+| `sdboot_qemu_test` | P0.9: the real chain — BROM → SPL → U-Boot → `boot.scr` → `bootm` with U-Boot's device tree → a Go program from the ramdisk, all from the card image that would be written to a board |
 
 **Userland programs** live in `userland/cmd/<name>/main.go` and build with rules_go
 (`goos = "linux"`, `goarch = "arm"`, `pure = "on"`). `minikern_rootfs` (in `minikern.bzl`)

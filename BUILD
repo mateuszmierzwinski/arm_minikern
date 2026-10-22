@@ -4,6 +4,7 @@ load("@rules_shell//shell:sh_test.bzl", "sh_test")
 load("//:version.bzl", "MINIKERN_VERSION")
 load("@rules_pkg//pkg:tar.bzl", "pkg_tar")
 load(":minikern.bzl", "build_stamp", "device_tree", "h3_init", "kernel_image", "minikern_rootfs", "stamp_flag")
+load("//toolchain:paths.bzl", "UBOOT_SUNXI_SPL")
 
 # minikern — a from-scratch kernel for the NanoPi NEO (Allwinner H3).
 #
@@ -969,6 +970,27 @@ sh_test(
     tags = ["manual"],
 )
 
+# P0.9: the real boot chain from an SD-card image — the one a board uses, and
+# the one `-kernel` skips. Needs a per-machine U-Boot (scripts/build_uboot.sh),
+# whose path comes from toolchain/paths.bzl.
+sh_test(
+    name = "sdboot_qemu_test",
+    size = "large",
+    srcs = ["test/sdboot_qemu_test.sh"],
+    args = [
+        "$(rootpath :minikern.uImage)",
+        "$(rootpath :goabi_rootfs)",
+        "$(rootpath scripts/mksdcard.sh)",
+    ],
+    data = [
+        ":goabi_rootfs",
+        ":minikern.uImage",
+        "scripts/mksdcard.sh",
+    ],
+    env = {"MINIKERN_UBOOT": UBOOT_SUNXI_SPL},
+    tags = ["manual"],
+)
+
 # P11.4: an idle core powers itself off, and comes back when work appears —
 # which on this chip saves more than stepping the clock does.
 sh_test(
@@ -1268,6 +1290,7 @@ test_suite(
         ":go_hello_qemu_test",
         ":cpufreq_qemu_test",
         ":cpuoff_qemu_test",
+        ":sdboot_qemu_test",
         ":entropy_qemu_test",
         ":netboot_two_guests_test",
         ":oom_qemu_test",

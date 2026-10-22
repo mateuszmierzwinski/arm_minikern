@@ -65,11 +65,38 @@ Legend: `[x]` done · `[ ]` to do · `[~]` partial
       time something else boots it, and a silent board is the hardest kind to
       look at. It is also self-checking: a wrong divisor, gate or frame makes the
       console go silent, which every test in the project notices at once.
-- [ ] **P0.9 Real hardware.** An SD card with mainline U-Boot (`nanopi_neo`), a
-      `boot.scr` that runs `bootm` with `${fdtcontroladdr}`, and a documented flash
-      procedure in `README.md`. The banner must appear on the NEO's debug header.
-      Optionally, the same SD image under QEMU (`-sd`, U-Boot `orangepi_pc`) to test
-      the U-Boot path without the board.
+- [~] **P0.9 Real hardware — the card and the chain are done and tested; the banner
+      on the NEO needs the board (2026-10-22).** Everything this task asks for that
+      does not require holding the hardware is finished, including the part it offered
+      as optional, which turned out to be the valuable half.
+      **Done and proved:** `scripts/mksdcard.sh` builds the card — U-Boot at 8 KiB
+      (sector 16, where the BROM looks), one FAT partition at 1 MiB holding
+      `minikern.uImage`, `rootfs.uImage` and a `boot.scr` that runs `bootm` with
+      `${fdtcontroladdr}` — and `sdboot_qemu_test` boots **that image**, not a
+      `-kernel` shortcut: BROM → SPL → U-Boot → `boot.scr` → `bootm` → the kernel
+      reading U-Boot's own device tree → a Go program out of the ramdisk. The flash
+      procedure is in `README.md`, and the image that boots in QEMU is byte for byte
+      the one that would be written to a card.
+      **Two facts only this path could show**, both now in CLAUDE.md §3:
+      the generic timer reports **24.000 MHz** here — the real H3 frequency — where
+      the `-kernel` path reports 62.5 MHz, so either number hard-coded would be wrong
+      on one path and nobody would have noticed; and U-Boot's PSCI implements `CPU_ON`
+      (four cores up) but **refuses `SYSTEM_OFF`**, so a board booted from a card
+      cannot power itself off — the kernel reports the refusal and idles, which is why
+      this test waits for a line rather than for QEMU to exit.
+      **A detour worth recording:** Fedora 43 ships no armv7 U-Boot at all
+      (`uboot-images-armv7` is gone, only `uboot-images-armv8` remains), and packages
+      need root. `scripts/build_uboot.sh` builds it as a per-machine host tool into
+      the gitignored `tools/uboot/` — the convention Rule 29 uses for the scanners —
+      and carries the three config knobs modern Fedora forces off
+      (`TOOLS_LIBCRYPTO`/`TOOLS_KWBIMAGE`: no `openssl/engine.h`;
+      `TOOLS_MKEFICAPSULE`: no gnutls) plus the assembly `binman` can no longer do
+      (setuptools 81 dropped `pkg_resources`). No U-Boot code enters this repository.
+      **What is left, and why it cannot be done here:** the banner on the NEO's debug
+      header, and with it the EMAC's clock/reset/PHY-select bits, the thermal sensor
+      and the PIO pin for VDD_CPUX — QEMU models none of them, so
+      `minikern.cpufreq=on` has still never run on silicon. That needs the board, a
+      3.3 V serial adapter and root to write a card.
 - [x] **P0.10 Version stamp (2026-10-22).** The build part of `MAJOR.MINOR.BUILD`
       is Bazel's own build timestamp, written into a generated C file by the
       `build_stamp` rule; the series comes from the monorepo's one constant as

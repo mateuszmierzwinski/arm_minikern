@@ -81,10 +81,18 @@ for log in "$tmp/plain.log" "$tmp/parked.log"; do
 done
 echo "ok: four cores are still offered to user space while some are off"
 
-# And the answer must be the same, parked or not.
+# And the answer must be the same, parked or not. A failure here prints the
+# log it is complaining about: the first version named a missing line from a
+# boot whose output it had never shown, so the one piece of evidence that
+# would have identified the check that failed was thrown away.
 for want in "ALL PASS" "random: "; do
-    grep -qF -- "$want" "$tmp/plain.log" || { echo "FAIL: the plain boot lacks: $want" >&2; exit 1; }
-    grep -qF -- "$want" "$tmp/parked.log" || { echo "FAIL: the parked boot lacks: $want" >&2; exit 1; }
+    for which in plain parked; do
+        grep -qF -- "$want" "$tmp/$which.log" && continue
+        echo "---- the $which boot"
+        cat "$tmp/$which.log"
+        echo "FAIL: the $which boot lacks: $want" >&2
+        exit 1
+    done
 done
 echo "ok: the workload produced the same result with cores powering off"
 echo PASS
