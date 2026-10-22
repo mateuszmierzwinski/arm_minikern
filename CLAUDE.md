@@ -160,13 +160,17 @@ kernel on 2026-10-21:
   0 for 24 MHz) before any of its registers mean anything. **This kernel did none of
   it until 2026-10-22** — see §10. All three are verified against QEMU's clock model
   (`hwreport_qemu_test`); the sensor itself has no model.
-  **Its conversion constants are disputed.** The datasheet's are
-  `223000 - raw * 119100 / 1000`; an implementation that runs on this hardware uses
-  `217000 - raw * 1211 / 10`, about 9 °C cooler at a room-temperature sample. The
-  datasheet's are in force, because the rule is that the datasheet and a measurement
-  decide, and because they read hotter, so the error throttles early. The hardware
-  report prints both for every sample, so one reading from a room of a known
-  temperature settles it.
+  **Its conversion constants are disputed, and ours have no citation.** At least three
+  conversions circulate for this part: this kernel's `223000 - raw * 119100 / 1000`; a
+  hardware-tested `217000 - raw * 1211 / 10` (equivalently 217000 with a divisor of
+  8253, i.e. 121.17 µC/LSB); and a third, quoted from a datasheet, which its user had
+  to correct by an empirical **51 °C** to get sensible readings — which is why "the
+  datasheet says so" is weak evidence for this particular sensor. This file's comment
+  used to assert ours were the datasheet's; that could not be supported and has been
+  withdrawn. They stay in force because they read **hotter** than the hardware-tested
+  pair at both room temperature and the trip points, so the error throttles early. The
+  report prints the raw sample and both conversions, so one reading settles it and a
+  third formula can be applied later without going back to the board.
 - SID (`0x01C14200`) holds the chip's unique ID. U-Boot derives the NEO's MAC address
   from it, and we will do the same (a locally administered MAC built from the SID), so
   a board keeps one MAC across reboots.

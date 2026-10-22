@@ -50,16 +50,31 @@
  *
  *     T(°C) = (OFFSET_mC - raw * SLOPE_uC_per_lsb / 1000) / 1000
  *
- * **The constants are disputed, and the board decides.** These are the
- * datasheet's. An implementation that runs on this hardware uses
- * `217000 - raw * 1211 / 10` instead — an offset 6 °C lower and a slope of
- * 121.1 rather than 119.1 µC per LSB, which at a room-temperature sample
- * differs by about 9 °C. The datasheet's are kept, because the rule here is
- * that the datasheet and a measurement decide rather than another
- * implementation (CLAUDE.md §0), and because they read *hotter*, so the
- * error throttles early rather than late. `minikern.hwreport=1` prints both
- * conversions for every sample, so the first reading from a board in a room
- * of a known temperature settles it.
+ * **The constants are disputed, and only a board can settle them.** There
+ * are at least three conversions in circulation for this part:
+ *
+ *   these:            223000 - raw * 119100 / 1000
+ *   hardware-tested:  217000 - raw * 1211 / 10   (and a second form of the
+ *                     same thing, 217000 with a divisor of 8253, which works
+ *                     out at 121.17 µC per LSB)
+ *   a third, quoted from a datasheet, that its user had to correct by an
+ *                     empirical 51 °C to get sensible readings at all.
+ *
+ * That third one is the useful signal: a datasheet-derived formula for this
+ * sensor has been reported needing a 51 °C fudge, so "the datasheet says so"
+ * is weak evidence here. **These constants' own provenance is a comment,
+ * not a citation** — this file used to claim they were the datasheet's, and
+ * that claim cannot be supported from anything available, so it has been
+ * withdrawn rather than repeated.
+ *
+ * They are kept in force anyway, for one reason that does not depend on
+ * which is right: they read *hotter* than the hardware-tested pair, by about
+ * 9 °C at a room-temperature sample and by a similar margin at the trip
+ * points, so an error here throttles early rather than late.
+ * `minikern.hwreport=1` prints the raw sample **and both conversions**, so
+ * one reading from a board in a room of a known temperature decides it —
+ * and the raw value means a third formula can be applied later without
+ * another trip to the hardware.
  *
  * A sample of zero means the sensor has not produced one yet, which is not
  * 223 °C and is reported as a failure instead — the same choice that
