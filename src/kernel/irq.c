@@ -1,5 +1,9 @@
 #include "kernel/irq.h"
 
+#include <stdbool.h>
+
+#include "kernel/klock.h"
+
 #include "core/console.h"
 #include "core/errno.h"
 
@@ -34,6 +38,20 @@ void irq_dispatch(void) {
     }
 }
 
+/* Waits for an interrupt, and gives up the kernel lock while waiting.
+ *
+ * It has to: the interrupt this is waiting for arrives through
+ * trap_dispatch, which takes that lock on the same core, so holding it
+ * across the wait is a deadlock against oneself (klock.h rule 5). Callers
+ * all loop on a condition, so re-reading their state after the wait is
+ * what they already do. */
 void irq_wait(void) {
+    bool held = klock_held_here();
+    if (held) {
+        klock_release();
+    }
     __asm__ volatile("dsb\n\twfi\n\tcpsie i\n\tisb\n\tcpsid i" ::: "memory");
+    if (held) {
+        klock_acquire();
+    }
 }

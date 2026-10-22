@@ -17,6 +17,7 @@ static struct {
     struct xfs fs;
     char at[XFSFS_PATH_MAX];
     bool up;
+    bool read_only;
 } mounted;
 
 /* Linux's d_type values, and the directory-entry record a listing emits. */
@@ -40,7 +41,7 @@ const char *xfsfs_prefix(void) {
     return mounted.at;
 }
 
-int xfsfs_mount(const char *at) {
+int xfsfs_mount(const char *at, bool read_only) {
     struct bcache *cache = knbd_cache();
     uint32_t i = 0;
     int rc;
@@ -63,8 +64,9 @@ int xfsfs_mount(const char *at) {
         i++;
     }
     mounted.at[i] = '\0';
+    mounted.read_only = read_only || !xfs_writable(&mounted.fs);
     mounted.up = true;
-    kprintf("xfs: mounted at %s\n", mounted.at);
+    kprintf("xfs: mounted at %s, %s\n", mounted.at, mounted.read_only ? "read-only" : "read-write");
     return KERR_OK;
 }
 
@@ -85,15 +87,33 @@ static int32_t xfsfs_read(struct file *f, void *buf, uint32_t n) {
     return (int32_t)got;
 }
 
-/* A read-only filesystem says so, rather than pretending a write worked. */
+/* Writing file data, which changes no metadata — see xfsfs.h for what is
+ * refused and why. */
 static int32_t xfsfs_write(struct file *f, const void *buf, uint32_t n) {
-    (void)f;
-    (void)buf;
-    (void)n;
-    return KERR_ROFS;
+    uint32_t put = 0;
+    int rc;
+    if (mounted.read_only) {
+        return KERR_ROFS;
+    }
+    rc = xfs_file_write(&mounted.fs, inode_of(f), f->pos, buf, n, &put);
+    if (rc != KERR_OK && put == 0) {
+        return rc;
+    }
+    f->pos += put;
+    return (int32_t)put;
 }
 
-static const struct file_ops xfsfs_ops = {.read = xfsfs_read, .write = xfsfs_write};
+/* fsync writes the cache back and flushes the device under it. */
+static int xfsfs_fsync(struct file *f) {
+    (void)f;
+    return mounted.up ? xfs_flush(&mounted.fs) : KERR_NODEV;
+}
+
+static const struct file_ops xfsfs_ops = {
+    .read = xfsfs_read,
+    .write = xfsfs_write,
+    .fsync = xfsfs_fsync,
+};
 
 bool xfsfs_owns(const struct file *f) {
     return f != NULL && f->ops == &xfsfs_ops;
@@ -127,8 +147,11 @@ int xfsfs_open(const char *rest, uint32_t flags, struct file **out) {
     if (!mounted.up) {
         return KERR_NODEV;
     }
-    if ((flags & O_ACCMODE) != O_RDONLY) {
+    if ((flags & O_ACCMODE) != O_RDONLY && mounted.read_only) {
         return KERR_ROFS;
+    }
+    if ((flags & (O_CREAT | O_TRUNC)) != 0) {
+        return KERR_ROFS; /* both would change metadata */
     }
     path[i++] = '/';
     for (const char *p = rest; *p != '\0' && i + 1 < sizeof path; p++) {

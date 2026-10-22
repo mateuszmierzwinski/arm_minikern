@@ -18,9 +18,9 @@ const (
 	device = "/dev/nbd0"
 
 	// What the host puts there before the boot.
-	header     = "MINIKERN-NBD-VOLUME-V1"
-	patternOff = 1 << 20
-	patternLen = 64 << 10
+	header      = "MINIKERN-NBD-VOLUME-V1"
+	patternOff  = 1 << 20
+	patternLen  = 64 << 10
 	patternByte = 0xa5
 
 	// What this program writes, for the host to find afterwards.
@@ -117,9 +117,27 @@ func unalignedSpan(f *os.File) error {
 	return nil
 }
 
-// writeRegion writes a block of one byte and a string, then syncs, so the
-// host can find both in its file.
+// neighbours holds the bytes either side of the write, read before it
+// happens.
+//
+// Checking that they are *unchanged* is the only sound way to prove a write
+// stayed inside its range: looking for "not the byte we wrote" fails once
+// in eight runs on a volume full of random bytes, because some of those
+// bytes are the one we wrote.
+var neighbours struct {
+	before [32]byte
+	after  [32]byte
+}
+
+// writeRegion notes what surrounds the range, writes a block of one byte
+// and a string, then syncs, so the host can find both in its file.
 func writeRegion(f *os.File) error {
+	if _, err := f.ReadAt(neighbours.before[:], writeOff-int64(len(neighbours.before))); err != nil {
+		return err
+	}
+	if _, err := f.ReadAt(neighbours.after[:], writeOff+writeLen); err != nil {
+		return err
+	}
 	block := bytes.Repeat([]byte{writeByte}, writeLen)
 	if _, err := f.WriteAt(block, writeOff); err != nil {
 		return err
@@ -133,20 +151,21 @@ func writeRegion(f *os.File) error {
 // readBack reads what writeRegion wrote, which must come back the same
 // whether it is still in the cache or not.
 func readBack(f *os.File) error {
-	buf := make([]byte, 64)
-	if _, err := f.ReadAt(buf, writeOff+writeLen-32); err != nil {
+	tail := make([]byte, 32)
+	if _, err := f.ReadAt(tail, writeOff+writeLen-int64(len(tail))); err != nil {
 		return err
 	}
-	for i := 0; i < 32; i++ {
-		if buf[i] != writeByte {
-			return fmt.Errorf("the tail of the write is %#02x at %d", buf[i], i)
+	for i, b := range tail {
+		if b != writeByte {
+			return fmt.Errorf("the tail of the write is %#02x at %d", b, i)
 		}
 	}
-	// Just past the write, the volume must be untouched.
-	for i := 32; i < 64; i++ {
-		if buf[i] == writeByte {
-			return fmt.Errorf("the write ran past its end at %d", i)
-		}
+	// Either side of the write, the volume must be exactly as it was.
+	if err := unchanged(f, writeOff-int64(len(neighbours.before)), neighbours.before[:]); err != nil {
+		return fmt.Errorf("before the write: %w", err)
+	}
+	if err := unchanged(f, writeOff+writeLen, neighbours.after[:]); err != nil {
+		return fmt.Errorf("after the write: %w", err)
 	}
 	marked := make([]byte, len(mark))
 	if _, err := f.ReadAt(marked, markOff); err != nil {
@@ -154,6 +173,20 @@ func readBack(f *os.File) error {
 	}
 	if string(marked) != mark {
 		return fmt.Errorf("the mark reads back as %q", marked)
+	}
+	return nil
+}
+
+// unchanged reads a range and compares it with what was there before.
+func unchanged(f *os.File, off int64, want []byte) error {
+	got := make([]byte, len(want))
+	if _, err := f.ReadAt(got, off); err != nil {
+		return err
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			return fmt.Errorf("byte %d of %d changed from %#02x to %#02x", i, len(want), want[i], got[i])
+		}
 	}
 	return nil
 }

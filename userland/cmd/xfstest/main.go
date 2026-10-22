@@ -9,6 +9,7 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"syscall"
@@ -32,18 +33,140 @@ func check(name string, err error) {
 	fmt.Printf("PASS %s\n", name)
 }
 
+// The two things this program is asked to do. The test runs it twice: once
+// on a volume it formats itself, and once on a filesystem the host made
+// with a file already in it, which is the only way to write to anything
+// (creating a file needs the log).
+const (
+	modeEnv    = "MINIKERN_XFS_MODE"
+	modeFormat = "format"
+	modeWrite  = "write"
+)
+
 func main() {
-	check("format", format())
-	check("mount", mountVolume())
-	check("list", list())
-	check("read-only", readOnly())
-	check("mount-twice", mountTwice())
-	check("bad-fstype", badFstype())
+	switch os.Getenv(modeEnv) {
+	case modeWrite:
+		writePhase()
+	default:
+		formatPhase()
+	}
 	if failed {
 		fmt.Println("XFS FAILURES")
 		os.Exit(1)
 	}
 	fmt.Println("ALL XFS PASS")
+}
+
+// formatPhase makes a filesystem on the volume and reads it back.
+func formatPhase() {
+	check("format", format())
+	check("mount", mountVolume(syscall.MS_RDONLY))
+	check("list", list())
+	check("read-only", readOnly())
+	check("mount-twice", mountTwice())
+	check("bad-fstype", badFstype())
+}
+
+// writePhase writes into a file the host put there, which is what a board
+// with somewhere to put its data actually does.
+func writePhase() {
+	check("mount-rw", mountVolume(0))
+	check("read-existing", readExisting())
+	check("write-data", writeData())
+	check("read-back", readBack())
+	check("refuse-create", refuseCreate())
+	check("refuse-grow", refuseGrow())
+}
+
+// The file the host made, and what this writes into it.
+const (
+	target    = mount + "/data.bin"
+	writeAt   = 4096
+	writeByte = 0x7e
+	writeLen  = 40000
+)
+
+// readExisting proves the file is the one the host made before anything is
+// written over it.
+func readExisting() error {
+	info, err := os.Stat(target)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("%s is %d bytes\n", target, info.Size())
+	if info.Size() < writeAt+writeLen {
+		return fmt.Errorf("the file is too small to write into: %d bytes", info.Size())
+	}
+	return nil
+}
+
+func writeData() error {
+	f, err := os.OpenFile(target, os.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = f.Close() }()
+	block := bytes.Repeat([]byte{writeByte}, writeLen)
+	if _, err := f.WriteAt(block, writeAt); err != nil {
+		return err
+	}
+	return f.Sync()
+}
+
+// readBack checks what was written is there, and that its neighbours are
+// not: a write that spilled would be worse than one that failed.
+func readBack() error {
+	f, err := os.Open(target)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = f.Close() }()
+	buf := make([]byte, writeLen+32)
+	if _, err := f.ReadAt(buf, writeAt-16); err != nil {
+		return err
+	}
+	for i := 0; i < 16; i++ {
+		if buf[i] == writeByte {
+			return fmt.Errorf("the write reached %d bytes before its start", 16-i)
+		}
+	}
+	for i := 16; i < 16+writeLen; i++ {
+		if buf[i] != writeByte {
+			return fmt.Errorf("byte %d of the write is %#02x", i-16, buf[i])
+		}
+	}
+	for i := 16 + writeLen; i < len(buf); i++ {
+		if buf[i] == writeByte {
+			return fmt.Errorf("the write reached past its end")
+		}
+	}
+	return nil
+}
+
+// refuseCreate and refuseGrow check the line this kernel draws: data into
+// blocks a file has, and nothing that would change metadata.
+func refuseCreate() error {
+	if f, err := os.OpenFile(mount+"/new.bin", os.O_CREATE|os.O_WRONLY, 0o644); err == nil {
+		_ = f.Close()
+		return fmt.Errorf("a new file was created on a filesystem with no journal")
+	}
+	return nil
+}
+
+func refuseGrow() error {
+	f, err := os.OpenFile(target, os.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = f.Close() }()
+	info, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if _, err := f.WriteAt([]byte("past the end"), info.Size()); err == nil {
+		return fmt.Errorf("a write past the end of the file succeeded")
+	}
+	return nil
 }
 
 // format writes a filesystem on the network block device, with the same
@@ -65,13 +188,13 @@ func format() error {
 
 // mountVolume asks the kernel to mount what was just written. A kernel that
 // could not read its own filesystem would fail here.
-func mountVolume() error {
+func mountVolume(flags uintptr) error {
 	if err := os.Mkdir(mount, 0o755); err != nil && !os.IsExist(err) {
 		// The root filesystem is read-only, so the mount point is
 		// expected to be there already; a missing one is the real error.
 		_ = err
 	}
-	return syscall.Mount(device, mount, "xfs", syscall.MS_RDONLY, "")
+	return syscall.Mount(device, mount, "xfs", flags, "")
 }
 
 // list reads the new filesystem's root, which must be empty.

@@ -11,6 +11,7 @@
 #include "kernel/time.h"
 
 #define CLOCK_REALTIME 0u
+#define CLOCK_MONOTONIC 1u
 #define CLOCK_REALTIME_COARSE 5u
 #define CLOCK_TAI 11u
 #define TIMER_ABSTIME 1u
@@ -106,6 +107,70 @@ static int32_t sys_gettimeofday(struct trapframe *tf) {
     return tf->r[0] == 0 ? KERR_OK : mm_copy_out(proc_current()->mm, tf->r[0], &tv, sizeof tv);
 }
 
+/* settimeofday(tv, tz) and clock_settime(id, ts): set the wall clock.
+ *
+ * Only CLOCK_REALTIME can be set — the monotonic clock is the generic
+ * timer, and a clock that can jump backwards is not monotonic. There is no
+ * privilege check because there is one process; a system with users would
+ * want one here. */
+static int32_t set_realtime(uint64_t ns) {
+    time_set_realtime_ns(ns);
+    return KERR_OK;
+}
+
+static int32_t sys_settimeofday(struct trapframe *tf) {
+    struct timespec32 tv;
+    if (tf->r[0] == 0) {
+        return KERR_OK; /* only the timezone, which this kernel does not keep */
+    }
+    if (mm_copy_in(proc_current()->mm, &tv, tf->r[0], sizeof tv) != KERR_OK) {
+        return KERR_FAULT;
+    }
+    if (tv.sec < 0 || tv.nsec < 0 || tv.nsec >= 1000000) {
+        return KERR_INVAL; /* a struct timeval carries microseconds */
+    }
+    return set_realtime((uint64_t)tv.sec * NS_PER_SEC + (uint64_t)tv.nsec * 1000u);
+}
+
+/* clock_settime (32-bit time) and clock_settime64 share everything but the
+ * width of the seconds field. */
+static int32_t clock_settime_common(struct trapframe *tf, bool wide) {
+    struct timespec32 narrow;
+    struct timespec64 wide_ts;
+    int64_t sec;
+    int32_t nsec;
+    if (!is_realtime(tf->r[0])) {
+        /* A monotonic clock that could be set would not be monotonic; any
+         * other identifier is simply not a clock here. */
+        return tf->r[0] == CLOCK_MONOTONIC ? KERR_PERM : KERR_INVAL;
+    }
+    if (wide) {
+        if (mm_copy_in(proc_current()->mm, &wide_ts, tf->r[1], sizeof wide_ts) != KERR_OK) {
+            return KERR_FAULT;
+        }
+        sec = wide_ts.sec;
+        nsec = (int32_t)wide_ts.nsec;
+    } else {
+        if (mm_copy_in(proc_current()->mm, &narrow, tf->r[1], sizeof narrow) != KERR_OK) {
+            return KERR_FAULT;
+        }
+        sec = narrow.sec;
+        nsec = narrow.nsec;
+    }
+    if (sec < 0 || nsec < 0 || nsec >= (int32_t)NS_PER_SEC) {
+        return KERR_INVAL;
+    }
+    return set_realtime((uint64_t)sec * NS_PER_SEC + (uint64_t)nsec);
+}
+
+static int32_t sys_clock_settime(struct trapframe *tf) {
+    return clock_settime_common(tf, false);
+}
+
+static int32_t sys_clock_settime64(struct trapframe *tf) {
+    return clock_settime_common(tf, true);
+}
+
 /* Sleeps until the monotonic deadline; a signal ends it early with the
  * time left written to rem (when given). */
 static int sleep_until(uint64_t deadline, uint32_t rem_uaddr, bool wide) {
@@ -155,11 +220,14 @@ static int32_t sys_clock_nanosleep64(struct trapframe *tf) {
 
 const struct syscall_entry sys_time_table[] = {
     {78, "gettimeofday", sys_gettimeofday},
+    {79, "settimeofday", sys_settimeofday},
     {162, "nanosleep", sys_nanosleep},
+    {262, "clock_settime", sys_clock_settime},
     {263, "clock_gettime", sys_clock_gettime},
     {264, "clock_getres", sys_clock_getres},
     {265, "clock_nanosleep", sys_clock_nanosleep},
     {403, "clock_gettime64", sys_clock_gettime64},
+    {404, "clock_settime64", sys_clock_settime64},
     {406, "clock_getres_time64", sys_clock_getres64},
     {407, "clock_nanosleep_time64", sys_clock_nanosleep64},
     {0, NULL, NULL},

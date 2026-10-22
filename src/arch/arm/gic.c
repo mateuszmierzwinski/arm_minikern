@@ -1,5 +1,7 @@
 #include "arch/arm/gic.h"
 
+#include "arch/arm/timer.h"
+
 #define GICD_CTLR        0x000u
 #define GICD_TYPER       0x004u
 #define GICD_ISENABLER   0x100u
@@ -65,7 +67,16 @@ static void gic_reset_distributor(const struct gic *g) {
 struct irq_chip_port gic_init(uintptr_t dist_base, uintptr_t cpu_base) {
     the_gic = (struct gic){.dist = dist_base, .cpu = cpu_base};
     gic_reset_distributor(&the_gic);
-    wr(cpu_base + GICC_PMR, GIC_PMR_ALL);
-    wr(cpu_base + GICC_CTLR, GIC_ENABLE_BOTH);
+    gic_init_cpu();
     return (struct irq_chip_port){.ack = gic_ack, .eoi = gic_eoi, .enable = gic_enable, .self = &the_gic};
+}
+
+/* The part of the controller that belongs to one core: its interface, and
+ * the private interrupts (the first 32 IDs) which are banked per core —
+ * including the generic timer's, so a core that skips this gets no ticks
+ * and never schedules anything. */
+void gic_init_cpu(void) {
+    wr(the_gic.cpu + GICC_PMR, GIC_PMR_ALL);
+    wr(the_gic.cpu + GICC_CTLR, GIC_ENABLE_BOTH);
+    wr(the_gic.dist + GICD_ISENABLER, 1u << TIMER_VIRT_PPI);
 }

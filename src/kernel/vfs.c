@@ -2,10 +2,12 @@
 
 #include "core/errno.h"
 #include "kernel/devfs.h"
+#include "kernel/genfs.h"
 #include "kernel/mem.h"
 #include "kernel/procfs.h"
 #include "kernel/sched.h"
 #include "kernel/tarfs.h"
+#include "kernel/tmpfs.h"
 #include "kernel/xfsfs.h"
 
 static uint32_t next_ino = 1;
@@ -37,6 +39,7 @@ static int under(const char *path, const char *prefix, const char **rest) {
 
 int vfs_open(const char *path, uint32_t flags, struct file **out, int *alias_fd) {
     const char *rest;
+    int rc = KERR_OK;
     if (path[0] != '/') {
         return KERR_NOENT;
     }
@@ -46,8 +49,16 @@ int vfs_open(const char *path, uint32_t flags, struct file **out, int *alias_fd)
     if (under(path, "/proc", &rest)) {
         return procfs_open(rest, flags, out);
     }
+    if (under(path, "/tmp", &rest)) {
+        return tmpfs_open(rest, flags, out);
+    }
     if (xfsfs_mounted() && under(path, xfsfs_prefix(), &rest)) {
         return xfsfs_open(rest, flags, out);
+    }
+    /* Ahead of the archive: the archive is read-only, and these files are
+     * what the kernel knows rather than what was packed (genfs.h). */
+    if (genfs_open(path, flags, out, &rc)) {
+        return rc;
     }
     return tarfs_open(path, flags, out);
 }

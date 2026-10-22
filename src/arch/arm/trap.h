@@ -44,6 +44,10 @@ struct trap_handlers {
 /* Installs the vector table (VBAR) and the handlers. */
 void trap_init(const struct trap_handlers *handlers);
 
+/* Points this core's VBAR at the vector table. Every core calls it once:
+ * a core that never set it takes its first exception to address zero. */
+void trap_init_cpu(void);
+
 /* Called from vectors.S with the frame just saved. */
 void trap_dispatch(struct trapframe *tf, uint32_t kind);
 

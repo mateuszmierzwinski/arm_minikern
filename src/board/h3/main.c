@@ -9,6 +9,7 @@
 #include "arch/arm/layout.h"
 #include "arch/arm/mmu.h"
 #include "arch/arm/psci.h"
+#include "arch/arm/smp.h"
 #include "arch/arm/timer.h"
 #include "arch/arm/trap.h"
 #include "board/h3/emac.h"
@@ -214,6 +215,23 @@ static uint32_t cmdline_number(const char *key, uint32_t fallback) {
     return n;
 }
 
+/* minikern.dns=<ip>: the resolver /etc/resolv.conf should name, instead of
+ * the one the lease advertised. */
+static void override_dns(void) {
+    size_t len = 0;
+    const char *v = cmdline_value(boot_cmdline, "minikern.dns", &len);
+    ip4_t dns = 0;
+    if (v == NULL) {
+        return;
+    }
+    if (ip4_parse(v, (uint32_t)len, &dns) != KERR_OK) {
+        kprintf("net: minikern.dns=\"%.*s\" is not an address, ignored\n", (int)len, v);
+        return;
+    }
+    knet_set_dns(dns);
+    kprintf("net: resolver set to %.*s by the command line\n", (int)len, v);
+}
+
 /* Splits "<ip>[:<port>][/<export>]" into its three parts. The export name
  * may be empty, which asks the server for its default volume. */
 static int parse_nbd_target(const char *s, size_t len, ip4_t *ip, uint16_t *port, char *name, uint32_t cap) {
@@ -261,6 +279,20 @@ static void attach_nbd(void) {
         return;
     }
     (void)knbd_connect(ip, port, name);
+}
+
+/* The other three cores. They idle once they are up (arch/arm/smp.h): this
+ * is the bring-up proved on its own, before the kernel is made safe to run
+ * on more than one. minikern.smp=off leaves them alone. */
+static void bring_up_cores(void) {
+    uint32_t online;
+    if (cmdline_equals(boot_cmdline, "minikern.smp", "off")) {
+        kprintf("smp: not starting the other cores (minikern.smp=off)\n");
+        return;
+    }
+    online = smp_start_secondaries();
+    kprintf("smp: %u of %u cores up (cpu %u is running the kernel)\n", online, SMP_MAX_CPUS,
+            smp_cpu_id());
 }
 
 /* The network: the EMAC under the stack, then DHCP in the background.
@@ -383,6 +415,7 @@ static bool start_init(const struct bootinfo *info) {
         kprintf("minikern: no root filesystem, nothing to run\n");
         return false;
     }
+    override_dns();
     attach_nbd();
     init_path(path, sizeof path);
     proc_set_exit_hook(&hook);
@@ -413,12 +446,26 @@ void kmain(uint32_t r0, uint32_t machine, uint32_t r2, uint32_t entry_cpsr) {
     kprintf("mem: %u KiB free\n", mem_free_pages() * 4u);
     bring_up_kernel(cmdline_number("minikern.epoch", 0));
     bring_up_console_input(&uart);
+    bring_up_cores();
     bring_up_network();
     syscall_set_trace(cmdline_equals(boot_cmdline, "minikern.strace", "1"));
     maybe_selftest(boot_cmdline);
     kprintf("minikern: boot complete\n");
     if (!start_init(&info) && halt_requested()) {
         finish();
+    }
+    /* Letting the other cores schedule is **not** on by default: the lock
+     * and the bring-up are proved, but running tasks on four cores still
+     * deadlocks somewhere after the second thread starts (TASKS.md P10.3),
+     * and a kernel that works on one core is worth more than one that
+     * might work on four. minikern.smp=all opts into the experiment.
+     *
+     * It is the last thing the boot path does either way, because until
+     * now it has been in the kernel without the lock and a second core in
+     * there would race it (klock.h rule 4). */
+    if (cmdline_equals(boot_cmdline, "minikern.smp", "all")) {
+        kprintf("smp: letting every core schedule (experimental)\n");
+        smp_release();
     }
     sched_idle_loop();
 }

@@ -9,6 +9,7 @@
 
 #include <stddef.h>
 #include "kernel/vfs.h"
+#include "kernel/tmpfs.h"
 #include "kernel/xfsfs.h"
 
 #define DT_DIR 4u
@@ -141,6 +142,14 @@ static int32_t sys_getdents64(struct trapframe *tf) {
         if (rc <= 0) {
             return rc;
         }
+        used = (uint32_t)rc;
+    } else if (tmpfs_owns(f)) {
+        uint32_t emitted = 0;
+        rc = tmpfs_getdents((uint32_t)f->pos, buf, cap, &emitted);
+        if (rc < 0) {
+            return rc;
+        }
+        f->pos += emitted;
         used = (uint32_t)rc;
     } else {
         if (!emit_mounts(f, buf, cap, &used)) {

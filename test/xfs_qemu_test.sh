@@ -101,4 +101,72 @@ grep -q "rootino = 64" "$tmp/db.log" || fail "rootino"
 grep -q "fdblocks = 114672" "$tmp/db.log" || fail "fdblocks"
 
 grep -q "served \"vol\"" "$tmp/server.log" || fail "the server did not log the session"
+
+# ── phase two: writing into a filesystem the host made ─────────────────────
+#
+# Creating a file needs the log, so a volume the board formatted has nowhere
+# to write. mkfs.xfs puts a file there instead, and the board writes into
+# the blocks it already has — the one kind of write that changes no
+# metadata, and so the one this kernel allows.
+command -v mkfs.xfs >/dev/null || { echo "mkfs.xfs is not installed" >&2; exit 1; }
+
+echo "---- phase two: a filesystem with a file in it"
+head -c 262144 /dev/urandom >"$tmp/data.bin"
+{
+    echo DUMMY
+    echo "0 0"
+    echo "d--755 0 0"
+    echo "data.bin ---644 0 0 $tmp/data.bin"
+    echo '$'
+} >"$tmp/proto"
+truncate -s 512M "$vol"
+mkfs.xfs -q -f -m crc=1,finobt=1,reflink=0,rmapbt=0,bigtime=0,inobtcount=0 \
+    -i sparse=0,size=512,nrext64=0 -n ftype=1 -b size=4096 -p "$tmp/proto" "$vol" ||
+    fail "mkfs.xfs could not make the second volume"
+xfs_repair -n "$vol" >/dev/null 2>&1 || fail "mkfs.xfs made an image xfs_repair dislikes"
+
+# How many 0x7e bytes the volume holds before the board writes 40000 of
+# them: the file is random, so a few are there by chance.
+pattern_before="$(tr -dc '\176' <"$vol" | wc -c)"
+
+log="$tmp/console2.log"
+timeout 120 qemu-system-arm -M orangepi-pc -display none -monitor none -serial "file:$log" \
+    -nic user -kernel "$image" -initrd "$rootfs" \
+    -append "console=uart0 minikern.halt=poweroff minikern.nbd=$host_ip:$port/vol minikern.env.MINIKERN_XFS_MODE=write" ||
+    { echo "---- console"; cat "$log"; fail "qemu did not power off in phase two"; }
+
+echo "---- console (phase two)"
+cat "$log"
+expect "xfs: mounted at /mnt, read-write"
+expect "PASS mount-rw"
+expect "PASS read-existing"
+expect "PASS write-data"
+expect "PASS read-back"
+expect "PASS refuse-create"
+expect "PASS refuse-grow"
+expect "ALL XFS PASS"
+expect "init exited with status 0"
+
+echo "---- xfs_repair after the board wrote into the file"
+if ! xfs_repair -n "$vol" >"$tmp/repair2.log" 2>&1; then
+    cat "$tmp/repair2.log"
+    fail "xfs_repair rejected the filesystem after the board wrote to it"
+fi
+grep -vE '^(Phase [0-9]|        - |No modify flag|Cannot get host|Repair may fail|the image and)' \
+    "$tmp/repair2.log" >"$tmp/complaints2.log" || true
+if [ -s "$tmp/complaints2.log" ]; then
+    cat "$tmp/repair2.log"
+    fail "xfs_repair complained after the board's write"
+fi
+
+echo "---- and the board's bytes really reached the image"
+pattern_after="$(tr -dc '\176' <"$vol" | wc -c)"
+echo "0x7e bytes in the volume: $pattern_before before, $pattern_after after"
+# At least the 40000 the board wrote must be there. The increase is slightly
+# less than 40000 because the random bytes it overwrote included a few 0x7e
+# of their own, which is why the test counts the total rather than the
+# difference.
+[ "$pattern_after" -ge 40000 ] || fail "the board's 40000 bytes are not in the volume"
+[ "$pattern_after" -gt "$pattern_before" ] || fail "the volume did not change at all"
+
 echo PASS

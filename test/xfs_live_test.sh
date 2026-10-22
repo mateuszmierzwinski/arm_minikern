@@ -124,6 +124,53 @@ echo "---- the reader changed nothing"
 [ "$(md5sum fs.img | cut -d' ' -f1)" = "$before" ] || fail "a read-only mount changed the image"
 xfs_repair -n fs.img >/dev/null 2>&1 || fail "the image is no longer sound"
 
+# ── writing file data, which changes no metadata ───────────────────────────
+echo "---- writing into a file's existing blocks"
+cp fs.img rw.img
+head -c 100000 /dev/urandom >payload.bin
+"$probe" rw.img write /big.bin 0 payload.bin | tee write.log
+grep -q "wrote 100000 bytes at 0" write.log || fail "the write did not report what it did"
+repair_clean() {
+    local img="$1"
+    xfs_repair -n "$img" >"$tmp/repair.log" 2>&1 || { cat "$tmp/repair.log"; fail "xfs_repair rejected $img"; }
+    grep -vE '^(Phase [0-9]|        - |No modify flag|Cannot get host|Repair may fail|the image and)' \
+        "$tmp/repair.log" >"$tmp/complaints.log" || true
+    [ -s "$tmp/complaints.log" ] && { cat "$tmp/repair.log"; fail "xfs_repair complained about $img"; }
+    return 0
+}
+repair_clean rw.img
+"$probe" rw.img cat /big.bin written.bin
+cmp payload.bin <(head -c 100000 written.bin) || fail "what was written is not what comes back"
+cmp <(tail -c +100001 big.bin) <(tail -c +100001 written.bin) ||
+    fail "the write changed bytes past its end"
+# Nothing else in the filesystem moved.
+"$probe" rw.img cat /hello.txt rw_hello.txt && cmp rw_hello.txt hello.txt ||
+    fail "another file changed"
+"$probe" rw.img ls / >rw_root.txt && cmp <(sort root.txt) <(sort rw_root.txt) ||
+    fail "the root directory changed"
+
+echo "---- a write in the middle of a file, spanning blocks"
+head -c 9000 /dev/urandom >mid.bin
+"$probe" rw.img write /big.bin 5000 mid.bin
+repair_clean rw.img
+"$probe" rw.img cat /big.bin after_mid.bin
+cmp <(dd if=mid.bin bs=1 count=9000 status=none) <(dd if=after_mid.bin bs=1 skip=5000 count=9000 status=none) ||
+    fail "the unaligned write did not land where it was asked to"
+
+echo "---- what writing must refuse"
+# Past the end of the file: growing it would change the inode.
+if "$probe" rw.img write /hello.txt 0 payload.bin 2>past.log; then
+    fail "a write past the end of a file succeeded"
+fi
+grep -q "writing 100000 bytes at 0" past.log || { cat past.log; fail "the refusal is unclear"; }
+# A directory is not a file.
+if "$probe" rw.img write /sub 0 payload.bin 2>dir.log; then
+    fail "writing to a directory succeeded"
+fi
+# And a read-only mount refuses even a legal write: the op decides how the
+# image is opened, so "cat" cannot change anything.
+[ "$(md5sum fs.img | cut -d' ' -f1)" = "$before" ] || fail "the read-only image changed"
+
 # ── the refusals ───────────────────────────────────────────────────────────
 echo "---- a filesystem with reflink is refused"
 truncate -s 512M reflink.img

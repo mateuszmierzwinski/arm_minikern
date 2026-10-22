@@ -21,6 +21,18 @@
  *     by walking their data blocks. The hash structures above 32 GiB of
  *     logical offset are never read, so a lookup is a linear scan: right
  *     for a board reading a few hundred entries, wrong for a million.
+ *   - **Writing file data, into blocks the file already has.** XFS does not
+ *     journal file data, so overwriting an allocated extent changes no
+ *     metadata and needs no transaction — which is why it is possible here
+ *     at all. Anything that *would* change metadata is refused: a hole, an
+ *     extent that was never written, growing a file, creating one. Those
+ *     need the log, which is P9.4.
+ *   - **Writing file data, into blocks the file already has.** XFS does not
+ *     journal file data, so overwriting an allocated extent changes no
+ *     metadata and needs no transaction — which is why it is possible here
+ *     at all. Anything that *would* change metadata is refused: a hole, an
+ *     extent that was never written, growing a file, creating one. Those
+ *     need the log, which is P9.4.
  *   - **A dirty log is refused.** Replaying one is not implemented, and
  *     reading a filesystem whose metadata is older than its log is reading
  *     something that is not there. Linux's xfs_repair is what fixes a
@@ -143,6 +155,25 @@ int xfs_path_lookup(struct xfs *fs, const char *path, struct xfs_inode *out);
  * xfs_dir_list is how they are read. */
 int xfs_file_read(struct xfs *fs, const struct xfs_inode *ip, uint64_t off, void *buf, uint32_t len,
                   uint32_t *got);
+
+/* Writes into a regular file, within what it already has allocated.
+ *
+ * *put is how much was written. A write that would need metadata changed
+ * is refused with nothing written: KERR_NOSPC past the end of the file,
+ * KERR_NOTSUP into a hole or an extent that was allocated but never
+ * written (both would mean allocating or converting, which needs the
+ * journal), KERR_ROFS on a read-only device, KERR_ISDIR for a directory.
+ *
+ * The write goes through the buffer cache and is not durable until
+ * xfs_flush. */
+int xfs_file_write(struct xfs *fs, const struct xfs_inode *ip, uint64_t off, const void *buf,
+                   uint32_t len, uint32_t *put);
+
+/* Makes everything written durable: the cache, then the device. */
+int xfs_flush(struct xfs *fs);
+
+/* Whether this filesystem may be written at all (the device decides). */
+bool xfs_writable(const struct xfs *fs);
 
 /* What kind of thing the inode is. */
 bool xfs_is_dir(const struct xfs_inode *ip);

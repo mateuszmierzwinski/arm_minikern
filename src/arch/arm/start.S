@@ -19,6 +19,38 @@
     .equ MODE_HYP,  0x1a
     .equ SVC_MASKED, 0xd3          @ SVC mode, IRQ and FIQ masked
 
+/* drop_to_svc resume: leaves HYP for SVC and continues at resume.
+ *
+ * Both the primary and every secondary need this, and for the same reason:
+ * QEMU enters a uImage in HYP mode, and **PSCI CPU_ON starts a secondary in
+ * the mode the primary was entered in**. From HYP a CP15 write to c1/c0/0
+ * or c2/c0/0 lands on HSCTLR and HTTBR — the hypervisor's own registers —
+ * so a secondary that skips this configures the wrong MMU and dies on the
+ * first instruction fetch afterwards (CLAUDE.md §10).
+ *
+ * It also hands the counter and the coprocessors down to PL1, which each
+ * core must do for itself. r3 is used and not preserved. */
+.macro drop_to_svc resume
+    mrs   r3, cpsr
+    and   r3, r3, #MODE_MASK
+    cmp   r3, #MODE_HYP
+    bne   \resume
+    mrc   p15, 4, r3, c14, c1, 0   @ CNTHCTL: PL1 may read the counter and use the timers
+    orr   r3, r3, #3
+    mcr   p15, 4, r3, c14, c1, 0
+    mov   r3, #0
+    mcrr  p15, 4, r3, r3, c14      @ CNTVOFF = 0: virtual count = physical count
+    mcr   p15, 4, r3, c1, c1, 2    @ HCPTR: trap no coprocessor (VFP must reach PL1/PL0)
+    mcr   p15, 4, r3, c1, c1, 3    @ HSTR: trap no CP15 access
+    mrs   r3, cpsr
+    bic   r3, r3, #MODE_MASK
+    orr   r3, r3, #SVC_MASKED
+    msr   spsr_hyp, r3
+    adr   r3, \resume
+    msr   elr_hyp, r3
+    eret
+.endm
+
 /* map_sections virt, phys, count, attrs: fills boot_l1 entries, r0 = table. */
 .macro map_sections virt, phys, count, attrs
     ldr   r1, =(\virt >> SECTION_SHIFT)
@@ -40,28 +72,67 @@ _start:
     mov   r5, r1
     mov   r6, r2
     mrs   r7, cpsr                 @ the entry mode, reported by kmain
-    and   r3, r7, #MODE_MASK
-    cmp   r3, #MODE_HYP
-    bne   in_svc
-    mrc   p15, 4, r3, c14, c1, 0   @ CNTHCTL: PL1 may read the counter and use the timers
-    orr   r3, r3, #3
-    mcr   p15, 4, r3, c14, c1, 0
-    mov   r3, #0
-    mcrr  p15, 4, r3, r3, c14      @ CNTVOFF = 0: virtual count = physical count
-    mcr   p15, 4, r3, c1, c1, 2    @ HCPTR: trap no coprocessor (VFP must reach PL1/PL0)
-    mcr   p15, 4, r3, c1, c1, 3    @ HSTR: trap no CP15 access
-    mrs   r3, cpsr
-    bic   r3, r3, #MODE_MASK
-    orr   r3, r3, #SVC_MASKED
-    msr   spsr_hyp, r3
-    adr   r3, in_svc
-    msr   elr_hyp, r3
-    eret
+    drop_to_svc in_svc
 in_svc:
     cpsid if
     bl    build_boot_table
     bl    enable_mmu
     ldr   pc, =high_start          @ from here on, linked (virtual) addresses
+
+/* _secondary_start — where PSCI CPU_ON lands the other three cores.
+ *
+ * It is entered at its *physical* address with the MMU off, exactly as the
+ * primary was, but the primary has since dropped the identity map that got
+ * it here (mmu_init hands the low half to user space). So a secondary turns
+ * the MMU on with a table of its own, kept for the purpose (smp_l1 in
+ * smp.c, which maps RAM identically and high), and only then joins the
+ * kernel's own translation regime.
+ *
+ * r0 is the context identifier PSCI passed, which carries nothing here:
+ * a core reads its own number out of MPIDR. */
+    .global _secondary_start
+_secondary_start:
+    cpsid if
+    drop_to_svc secondary_svc
+secondary_svc:
+    cpsid if
+    mov   r0, #0
+    mcr   p15, 0, r0, c8, c7, 0    @ TLBIALL
+    mcr   p15, 0, r0, c7, c5, 0    @ ICIALLU
+    mcr   p15, 0, r0, c7, c5, 6    @ BPIALL
+    dsb
+    isb
+    mcr   p15, 0, r0, c2, c0, 2    @ TTBCR = 0: one table for the whole space
+    ldr   r1, =(smp_l1_phys - KERNEL_VIRT_OFFSET)
+    ldr   r1, [r1]                 @ the bring-up table, physical, with its attrs
+    mcr   p15, 0, r1, c2, c0, 0    @ TTBR0
+    mcr   p15, 0, r1, c2, c0, 1    @ TTBR1
+    mov   r1, #1
+    mcr   p15, 0, r1, c3, c0, 0    @ DACR: domain 0 client
+    mrc   p15, 0, r1, c1, c0, 1
+    orr   r1, r1, #(1 << 6)        @ ACTLR.SMP: the caches do not work without it
+    mcr   p15, 0, r1, c1, c0, 1
+    mrc   p15, 0, r1, c1, c0, 0    @ SCTLR
+    ldr   r2, =((1 << 1) | (1 << 13) | (1 << 28) | (1 << 29))  @ A, V, TRE, AFE off
+    bic   r1, r1, r2
+    ldr   r2, =((1 << 0) | (1 << 2) | (1 << 11) | (1 << 12))   @ M, C, Z, I on
+    orr   r1, r1, r2
+    dsb
+    mcr   p15, 0, r1, c1, c0, 0
+    isb
+    ldr   pc, =secondary_high      @ from here on, linked (virtual) addresses
+
+    .text
+secondary_high:
+    mrc   p15, 0, r0, c0, c0, 5    @ MPIDR
+    and   r0, r0, #0xff            @ affinity 0 is the core number on an H3
+    bl    smp_stack_top            @ r0 = the top of this core's stack
+    mov   sp, r0
+    bl    smp_secondary_main       @ never returns
+1:  wfi
+    b     1b
+
+    .section .text.boot, "ax"
 
 /* boot_l1: zeroed, then RAM twice (identity and high) plus the I/O window. */
 build_boot_table:

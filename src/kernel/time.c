@@ -54,6 +54,11 @@ uint64_t time_realtime_ns(void) {
     return epoch_ns + time_monotonic_ns();
 }
 
+void time_set_realtime_ns(uint64_t ns) {
+    uint64_t since_boot = time_monotonic_ns();
+    epoch_ns = ns > since_boot ? ns - since_boot : 0;
+}
+
 uint64_t time_ticks(void) {
     return ticks;
 }

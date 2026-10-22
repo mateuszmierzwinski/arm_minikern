@@ -28,6 +28,11 @@ static void on_frame(void *self, const uint8_t *frame, uint32_t len) {
     net_input(&k->nif, frame, len);
 }
 
+/* A resolver the command line named, which outlives any lease: a lease
+ * that arrives later would otherwise overwrite it, and the override is
+ * there precisely because the lease's resolver is not wanted. */
+static ip4_t dns_override;
+
 static void on_bound(void *self, const struct netif *nif) {
     char ip[16], gw[16], dns[16];
     uint32_t prefix = 0;
@@ -37,6 +42,11 @@ static void on_bound(void *self, const struct netif *nif) {
     }
     kprintf("net: eth0 %s/%u gw %s dns %s (dhcp, lease %u s)\n", ip4_format(nif->ip, ip), prefix,
             ip4_format(nif->gateway, gw), ip4_format(nif->dns, dns), nif->lease_s);
+    if (dns_override != 0 && knet.nif.dns != dns_override) {
+        knet.nif.dns = dns_override;
+        kprintf("net: keeping the resolver the command line named (%s)\n",
+                ip4_format(dns_override, dns));
+    }
 }
 
 static void on_echo_reply(void *self, ip4_t from, uint16_t seq) {
@@ -96,6 +106,11 @@ void knet_report(void) {
             t->connections, t->retransmits, t->resets_sent, t->drop_checksum, t->drop_malformed,
             t->drop_no_socket, t->drop_out_of_window, t->drop_out_of_order, t->drop_backlog_full,
             t->drop_bad_reset);
+}
+
+void knet_set_dns(ip4_t dns) {
+    dns_override = dns;
+    knet.nif.dns = dns;
 }
 
 int knet_wait_address(uint32_t timeout_ms) {

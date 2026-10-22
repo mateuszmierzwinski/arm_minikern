@@ -15,6 +15,13 @@ static inline uint32_t arm_midr(void) {
 
 /* Generic-timer frequency as firmware programmed it. Never assume it:
  * 24 MHz on the H3, 62.5 MHz under QEMU (measured). */
+/* MPIDR: which core this is. On the H3 the core number is affinity 0. */
+static inline uint32_t arm_mpidr(void) {
+    uint32_t v;
+    __asm__ volatile("mrc p15, 0, %0, c0, c0, 5" : "=r"(v));
+    return v;
+}
+
 static inline uint32_t arm_cntfrq(void) {
     uint32_t v;
     __asm__ volatile("mrc p15, 0, %0, c14, c0, 0" : "=r"(v));

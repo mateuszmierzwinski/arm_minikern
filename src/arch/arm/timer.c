@@ -20,7 +20,18 @@ static void set_compare(uint64_t cval) {
     __asm__ volatile("mcrr p15, 3, %0, %1, c14\n\tisb" : : "r"((uint32_t)cval), "r"((uint32_t)(cval >> 32)));
 }
 
+static uint32_t tick_period;
+
+/* Starts this core's own tick, with the period the primary chose. A core
+ * without a tick never preempts and never notices work appearing. */
+void timer_start_cpu(void) {
+    if (tick_period != 0) {
+        timer_start_periodic(tick_period);
+    }
+}
+
 void timer_start_periodic(uint32_t period) {
+    tick_period = period;
     tick_period = period;
     deadline = timer_count() + period;
     set_compare(deadline);

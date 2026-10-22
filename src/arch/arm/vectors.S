@@ -63,6 +63,7 @@ vec_fiq:   trap_entry 7, 4
  * threads start here too (arm_thread_start). */
     .global trap_exit
 trap_exit:
+    bl    klock_release                @ the kernel lock, given up on the way out
     add   r0, sp, #TF_SP_USR
     ldmia r0, {sp, lr}^
     nop                                @ no banked-register access right after ldm ^

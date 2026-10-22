@@ -14,4 +14,8 @@
 /* An irq_chip_port over the GIC at the two (kernel virtual) bases. */
 struct irq_chip_port gic_init(uintptr_t dist_base, uintptr_t cpu_base);
 
+/* The per-core half: this core's CPU interface and its banked private
+ * interrupts. Every core calls it once, the primary through gic_init. */
+void gic_init_cpu(void);
+
 #endif

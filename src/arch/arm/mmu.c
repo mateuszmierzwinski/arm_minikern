@@ -11,8 +11,14 @@ extern uint32_t boot_l1[4096];
 /* An all-faults user table for when no process is current. */
 static uint32_t empty_user_l1[USER_L1_BYTES / 4] __attribute__((aligned(USER_L1_BYTES)));
 
+/* Flushes every core's TLB, not just this one's: TLBIALLIS is the
+ * inner-shareable broadcast form. A local flush would leave another core
+ * translating through an entry this one has just changed — and since every
+ * table change happens under the kernel lock, a broadcast here is the whole
+ * of what SMP needs from TLB maintenance. */
 void mmu_flush_tlb(void) {
-    __asm__ volatile("dsb\n\tmcr p15, 0, %0, c8, c7, 0\n\tdsb\n\tisb" : : "r"(0) : "memory");
+    __asm__ volatile("dsb ish\n\tmcr p15, 0, %0, c8, c3, 0\n\tdsb ish\n\tisb"
+                     : : "r"(0) : "memory");
 }
 
 void mmu_switch_user(uint32_t l1_phys) {

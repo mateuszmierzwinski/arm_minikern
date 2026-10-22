@@ -10,6 +10,7 @@
 
 #include <stddef.h>
 #include "kernel/vfs.h"
+#include "kernel/tmpfs.h"
 #include "kernel/xfsfs.h"
 
 #define AT_FDCWD (-100)
@@ -24,6 +25,7 @@
 #define F_SETFL 4u
 #define F_DUPFD_CLOEXEC 1030u
 #define FD_CLOEXEC 1u
+#define MS_RDONLY 1u
 #define SEEK_SET 0u
 #define SEEK_CUR 1u
 #define SEEK_END 2u
@@ -341,12 +343,50 @@ static int32_t sys_llseek(struct trapframe *tf) {
  * on its network block device, and it mounts it read-only. Everything else
  * is refused by name rather than half-attempted — Go's syscall.Mount
  * reaches this, so a program gets the ordinary errors it expects. */
+/* True when path is prefix or lies below it, with the remainder in rest. */
+static bool path_under(const char *path, const char *prefix, const char **rest) {
+    uint32_t i = 0;
+    while (prefix[i] != '\0' && path[i] == prefix[i]) {
+        i++;
+    }
+    if (prefix[i] != '\0' || (path[i] != '\0' && path[i] != '/')) {
+        return false;
+    }
+    *rest = path + i + (path[i] == '/');
+    return true;
+}
+
 static bool same_string(const char *a, const char *b) {
     while (*a != '\0' && *a == *b) {
         a++;
         b++;
     }
     return *a == *b;
+}
+
+/* unlink(path) and unlinkat(dirfd, path, flags).
+ *
+ * Only /tmp can lose a name: the root is a read-only archive and the
+ * network volume is mounted read-only, so everywhere else this is EROFS
+ * rather than a silent success. */
+static int32_t unlink_path(const char *path) {
+    const char *rest;
+    if (!path_under(path, "/tmp", &rest)) {
+        return KERR_ROFS;
+    }
+    return tmpfs_unlink(rest);
+}
+
+static int32_t sys_unlink(struct trapframe *tf) {
+    char path[PATH_CAP + 1];
+    int rc = user_path(AT_FDCWD, tf->r[0], path);
+    return rc != KERR_OK ? rc : unlink_path(path);
+}
+
+static int32_t sys_unlinkat(struct trapframe *tf) {
+    char path[PATH_CAP + 1];
+    int rc = user_path((int32_t)tf->r[0], tf->r[1], path);
+    return rc != KERR_OK ? rc : unlink_path(path);
 }
 
 static int32_t sys_mount(struct trapframe *tf) {
@@ -359,7 +399,7 @@ static int32_t sys_mount(struct trapframe *tf) {
     if (!same_string(fstype, "xfs") || !same_string(source, "/dev/nbd0")) {
         return KERR_NODEV; /* no such filesystem type, or no such device */
     }
-    return xfsfs_mount(target);
+    return xfsfs_mount(target, (tf->r[3] & MS_RDONLY) != 0);
 }
 
 static int32_t sys_ioctl(struct trapframe *tf) {
@@ -570,6 +610,7 @@ const struct syscall_entry sys_file_table[] = {
     {140, "_llseek", sys_llseek},
     {145, "readv", sys_readv},
     {146, "writev", sys_writev},
+    {10, "unlink", sys_unlink},
     {21, "mount", sys_mount},
     {118, "fsync", sys_fsync},
     {148, "fdatasync", sys_fsync},
@@ -582,6 +623,7 @@ const struct syscall_entry sys_file_table[] = {
     {327, "fstatat64", sys_fstatat64},
     {332, "readlinkat", sys_readlinkat},
     {334, "faccessat", sys_faccessat},
+    {328, "unlinkat", sys_unlinkat},
     {358, "dup3", sys_dup3},
     {0, NULL, NULL},
 };

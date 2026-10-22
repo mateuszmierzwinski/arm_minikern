@@ -7,6 +7,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -31,8 +32,22 @@ const (
 	// the address can be the host's own on the real network: slirp then
 	// carries the segments out through the EMAC and back, which is the one
 	// path a loopback connection does not exercise.
-	tcpEchoEnv  = "MINIKERN_TCP_ECHO"
-	networkWait = 10 * time.Second
+	tcpEchoEnv = "MINIKERN_TCP_ECHO"
+
+	// The name the DNS test resolves, and the address it must come back
+	// as, both passed in by the test: the server answering is one of ours
+	// (test/tools/dnsecho), so this proves the resolver path rather than
+	// the internet.
+	dnsNameEnv   = "MINIKERN_DNS_NAME"
+	dnsAnswerEnv = "MINIKERN_DNS_ANSWER"
+
+	// Where the test's own resolver listens. It is not port 53, because
+	// binding 53 on the build machine needs root and QEMU's guestfwd is
+	// TCP-only — so the query is aimed there by a Dial of our own. What
+	// that leaves untested is one line of /etc/resolv.conf, which the
+	// check below reads directly instead.
+	dnsServerEnv = "MINIKERN_DNS_SERVER"
+	networkWait  = 10 * time.Second
 )
 
 var failed bool
@@ -231,6 +246,60 @@ func httpOverLoopback() error {
 	return nil
 }
 
+// resolverConfig checks the file the kernel generates from the DHCP lease.
+// There is no resolver in this kernel: the lease becomes /etc/resolv.conf
+// and Go's own pure-Go resolver does the rest in user space (genfs.h).
+func resolverConfig() error {
+	conf, err := os.ReadFile("/etc/resolv.conf")
+	if err != nil {
+		return fmt.Errorf("reading /etc/resolv.conf: %w", err)
+	}
+	text := strings.TrimSpace(string(conf))
+	fmt.Printf("resolv.conf: %q\n", text)
+	if !strings.HasPrefix(text, "nameserver ") {
+		return fmt.Errorf("no nameserver line: %q", text)
+	}
+	if net.ParseIP(strings.TrimPrefix(text, "nameserver ")) == nil {
+		return fmt.Errorf("the nameserver is not an address: %q", text)
+	}
+	if _, err := os.ReadFile("/etc/hosts"); err != nil {
+		return fmt.Errorf("reading /etc/hosts: %w", err)
+	}
+	return nil
+}
+
+// resolveName looks a name up with Go's **own** resolver — its query
+// building, its retries, its answer parsing — over the UDP sockets this
+// kernel provides, and against a server the test runs. What comes back is
+// checked against what that server was told to answer, so this is a claim
+// about the kernel and not about the internet.
+func resolveName() error {
+	name, answer, server := os.Getenv(dnsNameEnv), os.Getenv(dnsAnswerEnv), os.Getenv(dnsServerEnv)
+	if name == "" || answer == "" || server == "" {
+		return errSkip
+	}
+	resolver := &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, network, server)
+		},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	addrs, err := resolver.LookupHost(ctx, name)
+	if err != nil {
+		return fmt.Errorf("looking up %s through %s: %w", name, server, err)
+	}
+	fmt.Printf("%s resolved to %v\n", name, addrs)
+	for _, got := range addrs {
+		if got == answer {
+			return nil
+		}
+	}
+	return fmt.Errorf("%s came back as %v, want %s", name, addrs, answer)
+}
+
 func main() {
 	check("network-up", waitForNetwork())
 	check("udp-loopback", loopback())
@@ -239,6 +308,8 @@ func main() {
 	check("tcp-client", tcpClient())
 	check("udp-server", udpServer())
 	check("tcp-server", tcpServer())
+	check("resolv-conf", resolverConfig())
+	check("dns", resolveName())
 	if failed {
 		os.Exit(1)
 	}

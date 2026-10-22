@@ -56,6 +56,7 @@ Step by step: each phase in `TASKS.md` ends with something that boots and is tes
 | P5 Netboot | **Done in QEMU (2026-10-21).** Our own MKNB protocol (NETBOOT.md): a unicast sweep finds the server, the archive arrives in windowed blocks and is verified against SHA-256 before anything is mounted. The server is a Go program in this tree. |
 | P6 Full Go (gc) | **Done for one core (2026-10-21).** Go 1.26 binaries run unchanged: threads, futex, epoll timers, async preemption by SIGURG, GC, signals. SMP is not started. |
 | P7 Sockets | **Done for UDP and TCP (2026-10-21).** Go's `net` package works: UDP both ways, TCP active and passive open, and a complete HTTP exchange (client *and* server) inside the guest. |
+| P10 SMP | **Cores up, the lock in place (2026-10-22).** All four Cortex-A7s are started (PSCI `CPU_ON`) and each initialises what is its own — vector table, interrupt interface, tick, VFP. One ticket spinlock around the kernel (`kernel/klock.h`) replaces "IRQs masked = locked", taken at `trap_dispatch` and released at `trap_exit`, with broadcast TLB maintenance. They do **not** schedule yet: `minikern.smp=all` opts into that and it still hangs (TASKS.md P10.3). |
 | P9 Storage | **NBD, XFS read-only and formatting done (2026-10-22).** Our own NBD client over our own TCP, a buffer cache, `/dev/nbd0`, a Go NBD server in-tree — and an XFS v5 reader that mounts filesystems Linux made, lists every directory shape and reads files byte for byte, refusing every feature it does not fully understand and every dirty log. A Go program formats a volume over the network (`userland/internal/xfsmk`) and `mount("/dev/nbd0", "/mnt", "xfs", …)` mounts it; `xfs_repair` finds nothing wrong with what the board writes (`XFS.md`). |
 
 A Go program on the board can now also reach a **network block device** and
@@ -82,7 +83,7 @@ says C follows them "in spirit". This is how minikern applies them:
 | Doc comments (Rule 15) | Apply to C. The comment block sits above the declaration in the `.h` file, and to a `static` function's definition when it is non-trivial. |
 | Mocking with gomock (Rule 17) | N/A. C ports are structs of function pointers, so a test passes a fake struct. The harness is `test/ktest.h`, with no framework. |
 | Benchmarks (Rule 18.2) | Deferred until there is a hot path worth measuring (the network checksum, the TAR lookup). |
-| Concurrency (Rule 20) | Single core. **The kernel runs with IRQs masked** (every exception masks them on entry) and is never preempted; IRQs are taken only in user mode and in the idle loop. That is the lock: every kernel structure is safe by construction, and "check then sleep" (futex, epoll) is atomic. User threads are preempted on the tick. Going SMP replaces this with real locks: the shared structures are the run queue, the pmm, the kheap and each process's mm/fd table. |
+| Concurrency (Rule 20) | **One lock around the whole kernel** (`kernel/klock.h`), which preserves exactly the property the single-core design relied on — one core inside the kernel at a time — on four cores, without auditing every structure. IRQs are still masked throughout the kernel, so there is no nesting; the lock is taken at `trap_dispatch`, released at `trap_exit`, handed on across a context switch, and given up by an idle core and by `irq_wait`. The parallelism this buys is in **user space**, which is where a Go program spends its time; finer locks come only where profiling asks (TASKS.md P10.4). |
 | CLI flags (Rule 21) | N/A in the kernel. Configuration is the **kernel command line** (`core/cmdline.h`). |
 | Sonar (Rule 24) | **Skipped.** There is no `go.mod` anywhere in the project (the Go code here builds through Bazel alone, as `src/go/purplelx`'s installer does), so the decision logic in Rule 24 says skip, and the CFamily analyzer is not used for the C. |
 | CVE suite (Rule 25) | **Applies, and is the project's largest test surface.** Four suites: `cve_syscall_qemu_test` (42 hostile syscalls from a Go program), `net_test` + `netboot_test` + `tcp_hostile_test` (malformed and attacking packets, also under ASan and UBSan), and the server's `cve_test.go` (amplification, traversal, exhaustion). Each class is named with the product class it comes from. |
@@ -239,6 +240,9 @@ Kernel command line (all optional):
 | `minikern.net=off` | leave the network down |
 | `minikern.netboot[=<ip>]` | fetch the root filesystem over the network; with an address, probe only that one and never sweep |
 | `minikern.nbd=<ip>[:<port>][/<export>]` | attach a network block device as `/dev/nbd0` before init runs (port 10809 by default) |
+| `minikern.dns=<ip>` | the resolver `/etc/resolv.conf` should name, instead of the lease's |
+| `minikern.smp=off` | do not start the other three cores at all |
+| `minikern.smp=all` | let them schedule too — experimental, and known to hang (TASKS.md P10.3) |
 | `minikern.netstat=1` | print the interface, TCP and block-cache counters when init exits |
 | `minikern.env.NAME=VALUE` | put `NAME=VALUE` in init's environment |
 
@@ -285,6 +289,8 @@ src/
 │   ├── mmu.*       TTBR0/TTBR1 split, TLB and cache maintenance
 │   ├── pgtable.*   user translation tables (pure, host-tested)
 │   ├── gic.*       GIC-400;  timer.*  generic timer;  psci.*  power;  cpu.*
+│   ├── smp.*       the other three cores: PSCI bring-up, per-core setup
+│   ├── spinlock.h  a ticket lock, the one synchronisation primitive
 │   └── layout.h    the virtual address map
 ├── kernel/     board-independent kernel services, over arch/ and core/
 │   ├── mem.*       the live pmm + kheap + table memory
@@ -293,12 +299,15 @@ src/
 │   ├── mm.*        address spaces: lazy faults, mmap/munmap/mprotect/brk, user copies
 │   ├── exec.*      ELF + stack + sigpage → a runnable process
 │   ├── signal.*    actions, masks, altstack, rt_sigframe delivery, rt_sigreturn
+│   ├── klock.*     one lock around the kernel: one core inside it at a time
 │   ├── futex.*, time.*, irq.*, fault.*, random.*, tty.*, panic.*, selftest.*
 │   ├── net.*       the live interface: EMAC frames in, tick, DHCP, echo service
 │   ├── netboot.*   fetches the root filesystem before init runs
 │   ├── dma.*       an uncached window of RAM for descriptor rings and buffers
 │   ├── nbd.*       the live NBD client: our TCP as its transport, /dev/nbd0
-│   ├── xfsfs.*     an XFS filesystem in the namespace (mount, read, list)
+│   ├── xfsfs.*     an XFS filesystem in the namespace (mount, read, list, write)
+│   ├── tmpfs.*     a small writable filesystem in memory, at /tmp
+│   ├── genfs.*     the files the kernel makes up: /etc/resolv.conf, /etc/hosts
 │   ├── socket.*    BSD sockets over the stack;  sock_udp.c, sock_tcp.c
 │   ├── vfs.*       files and the namespace;  tarfs.*, devfs.*, procfs.*
 │   └── syscall.* + sys_<domain>.c   the syscall table, one file per domain
@@ -530,7 +539,12 @@ syscall interface above. No `/proc/sys` tree is wanted.
   reset is believed only at exactly the expected sequence number (blind reset
   injection); a SYN flood is bounded by the listener's backlog, not by the
   connection table.
-- **Not yet**: DHCP lease renewal (P1.11), DNS, IPv6, congestion control, and
+- **DNS needs no resolver in the kernel.** The lease's DNS option becomes
+  `/etc/resolv.conf` (`kernel/genfs.c`) and Go's own pure-Go resolver does the
+  rest in user space over the UDP sockets it already has. `minikern.dns=`
+  overrides the lease and survives it, because a lease arriving later would
+  otherwise overwrite exactly the thing the override is for.
+- **Not yet**: DHCP lease renewal (P1.11), IPv6, congestion control, and
   `SO_RCVTIMEO`-style socket timeouts (Go uses its own deadlines, so nothing needs
   them yet).
 - **QEMU wiring:** `-nic user` for DHCP and egress; `hostfwd=` to reach the guest's
@@ -616,6 +630,22 @@ syscall interface above. No `/proc/sys` tree is wanted.
   not keep coherent (ARM ARM B2.9). `minikern.selftest=dma-alias` proves the alias
   is really gone — the only half of this QEMU can judge — and that an accidental
   access faults instead of corrupting a frame.
+- **PSCI starts a secondary core in the mode the primary was entered in.** On
+  QEMU that is HYP, and from HYP a CP15 write to `c1/c0/0` or `c2/c0/0` lands on
+  **HSCTLR and HTTBR** — the hypervisor's own registers — not the ones the code
+  means. A secondary that skipped the HYP→SVC drop therefore configured the wrong
+  MMU and died on the first instruction fetch after enabling it, with PSCI
+  reporting success and the core simply never arriving. The drop is now one macro
+  (`drop_to_svc`) that the primary and every secondary use, and it also hands the
+  counter and the coprocessors down to PL1, which each core must do for itself.
+  *Found by writing a character to the UART's physical address at each step of the
+  bring-up:* the core printed its way to the MMU enable and no further, which is
+  the only kind of evidence available before there is a console.
+- **A secondary cannot use the primary's boot table.** `mmu_init` gives the low
+  half to user space, so by the time a core is started there is no identity
+  mapping for the physical address it is entered at. It gets its own table
+  (`smp_l1`), mapping RAM identically and high, and joins the kernel's regime
+  after the jump.
 - **A test that does nothing must not pass.** `net_sanitized_test.sh` found its
   include roots by walking up to a directory named `minikern`, and picked the test
   mains out of its arguments with `/test/`. Both assumed the monorepo's path.

@@ -1,6 +1,7 @@
 #include "arch/arm/trap.h"
 
 #include "core/console.h"
+#include "kernel/klock.h"
 #include "kernel/panic.h"
 
 extern const uint32_t arm_vectors[];
@@ -37,6 +38,12 @@ static uint32_t read_ifsr(void) {
 
 void trap_init(const struct trap_handlers *h) {
     handlers = *h;
+    trap_init_cpu();
+}
+
+/* VBAR is per core: a core that never set it takes its first exception to
+ * address zero, which is nothing at all. */
+void trap_init_cpu(void) {
     __asm__ volatile("mcr p15, 0, %0, c12, c0, 0\n\tisb" : : "r"(arm_vectors) : "memory");
 }
 
@@ -85,7 +92,28 @@ static void trap_route(struct trapframe *tf, uint32_t kind) {
     }
 }
 
+/* Every way into the kernel comes through here, which is why the kernel
+ * lock is taken here (klock.h).
+ *
+ * It is **released by `trap_exit`**, not here, because that is the one path
+ * out to user mode and a freshly started thread takes it without ever
+ * having arrived through this function: it inherits the lock from the core
+ * that switched to it and would otherwise hold it for ever — which is
+ * exactly how the first version of this deadlocked on init's first
+ * syscall. A context switch inside the handler hands the lock on in the
+ * same way. */
 void trap_dispatch(struct trapframe *tf, uint32_t kind) {
+    /* A fault in kernel mode is a kernel bug: kernel/fault.c refuses to
+     * recover one, so it ends in a panic. The core that took it is already
+     * inside the kernel and therefore already holds the lock, so taking it
+     * again would deadlock and the panic would never be printed — which is
+     * how a missing per-core VFP enable showed up as a silent freeze
+     * instead of a message. An interrupt in kernel mode is different: it
+     * can only arrive from irq_wait, which gives the lock up first. */
+    bool kernel_fault = !trap_from_user(tf) && kind != TRAP_IRQ;
+    if (!kernel_fault) {
+        klock_acquire();
+    }
     trap_route(tf, kind);
     if (trap_from_user(tf) && handlers.return_to_user != NULL) {
         handlers.return_to_user(tf);

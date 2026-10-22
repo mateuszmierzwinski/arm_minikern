@@ -16,6 +16,7 @@ set -euo pipefail
 image="$1"
 rootfs="$2"
 netecho="$3"
+dnsecho="${4:-}"
 tmp="${TEST_TMPDIR:-$(mktemp -d)}"
 log="$tmp/console.log"
 ready="$tmp/netecho.ready"
@@ -38,13 +39,46 @@ fi
 
 "$netecho" -tcp "$tcp_echo" -udp "127.0.0.1:$udp_port" -ready-file "$ready" >"$tmp/netecho.log" 2>&1 &
 echo_pid=$!
+
+# A resolver of our own, so "the kernel can resolve a name" is a claim about
+# the kernel rather than about the internet.
+#
+# It listens on a high port on the host's own address, because binding port
+# 53 needs root and QEMU's guestfwd is TCP-only — so the guest's resolver is
+# pointed at it with a Dial of its own. The one thing that leaves untested
+# is whether /etc/resolv.conf names the right address, which the guest
+# checks by reading the file.
+dns_pid=0
+dns_name="minikern.test."
+dns_answer="10.9.8.7"
+dns_env=""
+guestfwd=""
+if [ -n "$dnsecho" ] && [ -n "$host_ip" ]; then
+    dns_ready="$tmp/dns.ready"
+    "$dnsecho" -listen "$host_ip:0" -name "$dns_name" -answer "$dns_answer" \
+        -ready-file "$dns_ready" >"$tmp/dnsecho.log" 2>&1 &
+    dns_pid=$!
+    for _ in $(seq 1 50); do
+        [ -s "$dns_ready" ] && break
+        sleep 0.1
+    done
+    if [ -s "$dns_ready" ]; then
+        dns_server="$(tr -d '\n' <"$dns_ready")"
+        dns_env=" minikern.env.MINIKERN_DNS_NAME=$dns_name minikern.env.MINIKERN_DNS_ANSWER=$dns_answer\
+ minikern.env.MINIKERN_DNS_SERVER=$dns_server minikern.dns=${dns_server%%:*}"
+        echo "the guest will resolve $dns_name through $dns_server"
+    else
+        echo "dnsecho did not come up: the DNS check will be skipped" >&2
+    fi
+fi
+
 qemu-system-arm -M orangepi-pc -display none -monitor none -serial "file:$log" \
     -nic "user,hostfwd=udp:127.0.0.1:$guest_udp-:9000,hostfwd=tcp:127.0.0.1:$guest_tcp-:9001" \
     -kernel "$image" -initrd "$rootfs" \
     -append "console=uart0 minikern.halt=poweroff minikern.env.MINIKERN_TCP_ECHO=$tcp_echo \
-minikern.env.MINIKERN_UDP_ECHO=10.0.2.2:$udp_port" &
+minikern.env.MINIKERN_UDP_ECHO=10.0.2.2:$udp_port$dns_env" &
 qemu=$!
-trap 'kill $echo_pid $qemu 2>/dev/null || true; wait 2>/dev/null || true' EXIT
+trap 'kill $echo_pid $dns_pid $qemu 2>/dev/null || true; wait 2>/dev/null || true' EXIT
 
 fail() {
     echo "---- console"; cat "$log" 2>/dev/null || true
@@ -92,6 +126,17 @@ tcp_reply=""
 read -r -t 15 -N 5 tcp_reply <&4 || true
 exec 4<&-
 [ "$tcp_reply" = "KNOCK" ] || fail "the guest's TCP server replied '$tcp_reply', want 'KNOCK'"
+
+# The resolver: the kernel generated /etc/resolv.conf from the lease, Go's
+# own resolver read it, and the answer came from a server of ours.
+wait_for "PASS resolv-conf"
+if [ -n "$dns_env" ]; then
+    wait_for "PASS dns"
+    grep -q "minikern.test. resolved to \[$dns_answer\]" "$log" ||
+        fail "the guest resolved the name to something else"
+    grep -q "resolv.conf: \"nameserver ${dns_server%%:*}\"" "$log" ||
+        fail "the kernel's generated resolv.conf does not name the resolver we gave it"
+fi
 
 wait_for "ALL NET PASS"
 wait_for "init exited with status 0"

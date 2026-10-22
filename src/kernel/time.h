@@ -19,6 +19,15 @@ uint64_t time_monotonic_ns(void);
 /* Nanoseconds since 1970. */
 uint64_t time_realtime_ns(void);
 
+/* Sets the wall clock. The monotonic clock is unaffected — it is the
+ * generic timer and nothing may move it — so this only changes the offset
+ * between the two.
+ *
+ * It exists so an NTP client written in Go can fix the time: this board has
+ * no battery-backed clock, so without it every boot starts in 1970 or at
+ * whatever minikern.epoch= claimed. */
+void time_set_realtime_ns(uint64_t ns);
+
 /* Something run on every tick, in interrupt context (IRQs masked). */
 struct tick_hook {
     void (*tick)(void *self, uint64_t now_ns);

@@ -5,9 +5,11 @@
  * file or listing that directory goes through the reader, the buffer cache
  * and the network block device beneath it.
  *
- * One mount, read-only, over the volume /dev/nbd0 names. Writing is P9.4
- * and the log comes first — a filesystem this kernel cannot journal is one
- * it must not change.
+ * One mount, over the volume /dev/nbd0 names. A read-write mount may write
+ * **file data into blocks a file already has** and nothing else: XFS does
+ * not journal data, so that changes no metadata. Creating a file, growing
+ * one or filling a hole all need the log, which is P9.4 — a filesystem this
+ * kernel cannot journal is one it must not restructure.
  */
 #ifndef MINIKERN_KERNEL_XFSFS_H
 #define MINIKERN_KERNEL_XFSFS_H
@@ -24,7 +26,7 @@ struct file;
  * KERR_NODEV when no volume is attached, KERR_BUSY when something is
  * already mounted, KERR_INVAL for a path that is not absolute, or whatever
  * xfs_mount refused it for — which the console explains. */
-int xfsfs_mount(const char *at);
+int xfsfs_mount(const char *at, bool read_only);
 
 /* Whether anything is mounted, and where. */
 bool xfsfs_mounted(void);

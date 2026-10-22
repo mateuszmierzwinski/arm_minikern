@@ -47,6 +47,8 @@ expect_common() {
 boot atags ""
 expect_common
 expect "boot: info atags at 40000100"
+# Every core came up and said so (arch/arm/smp.h).
+expect "smp: 4 of 4 cores up"
 
 boot atags_initrd "" -initrd "$initrd"
 expect_common
@@ -64,6 +66,15 @@ selftest() {
     expect "in kernel mode"
     expect "PANIC: unhandled $2"
 }
+# With the other cores left alone, the kernel is the single-core one it was.
+# expect_common is not used here: it asserts the exact command line, and this
+# boot has one more option on it.
+boot smp_off " minikern.smp=off"
+expect "minikern: boot complete"
+expect "minikern: powering off"
+expect "smp: not starting the other cores"
+! grep -qF "cores up" "$log" || fail "cores were started with minikern.smp=off"
+
 selftest undef "undefined instruction"
 selftest dabt "data abort"
 selftest pabt "prefetch abort"

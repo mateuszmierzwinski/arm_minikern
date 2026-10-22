@@ -19,6 +19,12 @@ struct frame_sink knet_init(const uint8_t mac[ETH_ALEN], const struct netdev_por
 /* Starts DHCP and the tick (once the device is up). */
 void knet_start(uint32_t xid);
 
+/* Overrides the resolver the lease advertised, which is what
+ * minikern.dns=<ip> is for: a board on a network whose DHCP points at a
+ * resolver it cannot reach, and the DNS test, which runs a resolver of its
+ * own. Takes effect for every /etc/resolv.conf opened afterwards. */
+void knet_set_dns(ip4_t dns);
+
 /* Waits, with interrupts open, until DHCP has given the interface an
  * address. KERR_OK, or KERR_TIMEDOUT after timeout_ms.
  *

@@ -1,7 +1,9 @@
 #include "kernel/sched.h"
 
+#include "core/console.h"
 #include "core/errno.h"
 #include "kernel/irq.h"
+#include "kernel/klock.h"
 #include "kernel/mem.h"
 #include "kernel/panic.h"
 #include "kernel/proc.h"
@@ -13,8 +15,51 @@
 void arm_switch(uint32_t *save_sp, uint32_t new_sp);
 void arm_thread_start(void);
 
+#include "arch/arm/smp.h"
+
 static struct task tasks[SCHED_MAX_TASKS];
-static struct task *current = &tasks[0];
+
+/* Which task each core is running. The first SMP_MAX_CPUS entries of tasks[]
+ * are the cores' idle contexts — the context a core is on when it has
+ * nothing to run — so a core always has a `current` to save state into. */
+static struct task *cpu_current[SMP_MAX_CPUS];
+
+#define current (*current_slot())
+
+static struct task **current_slot(void) {
+    uint32_t cpu = smp_cpu_id();
+    return &cpu_current[cpu < SMP_MAX_CPUS ? cpu : 0];
+}
+
+/* The first SMP_MAX_CPUS tasks are the cores' idle contexts, one each.
+ *
+ * They are never on the run queue and never scheduled by another core: two
+ * cores running one idle context would be two cores on one stack. Every
+ * loop over tasks[] therefore starts past them, and every "is this the idle
+ * task" test asks about the range rather than about tasks[0] — which is
+ * what the single-core version did, and what made a secondary push its own
+ * idle context onto the shared queue. */
+#define FIRST_REAL_TASK SMP_MAX_CPUS
+
+static bool is_idle(const struct task *t) {
+    return t >= &tasks[0] && t < &tasks[FIRST_REAL_TASK];
+}
+
+/* This core's idle context: where it goes when there is nothing to run. */
+static struct task *my_idle(void) {
+    return &tasks[smp_cpu_id() % SMP_MAX_CPUS];
+}
+
+/* True when any core is running this task, which is what makes it unsafe
+ * to free. */
+static bool running_somewhere(const struct task *t) {
+    for (uint32_t cpu = 0; cpu < SMP_MAX_CPUS; cpu++) {
+        if (cpu_current[cpu] == t) {
+            return true;
+        }
+    }
+    return false;
+}
 static struct task *run_head, *run_tail;
 static uint32_t next_tid = 1;
 static bool need_resched;
@@ -62,8 +107,8 @@ static void free_task(struct task *t) {
 
 /* Frees exited tasks; never the one running (its stack is in use). */
 static void reap_zombies(void) {
-    for (uint32_t i = 1; i < SCHED_MAX_TASKS; i++) {
-        if (tasks[i].state == TASK_ZOMBIE && &tasks[i] != current) {
+    for (uint32_t i = FIRST_REAL_TASK; i < SCHED_MAX_TASKS; i++) {
+        if (tasks[i].state == TASK_ZOMBIE && !running_somewhere(&tasks[i])) {
             free_task(&tasks[i]);
         }
     }
@@ -89,12 +134,21 @@ static void switch_to(struct task *next) {
 }
 
 void sched_init(void) {
-    tasks[0] = (struct task){.tid = 0, .state = TASK_RUNNABLE};
-    current = &tasks[0];
+    for (uint32_t cpu = 0; cpu < SMP_MAX_CPUS; cpu++) {
+        tasks[cpu] = (struct task){.tid = 0, .state = TASK_RUNNABLE};
+        cpu_current[cpu] = &tasks[cpu];
+    }
+}
+
+/* What a core calls once, before it starts scheduling: it adopts its own
+ * idle context. The primary did this in sched_init; a secondary does it
+ * when it is let into the kernel (arch/arm/smp.h). */
+void sched_init_cpu(void) {
+    current = &tasks[smp_cpu_id() % SMP_MAX_CPUS];
 }
 
 static struct task *free_slot(void) {
-    for (uint32_t i = 1; i < SCHED_MAX_TASKS; i++) {
+    for (uint32_t i = FIRST_REAL_TASK; i < SCHED_MAX_TASKS; i++) {
         if (tasks[i].state == TASK_UNUSED) {
             return &tasks[i];
         }
@@ -132,16 +186,16 @@ struct task *sched_current(void) {
 
 void sched_yield(void) {
     struct task *next;
-    if (current != &tasks[0] && current->state == TASK_RUNNABLE) {
+    if (!is_idle(current) && current->state == TASK_RUNNABLE) {
         runq_push(current);
     }
     next = runq_pop();
-    switch_to(next != NULL ? next : &tasks[0]);
+    switch_to(next != NULL ? next : my_idle());
 }
 
 int sched_sleep(const void *chan, uint32_t key, uint64_t deadline_ns, bool interruptible) {
     struct task *t = current;
-    if (t == &tasks[0]) {
+    if (is_idle(t)) {
         panic("sched: the idle task cannot sleep");
     }
     if (interruptible && (t->sig_pending & ~t->sig_blocked) != 0) {
@@ -166,7 +220,7 @@ static void wake(struct task *t, int result) {
 
 uint32_t sched_wake(const void *chan, uint32_t key, uint32_t max) {
     uint32_t n = 0;
-    for (uint32_t i = 1; i < SCHED_MAX_TASKS && n < max; i++) {
+    for (uint32_t i = FIRST_REAL_TASK; i < SCHED_MAX_TASKS && n < max; i++) {
         struct task *t = &tasks[i];
         if (t->state == TASK_SLEEPING && t->wait_chan == chan && t->wait_key == key && chan != NULL) {
             wake(t, 0);
@@ -183,13 +237,13 @@ void sched_interrupt(struct task *t) {
 }
 
 void sched_tick(uint64_t now_ns) {
-    for (uint32_t i = 1; i < SCHED_MAX_TASKS; i++) {
+    for (uint32_t i = FIRST_REAL_TASK; i < SCHED_MAX_TASKS; i++) {
         struct task *t = &tasks[i];
         if (t->state == TASK_SLEEPING && t->wake_at_ns != 0 && now_ns >= t->wake_at_ns && t->wait_chan != NULL) {
             wake(t, KERR_TIMEDOUT);
         }
     }
-    if (current != &tasks[0] && current->slice_left > 0 && --current->slice_left == 0) {
+    if (!is_idle(current) && current->slice_left > 0 && --current->slice_left == 0) {
         need_resched = true;
     }
 }
@@ -208,7 +262,7 @@ void sched_exit_current(void) {
 }
 
 void sched_kill_task(struct task *t) {
-    if (t == current || t == &tasks[0]) {
+    if (t == current || is_idle(t)) {
         panic("sched: cannot kill the running or idle task");
     }
     if (t->state == TASK_RUNNABLE) {
@@ -217,19 +271,27 @@ void sched_kill_task(struct task *t) {
     free_task(t);
 }
 
+/* An idle core. It holds the kernel lock while it looks at the run queue
+ * and gives it up around the wait, which is the one place anything does
+ * (klock.h rule 3): there is nothing to protect while asleep, and holding
+ * it there would stop every other core from entering the kernel.
+ *
+ * Every core ends up here — the primary at the end of boot, a secondary as
+ * soon as it is let in — so this is also where a core waits for work. */
 void sched_idle_loop(void) {
+    klock_acquire();
     for (;;) {
         reap_zombies();
         if (run_head != NULL) {
             sched_yield();
-        } else {
-            irq_wait();
+            continue;
         }
+        irq_wait();  /* gives the lock up while it waits (klock.h rule 5) */
     }
 }
 
 void sched_for_each(void (*fn)(void *ctx, struct task *t), void *ctx) {
-    for (uint32_t i = 1; i < SCHED_MAX_TASKS; i++) {
+    for (uint32_t i = FIRST_REAL_TASK; i < SCHED_MAX_TASKS; i++) {
         if (tasks[i].state != TASK_UNUSED && tasks[i].state != TASK_ZOMBIE) {
             fn(ctx, &tasks[i]);
         }
@@ -237,7 +299,7 @@ void sched_for_each(void (*fn)(void *ctx, struct task *t), void *ctx) {
 }
 
 struct task *sched_find(uint32_t tid) {
-    for (uint32_t i = 1; i < SCHED_MAX_TASKS; i++) {
+    for (uint32_t i = FIRST_REAL_TASK; i < SCHED_MAX_TASKS; i++) {
         if (tasks[i].tid == tid && tasks[i].state != TASK_UNUSED && tasks[i].state != TASK_ZOMBIE) {
             return &tasks[i];
         }

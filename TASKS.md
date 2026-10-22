@@ -177,9 +177,15 @@ Legend: `[x]` done · `[ ]` to do · `[~]` partial
       lossy, duplicating, reordering wire, and 12 hostile-input cases.
 - [x] **P7.4 The milestone**, `net_sockets_qemu_test`: Go's `net` over UDP and TCP in
       both directions, including a full HTTP client and server inside the guest.
-- [ ] **P7.5 DNS**, so Go can dial a name rather than an address. No kernel
-      resolver: synthesize `/etc/resolv.conf` from the DHCP DNS option and let Go's
-      pure-Go resolver do the rest in user space.
+- [x] **P7.5 DNS (2026-10-22).** No kernel resolver: `/etc/resolv.conf` and
+      `/etc/hosts` are generated from the DHCP lease (`kernel/genfs.c`) and Go's own
+      pure-Go resolver does the rest over the UDP sockets it already has.
+      `minikern.dns=<ip>` overrides the lease, and survives it. Proved in
+      `net_sockets_qemu_test` against a one-name DNS server of ours
+      (`test/tools/dnsecho`), so the check is about the kernel rather than about the
+      internet. *Learned:* QEMU's `guestfwd` is TCP-only, so the guest cannot be
+      pointed at a host program on port 53 without root — the test aims the query
+      with a `Dial` of its own and checks the generated file separately.
 - [ ] P7.6 `SO_RCVTIMEO`/`SO_SNDTIMEO` and `poll`/`select`, for programs that are
       not Go.
 
@@ -197,10 +203,15 @@ Legend: `[x]` done · `[ ]` to do · `[~]` partial
       under two cacheabilities. `minikern.selftest=dma-alias` proves the alias faults.
       *Learned:* a QEMU-only test suite cannot see a cache bug at all (CLAUDE.md §10).
 - [ ] An RTC driver (the H3 has one, and so does QEMU) instead of `minikern.epoch=`.
-- [ ] **P8.9 `clock_settime`**, so an NTP client written in Go can fix the clock and
-      `minikern.epoch=` can go (the NEO's RTC has no battery anyway).
-- [ ] **P8.10 A writable `/tmp`** (tmpfs): a lot of Go code assumes it can write
-      somewhere.
+- [x] **P8.9 `clock_settime` (2026-10-22).** `settimeofday`, `clock_settime` and
+      `clock_settime64` set the wall clock; the monotonic clock is the generic timer
+      and cannot be moved, which the test checks. An NTP client in Go can now fix
+      the time on a board with no battery.
+- [x] **P8.10 A writable `/tmp` (2026-10-22).** `kernel/tmpfs.c`: sixteen flat
+      files of at most 256 KiB out of the kernel heap, with create, write, grow,
+      list, unlink and unlink-while-open. `unlink`/`unlinkat` refuse everywhere
+      else, because everywhere else is read-only. The ABI suite exercises it
+      through `os.CreateTemp`, `os.ReadDir` and `os.Remove`.
 - [ ] **P8.11 A watchdog driver**, needed before this ever runs unattended.
 - [ ] A real entropy source (the H3 crypto engine's PRNG, or timing jitter): today's
       `getrandom` is xoshiro128** seeded from the timer and chip ID, which is fine for
@@ -247,8 +258,19 @@ after every test.**
       nothing wrong with it**. *Learned:* five numbers came from xfs_repair's own
       complaints rather than from any document (XFS.md §7) — among them that the log
       record header's cycle-data array is 64 entries, not 56.
-- [ ] **P9.4 Writes.** The log first. No log recovery at first: keep refusing a dirty
+- [~] **P9.4 Writes.** The log first. No log recovery at first: keep refusing a dirty
       log and let Linux `xfs_repair` deal with a crash until replay exists.
+      - [x] **P9.4a File data into blocks a file already has (2026-10-22).** XFS does
+            not journal data, so this changes no metadata and needs no transaction —
+            which is why it is possible before the log exists. A hole, an unwritten
+            extent, growing a file and creating one are all refused. A read-write
+            mount is `mount(..., 0)`; `MS_RDONLY` still gives the old behaviour.
+            Proved on real images (`xfs_live_test`) and from the board, writing into
+            a file `mkfs.xfs` put there, with `xfs_repair -n` clean afterwards and
+            the bytes found in the volume (`xfs_qemu_test` phase two).
+      - [ ] **P9.4b The log**: transaction framing, buffer and inode log items, and
+            the commit record — with `xfs_logprint` as the judge. Then creating a
+            file, allocating blocks and growing one become possible.
 
 ---
 
@@ -257,13 +279,53 @@ after every test.**
 Stage 1 is a big kernel lock on purpose. The payoff is Go running `GOMAXPROCS=4` in
 *user* space, and this kernel spends little time in itself.
 
-- [ ] **P10.1 Bring up CPUs 1–3** with PSCI `CPU_ON` (U-Boot provides PSCI on the
-      H3): a GIC CPU interface, generic timer, stack and current-thread pointer each.
-- [ ] **P10.2 One spinlock around the kernel**, replacing "IRQs masked = locked"
-      (CLAUDE.md §2). TLB maintenance becomes the broadcast forms (`TLBIMVAIS` and
-      friends), plus a reschedule IPI.
-- [ ] **P10.3 Fix what the single-core assumption bought.** `futex` and the scheduler
-      are where the bugs will be.
+- [x] **P10.1 Bring up CPUs 1–3 (2026-10-22).** PSCI `CPU_ON`, a private
+      bring-up translation table (the primary has given the low half to user space
+      by then, so there is no identity map left), a stack each, and the MMU on.
+      They report themselves and then idle: they run no kernel code and touch no
+      kernel structure, so the kernel is exactly as correct as it was while the hard
+      part is proved on its own. `minikern.smp=off` leaves them alone.
+      *Learned:* **PSCI starts a secondary in the mode the primary was entered in**
+      — HYP on QEMU — and from HYP a CP15 write to c1/c0/0 goes to HSCTLR, not
+      SCTLR, so a core that skips the HYP→SVC drop configures the wrong MMU and
+      dies with PSCI reporting success (CLAUDE.md §10).
+- [x] **P10.1b What belongs to one core (2026-10-22).** Each core sets up its own
+      vector table (`trap_init_cpu`), interrupt interface and banked timer
+      interrupt (`gic_init_cpu`), tick (`timer_start_cpu`), **VFP**
+      (`arm_vfp_enable`) and current-task slot (`sched_init_cpu`). *Learned:* a
+      core that skips the VFP enable faults on the first floating-point
+      instruction — which, inside the kernel while holding the lock, deadlocked in
+      silence. `trap_dispatch` now leaves the lock alone for a kernel-mode fault,
+      so a kernel bug on any core panics with a message instead of freezing.
+- [x] **P10.2 One lock around the kernel (2026-10-22).** A ticket spinlock
+      (`arch/arm/spinlock.h`) taken at the single way in — `trap_dispatch` — and
+      released on the one way out to user mode, `trap_exit`. The rules are in
+      `kernel/klock.h`: the lock belongs to the core rather than to the stack, so a
+      context switch hands it on; an idle core gives it up around `wfi`; and
+      `irq_wait` gives it up while it waits, because the interrupt it waits for
+      arrives through the same door. TLB maintenance is the broadcast form now
+      (`TLBIALLIS`). All 47 targets pass with it in place.
+      *Learned:* a freshly started thread reaches user mode without ever having
+      come through `trap_dispatch`, so releasing there deadlocked init on its first
+      syscall; the release belongs at the exit, which both paths share.
+      A reschedule IPI is **not** done: an idle core notices work on its next tick
+      instead, which is a millisecond of latency rather than a correctness problem.
+- [~] **P10.3 Fix what the single-core assumption bought.** The cores schedule only
+      with `minikern.smp=all`, because that path still hangs shortly after the Go
+      runtime's second thread appears. Two real bugs were found and fixed on the
+      way — `sched_yield` pushed a core's **own idle context** onto the shared run
+      queue (two cores would have run one stack), and it fell back to core 0's idle
+      context whatever core it was on — and the next step is the third:
+      - **Nothing stops two cores popping the same task.** A task is on the queue
+        and still on a core between `runq_push` and the end of `arm_switch`. The fix
+        is to enqueue a yielding task on the **far side** of the switch, where its
+        state is known to be saved, rather than to skip "on a core" tasks at pop
+        time — which was tried, costs the single-core path a bounce through idle,
+        and did not fix the hang on its own.
+      - Then `sched_sleep`/`sched_wake` want reviewing for the same class of race,
+        and `proc_switch_mm` for two cores in one address space.
+      *What is proved meanwhile:* four cores up, the lock correct on the paths all
+      47 tests take, and each core initialising what is its own.
 - [ ] **P10.4 Finer locks only where profiling says so** — likely futex, the network
       stack, the run queue. Not designed up front.
 

@@ -17,6 +17,10 @@ uint64_t timer_count_to_ns(uint64_t count, uint32_t hz);
 /* Starts a periodic interrupt every period counts. timer_ack re-arms it
  * from the previous deadline, so ticks never drift. */
 void timer_start_periodic(uint32_t period);
+
+/* Starts this core's tick with the period already chosen, for a core that
+ * came up after the primary. */
+void timer_start_cpu(void);
 void timer_ack(void);
 
 #endif

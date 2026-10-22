@@ -56,6 +56,10 @@ struct task {
 /* The boot context becomes the idle task (tid 0). */
 void sched_init(void);
 
+/* Adopts this core's idle context. Each core calls it once before it
+ * schedules anything. */
+void sched_init_cpu(void);
+
 /* A fresh task with a kernel stack whose trapframe is zeroed; it is not
  * runnable until sched_start. NULL when out of tasks or memory. */
 struct task *sched_new_task(struct proc *p);
