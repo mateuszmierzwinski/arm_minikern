@@ -45,6 +45,18 @@ static void take_dma_alias(void) {
     (void)*(volatile uint32_t *)(uintptr_t)phys_to_virt(phys);
 }
 
+/* Wedges the kernel the way a deadlock does: interrupts masked and no way
+ * out. Nothing can report this — no print, no panic, no question answered —
+ * which is exactly why the watchdog exists, and this is how it is tested:
+ * with `minikern.watchdog=`, the machine must reboot. */
+static void take_wedge(void) {
+    kprintf("selftest: wedging the kernel with interrupts masked\n");
+    __asm__ volatile("cpsid if" ::: "memory");
+    for (;;) {
+        __asm__ volatile("" ::: "memory");
+    }
+}
+
 /* One deliberate fault per name: the C form of master Rule 6.3, so adding
  * a case is a row rather than another branch. */
 static const struct {
@@ -55,6 +67,7 @@ static const struct {
     {"dabt", take_dabt},
     {"pabt", take_pabt},
     {"dma-alias", take_dma_alias},
+    {"wedge", take_wedge},
 };
 
 void selftest_run(const char *name, unsigned len) {

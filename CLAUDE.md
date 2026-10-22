@@ -53,13 +53,13 @@ Step by step: each phase in `TASKS.md` ends with something that boots and is tes
 | P2 Kernel core | **Done (2026-10-21).** Page allocator, kernel heap, user address spaces with lazy faults, GIC + generic-timer tick, preemptive scheduler, threads. |
 | P3 Syscalls / TinyGo | **Done (2026-10-21).** TinyGo 0.39 binaries run unchanged. |
 | P4 TAR root + `/init` | **Done (2026-10-21).** ustar initrd as `/`, devfs, procfs; `/init` built from Go source by Bazel. |
-| P5 Netboot | **Done in QEMU (2026-10-21).** Our own MKNB protocol (NETBOOT.md): a unicast sweep finds the server, the archive arrives in windowed blocks and is verified against SHA-256 before anything is mounted. The server is a Go program in this tree. |
+| P5 Netboot | **Done in QEMU, and authenticated (2026-10-22).** Our own MKNB protocol (NETBOOT.md): a unicast sweep finds the server, the archive arrives in windowed blocks and is verified against SHA-256 before anything is mounted. A board can be told which image's digest to accept, and **which key's offers** — Ed25519 verification written from scratch here, with no signing, so the private half stays on the server. The server is a Go program in this tree. |
 | P6 Full Go (gc) | **Done for one core (2026-10-21).** Go 1.26 binaries run unchanged: threads, futex, epoll timers, async preemption by SIGURG, GC, signals. SMP is not started. |
 | P7 Sockets | **Done for UDP and TCP (2026-10-21).** Go's `net` package works: UDP both ways, TCP active and passive open, and a complete HTTP exchange (client *and* server) inside the guest. |
 | P10 SMP | **Done (2026-10-22).** All four Cortex-A7s run user code. One ticket spinlock around the kernel (`kernel/klock.h`) replaces "IRQs masked = locked", taken at `trap_dispatch` and released at `trap_exit`; each core initialises what is its own (vector table, interrupt interface, tick, VFP, address-space regime); TLB maintenance is the broadcast form. Go sees four CPUs and uses them: 4× the work in 1.6× the time, with every core showing kernel entries. Seven single-core assumptions turned out to be bugs — they are listed in TASKS.md P10.3, and `minikern.hangcheck` exists because the last one was invisible without it. |
 | P8 fork/exec | **Done (2026-10-22).** Go's `os/exec` runs programs: `clone(CLONE_VM\|CLONE_VFORK)`, own pipes, `execve`, `wait4`, zombies that keep an exit status for their parent. Measured from a real Go binary rather than guessed, including that refusing `CLONE_PIDFD` makes Go fall back on its own. |
 | P11 Thermal/DVFS | **Policy done, hardware unverifiable here (2026-10-22).** A pure, host-tested policy (temperature overrules load, hysteresis against flapping) and a governor driven through ports, proved end to end against a ramping fake sensor (`minikern.cpufreq=test`). The H3 sensor and PLL adapters have **never run on silicon** — QEMU models neither — so the real path is off unless `minikern.cpufreq=on`. |
-| P9 Storage | **NBD, XFS reading, formatting and logged writes (2026-10-22).** Our own NBD client over our own TCP, a buffer cache, `/dev/nbd0`, a Go NBD server in-tree — and an XFS v5 reader that mounts filesystems Linux made, lists every directory shape and reads files byte for byte, refusing every feature it does not fully understand and every dirty log. A Go program formats a volume over the network (`userland/internal/xfsmk`) and `mount("/dev/nbd0", "/mnt", "xfs", …)` mounts it; `xfs_repair` finds nothing wrong with what the board writes (`XFS.md`). |
+| P9 Storage | **NBD, XFS reading, formatting, logged writes and creating files (2026-10-22).** Our own NBD client over our own TCP, a buffer cache, `/dev/nbd0`, a Go NBD server in-tree — and an XFS v5 reader that mounts filesystems Linux made, lists every directory shape and reads files byte for byte, refusing every feature it does not fully understand and every dirty log. A Go program formats a volume over the network (`userland/internal/xfsmk`) and `mount("/dev/nbd0", "/mnt", "xfs", …)` mounts it; `xfs_repair` finds nothing wrong with what the board writes (`XFS.md`). |
 
 A Go program on the board can now also reach a **network block device** and
 read an **XFS filesystem** off it — the volume being a file on a server, and
@@ -240,9 +240,13 @@ Kernel command line (all optional):
 | `minikern.halt=poweroff` | power off when init ends, or on a panic (the tests use it) |
 | `minikern.strace=1` | log every syscall with its arguments and result |
 | `minikern.epoch=<seconds>` | the wall clock at boot (default 0: there is no RTC driver yet) |
-| `minikern.selftest=undef\|dabt\|pabt` | take that exception on purpose |
+| `minikern.selftest=undef\|dabt\|pabt\|dma-alias\|wedge` | take that exception, or wedge the kernel on purpose |
+| `minikern.cpufreq=on\|test` | run the frequency governor against the real hardware, or against a fake sensor that ramps (the real path has never run on silicon) |
+| `minikern.vddcpux=<pin>` | the pin that switches VDD_CPUX, e.g. `PA10` — without it the operating points above 816 MHz are not offered |
+| `minikern.watchdog=<seconds>` | reboot the board if the kernel stops ticking for that long |
 | `minikern.net=off` | leave the network down |
 | `minikern.netboot[=<ip>]` | fetch the root filesystem over the network; with an address, probe only that one and never sweep |
+| `minikern.netboot.key=<hex>` | the Ed25519 public key whose holder's offers this board will accept, refusing every other — so only one machine can say what it runs |
 | `minikern.rootfs.sha256=<hex>` | accept only a netbooted root filesystem with this digest, refusing every other offer — so answering the sweep first decides nothing |
 | `minikern.nbd=<ip>[:<port>][/<export>]` | attach a network block device as `/dev/nbd0` before init runs (port 10809 by default) |
 | `minikern.dns=<ip>` | the resolver `/etc/resolv.conf` should name, instead of the lease's |
@@ -262,6 +266,8 @@ src/
 │   ├── kfmt.*      printf-style formatter (tested against libc)
 │   ├── div64.*     64-bit division; aeabi_div.S binds it to the EABI names
 │   ├── crc32c.*    CRC-32C, which every v5 XFS metadata block carries
+│   ├── sha512.*    SHA-512;  fe25519.*  the field of 2^255-19
+│   ├── ed25519.*   verifying a signature — never signing one
 │   └── kmem.c      memset / memcpy / memmove / memcmp (kernel only)
 ├── core/       the hexagon: pure, portable C, host-tested; includes only core/ and lib/
 │   ├── ports.h     every port: console, console input, power, page source, irq chip
@@ -277,8 +283,9 @@ src/
 │   ├── blockdev.h  a block device: fixed-size blocks, addressed by index
 │   ├── bcache.*    a buffer cache over one, because the device is a network away
 │   ├── nbd.*       the NBD client: a volume that is a file on a server
-│   ├── xfs/        an XFS v5 reader (XFS.md): superblock, inodes, extents,
-│   │               directories in all three shapes, and a clean-log check
+│   ├── xfs/        XFS v5 (XFS.md): superblock, inodes, extents, directories
+│   │               in all three shapes, a clean-log check, writing the log,
+│   │               and creating a file from the inode btrees
 │   └── net/        the IPv4 stack, all pure and host-tested
 │       ├── net.h       the one public header (netif, ports, UDP, ICMP)
 │       ├── net_eth.c   Ethernet II framing and the input entry point
@@ -306,6 +313,8 @@ src/
 │   ├── exec.*      ELF + stack + sigpage → a runnable process
 │   ├── signal.*    actions, masks, altstack, rt_sigframe delivery, rt_sigreturn
 │   ├── klock.*     one lock around the kernel: one core inside it at a time
+│   ├── watchdog.*  feeds the board's watchdog while the tick still arrives
+│   ├── thermal.*   reads the temperature, asks the policy, moves the clock
 │   ├── futex.*, time.*, irq.*, fault.*, random.*, tty.*, panic.*, selftest.*
 │   ├── net.*       the live interface: EMAC frames in, tick, DHCP, echo service
 │   ├── netboot.*   fetches the root filesystem before init runs

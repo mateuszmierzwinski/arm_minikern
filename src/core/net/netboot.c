@@ -1,5 +1,7 @@
 #include "core/net/netboot.h"
 
+#include "lib/ed25519.h"
+
 #include "core/errno.h"
 #include "core/net/net_internal.h"
 #include "lib/sha256.h"
@@ -178,6 +180,29 @@ static void finish(struct netboot *nb) {
     send_done(nb);
 }
 
+/* What the signature covers, built the same way on both ends: the session
+ * id, the image length and the digest, big-endian. The xid is in it so that
+ * an offer recorded from one boot cannot be replayed into another. */
+static void signed_bytes(const struct netboot *nb, const uint8_t *body, uint32_t len, uint8_t out[MKNB_SIGNED_BYTES]) {
+    put32(out, nb->xid);
+    put32(out + 4, len);
+    net_copy(out + 8, body + 4, 32);
+}
+
+/* True when the offer carries a good signature, or when none is required. */
+static bool offer_is_signed(const struct netboot *nb, const struct udp_datagram *d, const uint8_t *body,
+                            uint32_t len) {
+    uint8_t message[MKNB_SIGNED_BYTES];
+    if (!nb->require_signature) {
+        return true;
+    }
+    if (d->len < MKNB_HEADER + MKNB_OFFER_SIGNED) {
+        return false; /* an unsigned offer, where one was required */
+    }
+    signed_bytes(nb, body, len, message);
+    return ed25519_verify(nb->key, body + MKNB_OFFER_BODY, message, sizeof message);
+}
+
 /* An OFFER: the first valid one fixes the server and starts the transfer. */
 static void take_offer(struct netboot *nb, const struct udp_datagram *d, uint32_t len) {
     const uint8_t *body = d->data + MKNB_HEADER;
@@ -188,6 +213,12 @@ static void take_offer(struct netboot *nb, const struct udp_datagram *d, uint32_
     if (len == 0 || len > nb->capacity) {
         nb->stats.offers_refused++;
         fail(nb, NETBOOT_ERR_TOO_BIG);
+        return;
+    }
+    if (!offer_is_signed(nb, d, body, len)) {
+        /* Not from the machine this board trusts. Refused at the offer, so
+         * the sweep carries on and answering first gains nothing. */
+        nb->stats.offers_refused++;
         return;
     }
     if (nb->pinned_digest && !sha256_equal(body + 4, nb->expected)) {
@@ -353,4 +384,9 @@ const char *netboot_error_text(enum netboot_error e) {
 void netboot_expect_digest(struct netboot *nb, const uint8_t digest[32]) {
     net_copy(nb->expected, digest, 32);
     nb->pinned_digest = true;
+}
+
+void netboot_require_signature(struct netboot *nb, const uint8_t key[32]) {
+    net_copy(nb->key, key, 32);
+    nb->require_signature = true;
 }

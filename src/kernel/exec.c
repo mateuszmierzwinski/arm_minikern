@@ -242,9 +242,12 @@ int exec_replace(const char *path, const char *const *argv, uint32_t argc, const
     if (rc != KERR_OK) {
         return rc; /* nothing has been committed: the old image runs on */
     }
-    if (p->nthreads > 1) {
+    /* Only now that the image is known to be loadable: this ends the other
+     * threads, and there is no putting them back. */
+    rc = p->nthreads > 1 ? proc_become_single_threaded(p) : KERR_OK;
+    if (rc != KERR_OK) {
         mm_put(fresh);
-        return KERR_AGAIN;
+        return rc;
     }
     proc_adopt_mm(p, fresh);
     proc_close_on_exec(p);

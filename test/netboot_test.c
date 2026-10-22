@@ -8,6 +8,8 @@
 
 #include "core/errno.h"
 #include "ktest.h"
+
+#include "offer_vector.h"
 #include "lib/sha256.h"
 #include "net_frames.h"
 
@@ -27,6 +29,8 @@ struct server_config {
     ip4_t ip;
     bool silent;            /* never answer a probe */
     bool wrong_digest;      /* offer a digest that will not match */
+    bool sign;              /* append a signature to the offer */
+    bool spoil_signature;   /* ...and move a bit of it */
     bool bad_block_size;    /* offer a block size we do not support */
     uint32_t claim_len;     /* 0: the real length */
     uint32_t drop_first;    /* lose the first transmission of every n-th block */
@@ -83,8 +87,9 @@ static uint32_t server_message(uint8_t *f, uint8_t type, uint32_t arg, const voi
 #define SERVER_TOKEN 0x5eed1234u
 
 static void answer_discover(uint16_t client_port) {
-    uint8_t f[ETH_FRAME_MAX], body[MKNB_OFFER_BODY];
+    uint8_t f[ETH_FRAME_MAX], body[MKNB_OFFER_SIGNED];
     uint32_t len = cfg.claim_len != 0 ? cfg.claim_len : IMAGE_BYTES;
+    uint32_t size = MKNB_OFFER_BODY;
     fp16(body, cfg.bad_block_size ? 4096u : MKNB_BLOCK);
     fp16(body + 2, 0);
     memcpy(body + 4, source_digest, 32);
@@ -92,7 +97,12 @@ static void answer_discover(uint16_t client_port) {
     if (cfg.wrong_digest) {
         body[4] ^= 0xff;
     }
-    enqueue(f, server_message(f, MKNB_OFFER, len, body, sizeof body, client_port, cfg.ip));
+    if (cfg.sign) {
+        memcpy(body + MKNB_OFFER_BODY, TEST_OFFER_SIGNATURE, 64);
+        body[MKNB_OFFER_BODY] ^= cfg.spoil_signature ? 0x80u : 0u;
+        size = MKNB_OFFER_SIGNED;
+    }
+    enqueue(f, server_message(f, MKNB_OFFER, len, body, size, client_port, cfg.ip));
 }
 
 /* True when this block's transmission is the one to lose. */
@@ -370,6 +380,53 @@ static void test_data_from_another_host_is_refused(void) {
     KTEST_CHECK(nb.stats.blocks_refused > 0);
 }
 
+/* A signature is the thing a pinned digest is not: it says *who* is
+ * offering, so the server can change what it serves and nothing else on
+ * the subnet can make an offer this board will look at. */
+static void test_a_signed_offer_is_accepted(void) {
+    fresh(IP4(255, 255, 255, 0));
+    cfg.sign = true;
+    KTEST_CHECK(start(0) == KERR_OK);
+    netboot_require_signature(&nb, TEST_PUBLIC_KEY);
+    run(5000);
+    KTEST_CHECK(nb.state == NETBOOT_READY);
+    KTEST_CHECK(nb.stats.offers_refused == 0);
+}
+
+/* The attack: a machine that answers the sweep without the private key.
+ * Refused at the offer, so the sweep carries on and it gains nothing. */
+static void test_an_unsigned_offer_is_refused(void) {
+    fresh(IP4(255, 255, 255, 0));
+    KTEST_CHECK(start(0) == KERR_OK);
+    netboot_require_signature(&nb, TEST_PUBLIC_KEY);
+    run(5000);
+    KTEST_CHECK(nb.state != NETBOOT_READY);
+    KTEST_CHECK(nb.have == 0 && nb.stats.offers_seen == 0);
+    KTEST_CHECK(nb.stats.offers_refused > 0);
+}
+
+/* A signature that is there but wrong, which is the same answer. */
+static void test_a_spoiled_signature_is_refused(void) {
+    fresh(IP4(255, 255, 255, 0));
+    cfg.sign = true;
+    cfg.spoil_signature = true;
+    KTEST_CHECK(start(0) == KERR_OK);
+    netboot_require_signature(&nb, TEST_PUBLIC_KEY);
+    run(5000);
+    KTEST_CHECK(nb.state != NETBOOT_READY);
+    KTEST_CHECK(nb.stats.offers_refused > 0);
+}
+
+/* And a signed offer is still accepted by a board that was not told to
+ * expect one: adding the signature does not break an older board. */
+static void test_a_signature_is_ignored_when_not_required(void) {
+    fresh(IP4(255, 255, 255, 0));
+    cfg.sign = true;
+    KTEST_CHECK(start(0) == KERR_OK);
+    run(5000);
+    KTEST_CHECK(nb.state == NETBOOT_READY);
+}
+
 /* With a digest pinned, only the image that matches it is accepted — and the
  * refusal happens at the **offer**, before a byte is transferred. */
 static void test_a_pinned_digest_accepts_the_right_image(void) {
@@ -532,6 +589,10 @@ int main(void) {
     KTEST_RUN(test_lost_blocks_are_refetched);
     KTEST_RUN(test_duplicates_are_ignored);
     KTEST_RUN(test_digest_mismatch_is_refused);
+    KTEST_RUN(test_a_signed_offer_is_accepted);
+    KTEST_RUN(test_an_unsigned_offer_is_refused);
+    KTEST_RUN(test_a_spoiled_signature_is_refused);
+    KTEST_RUN(test_a_signature_is_ignored_when_not_required);
     KTEST_RUN(test_a_pinned_digest_accepts_the_right_image);
     KTEST_RUN(test_a_pinned_digest_refuses_another_image);
     KTEST_RUN(test_corrupt_block_fails_the_digest);

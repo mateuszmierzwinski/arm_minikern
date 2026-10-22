@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"syscall"
 )
 
 // self is the program's own path, which is what it execs.
@@ -31,6 +32,19 @@ func child(role string) {
 	case "env":
 		fmt.Print(os.Getenv("MINIKERN_PASSED"))
 		os.Exit(0)
+	case "replaced":
+		fmt.Print("the new image is running")
+		os.Exit(0)
+	case "replacer":
+		// syscall.Exec from a Go program is an execve from a process with
+		// several threads, which the kernel supports by ending the others
+		// first (kernel/exec.h). Nothing after this line should run.
+		if err := syscall.Exec(self, []string{self, "child", "replaced"}, os.Environ()); err != nil {
+			fmt.Print("exec failed: ", err)
+			os.Exit(1)
+		}
+		fmt.Print("execve returned, which it must never do")
+		os.Exit(1)
 	case "args":
 		fmt.Print(strings.Join(os.Args[3:], "|")) // past the program, "child" and the role
 		os.Exit(0)
@@ -108,6 +122,16 @@ func runArgs() {
 		fmt.Sprintf("out=%q err=%v", out, err))
 }
 
+// runReplace proves a multi-threaded process can replace its own image.
+// The child runs the Go runtime — so it has several threads — and calls
+// syscall.Exec; what comes back is the output of the program that replaced
+// it, from the same process.
+func runReplace() {
+	out, err := output("replacer")
+	check("a process with threads can replace its own image", err == nil && out == "the new image is running",
+		fmt.Sprintf("out=%q err=%v", out, err))
+}
+
 func runMissing() {
 	err := exec.Command("/no/such/program").Run()
 	check("execing something that is not there fails cleanly", err != nil, "it reported success")
@@ -143,6 +167,7 @@ func main() {
 	runStdin()
 	runEnv()
 	runArgs()
+	runReplace()
 	runMissing()
 	if failed {
 		fmt.Println("exectest failed")

@@ -363,3 +363,56 @@ one past its own blocks and removing one all need the *allocator* — the
 free-space btrees, the inode btrees and the AGF/AGI counters — and each of
 those is another log item type beside the inode core. The log machinery is
 now the part that exists; the allocator is the part that does not.
+
+---
+
+## 10. Creating a file, and what the group headers look like
+
+A create changes four things, and each was measured on a filesystem
+`mkfs.xfs` made rather than taken from a document:
+
+| Structure | Where | What a create does |
+|---|---|---|
+| the group's inode header (`XAGI`) | sector 2 of the group's first block | one fewer free inode |
+| every inode chunk (`IAB3`) | the block `agi_root` names | the inode's bit cleared, its count down |
+| the chunks with a free inode (`FIB3`) | the block at `agi+328` | the same, in the same record |
+| the superblock's counter | `sb_ifree` | follows the groups' |
+
+Both trees are the same shape: a 56-byte block header, then 16-byte records
+of `startino, freecount, free` — a **set** bit meaning free. A real
+filesystem's first group reads `[96, 57, 0xffffffffffffff80]`: inodes 96 to
+102 used, 57 of the chunk's 64 still free.
+
+A **shortform directory** lives in its parent's inode as
+`count, i8count, parent`, then entries of `namelen(1) offset(2) name
+ftype(1) inumber(4)`. The offset is where the entry would sit in a
+block-form directory, and those offsets are the part worth measuring: four
+files came out at **96, 112, 128, 152**. The first is 64 (a data block's
+header) plus sixteen bytes each for "." and "..", and each one after
+advances by `(12 + namelen)` rounded up to eight — so the deltas are 16, 16,
+24 for names of 1, 2 and 8 characters. The directory's recorded size is the
+total length of that structure, which came to 57 for those four.
+
+**What it will not do**, each because the alternative is a btree operation
+this does not implement, and a half-done btree is worse than a refusal:
+take the **last** free inode of a chunk (that record would have to be
+deleted from the free-inode tree), allocate a new chunk (that needs the
+block allocator), or touch a tree with more than one level or a directory
+that has outgrown its inode. So it creates files in a filesystem that has
+room for them, and says which of those it hit when it cannot.
+
+**Three bugs this cost, all found by the judges rather than by reading:**
+
+- `di_next_unlinked` must be `0xffffffff`, not the zero a cleared inode has.
+  Zero means "inode 0 is next on the unlinked list" rather than "nothing
+  is", and `xfs_repair` said so — *"bad next_unlinked 0x0 on inode 100"* —
+  and would have cleared the inode for it.
+- **A smaller batch written over a larger one leaves an orphan.** The head
+  of the log is found by reading one word per basic block, so a block left
+  over from a longer record still carries the cycle and still looks like
+  part of the log; `xfs_repair` found one past the unmount record and
+  reported a log with valuable metadata changes. The writer now clears a
+  window as long as the longest record it can produce.
+- Clearing that window zeroed **5632 bytes of a 4096-byte buffer**, over
+  whatever static followed it, which came back as a kernel that spun
+  instead of finishing. The window is now written in passes that fit.

@@ -161,13 +161,29 @@ Legend: `[x]` done · `[ ]` to do · `[~]` partial
             the initrd. A pin that will not parse **stops the boot** rather than
             being ignored, because a boot that looked protected and was not would
             be worse than no pin.
-      - [ ] **An Ed25519 signature over the offer**, which is the thing a pin is
-            not: it authenticates the *server* rather than one image, so the
-            server can change what it serves without every board being
-            reconfigured. It needs Ed25519 verification written from scratch here
-            (SHA-512 and the field arithmetic), with RFC 8032's vectors as the
-            judge. The pin is what makes that a convenience rather than a
-            prerequisite.
+      - [x] **An Ed25519 signature over the offer (2026-10-22).** The board
+            accepts only offers signed by the holder of the key it was given
+            (`minikern.netboot.key=`), which is what a pin cannot do: it
+            authenticates the **server**, so the server may change what it serves
+            and nothing else on the subnet can make an offer the board will look
+            at. The signature covers the session's own id, so a recorded offer
+            cannot be replayed into a later boot. Proved by booting from a server
+            that signs, and then by the same server with signing turned off —
+            offering the *right* image and refused anyway, because of who was
+            offering it.
+            **Written from scratch, as everything here is** (CLAUDE.md §2): SHA-512
+            (constants generated, not transcribed), the field of 2^255-19 in eight
+            32-bit limbs with schoolbook multiplication, and the curve. Plain
+            rather than quick on purpose — this verifies one signature per boot,
+            so the fast representations with their delayed reductions would buy
+            nothing and cost the only thing that matters, being able to read it.
+            Nothing is constant-time and nothing needs to be: a key, a signature
+            and a message are all public, and **there is no signing here** — the
+            private half stays on the machine that signs.
+            Checked against the library that will sign in production: 47 vectors
+            from Go's `crypto/ed25519`, every single-bit flip of a 64-byte
+            signature, and the field arithmetic against Python's arbitrary
+            precision at p-1, p-2, (p-1)/2 and 2^254.
 - [ ] P5.6 Two-QEMU test over `-netdev socket,mcast=`, so discovery is proven
       between two guests rather than through slirp's NAT.
 
@@ -226,15 +242,21 @@ Legend: `[x]` done · `[ ]` to do · `[~]` partial
       list, unlink and unlink-while-open. `unlink`/`unlinkat` refuse everywhere
       else, because everywhere else is read-only. The ABI suite exercises it
       through `os.CreateTemp`, `os.ReadDir` and `os.Remove`.
-- [ ] **P8.11 A watchdog driver**, needed before this ever runs unattended — and
-      waiting for the board on purpose. A watchdog is one register write and a
-      reset nobody can observe in QEMU, which models neither; writing it now would
-      add an untestable driver whose whole job is to reboot the machine. The
-      software half of the same goal does exist and is tested:
-      `minikern.hangcheck=<seconds>` notices a kernel where every core is idle with
-      a sleeper nothing will wake, prints the task and process tables, and panics
-      instead of freezing (it is how P10.3's last bug was found). The hardware half
-      belongs with P0.9.
+- [x] **P8.11 A watchdog (2026-10-22).** `minikern.watchdog=<seconds>` reboots the
+      board if the kernel stops ticking for that long, which is the one failure
+      nothing else here can report: a kernel that has stopped taking interrupts
+      cannot print, cannot panic and cannot be asked anything — and three of
+      P10.3's bugs looked exactly like that. **QEMU models this device**
+      (`allwinner-wdt-sun6i`), unlike the thermal sensor and the PLLs, so it is
+      tested in both directions rather than hoped for: `minikern.selftest=wedge`
+      masks interrupts and spins, and the board reboots (9 times in 20 s), while a
+      healthy boot with the watchdog on runs to its power-off untouched. The
+      second half is what decides whether a watchdog stays switched on, so it is
+      not an afterthought.
+      It is fed from the tick and is no cleverer than that on purpose: a watchdog
+      that tried to judge whether work was *progressing* would reboot an idle
+      board, which is how watchdogs get turned off. `minikern.hangcheck` remains
+      the software half, for the case where the tick is still arriving.
 - [ ] A real entropy source (the H3 crypto engine's PRNG, or timing jitter): today's
       `getrandom` is xoshiro128** seeded from the timer and chip ID, which is fine for
       hash seeds and not fine for keys.
@@ -306,10 +328,23 @@ after every test.**
             *Also fixed on the way:* the kernel flushes a mounted filesystem when
             the machine stops. "The program should have called fsync" is not an
             answer a kernel gets to give.
-      - [ ] **P9.4c The allocator**, which is what creating a file, removing one and
-            growing one past its own blocks all need: the free-space btrees, the
-            inode btrees and the AGF/AGI counters, each with its own log item type
-            beside the inode core. The log machinery now exists; this does not.
+      - [x] **P9.4c Creating a file (2026-10-22).** An inode comes out of the inode
+            btrees — both of them, every chunk and the chunks with a free inode —
+            the group header and the superblock counter follow it, the inode is
+            written with everything a v5 inode carries, and an entry appears in
+            the parent's shortform directory. The create and its parent are logged
+            as **one transaction**, because a file that exists in a directory but
+            has no inode is not half a create.
+            The board creates a file over the network, lists it back, is refused a
+            duplicate, and **`xfs_repair -n` finds nothing wrong**; `xfs_db` reads
+            the new inode and agrees about its mode, format, size and link count.
+            Measured facts and the three bugs it cost are in XFS.md §10.
+            *Refused, each with its own errno rather than worked around:* the last
+            free inode of a chunk, a new chunk, a tree with branches, a directory
+            that has outgrown its inode, `O_TRUNC`.
+      - [ ] **P9.4d Removing a file and growing one past its own blocks**, which
+            need what is still missing: deleting a btree record, and the free-space
+            btrees with their AGF counters.
 
 ---
 
@@ -423,6 +458,18 @@ is worse than no frequency scaling.
       in the log — up under load, down across the threshold, the critical reading
       reported even with nothing left to give up, and the recovery on the way
       back down.
-- [ ] **P11.3 The VDD_CPUX GPIO**, which unlocks the points above 816 MHz.
+- [x] **P11.3 The VDD_CPUX pin (2026-10-22).** `minikern.vddcpux=<pin>` names the
+      pin that switches the supply, which unlocks the points above 816 MHz: with
+      it the governor climbs the whole published table to 1008 MHz at 1300 mV, and
+      **without it those points are not offered at all** — asking for a frequency
+      the core cannot be fed at is the one mistake here that does not announce
+      itself, so `cpux_set` refuses a voltage it has no way to supply.
+      The pin is **configuration, not a constant**: which one it is belongs to the
+      board's schematic and differs between boards that share this chip, so
+      guessing one in the kernel would be guessing at someone else's wiring. The
+      half that can be tested is which pin was meant, and it is (`core/gpio.h`, 6
+      host cases over every boundary and every kind of rubbish); the pin
+      controller itself is **unverified on silicon**, since QEMU does not model
+      it.
 - [ ] **P11.4 A governor last, and least.** `wfi` in idle plus PSCI `CPU_OFF` for
       unused cores saves more on this chip than frequency stepping does.

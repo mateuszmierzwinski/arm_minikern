@@ -7,6 +7,7 @@
 #include "kernel/futex.h"
 #include "kernel/mem.h"
 #include "kernel/panic.h"
+#include "kernel/time.h"
 #include "kernel/vfs.h"
 
 #define PROC_MAX 32
@@ -270,7 +271,11 @@ void proc_exit_thread(int code) {
     struct task *t = sched_current();
     struct proc *p = t->proc;
     clear_child_tid(t);
-    if (--p->nthreads == 0) {
+    p->nthreads--;
+    /* Whoever is waiting for this process to be down to one thread
+     * (proc_become_single_threaded) is woken by every departure. */
+    sched_wake(&p->nthreads, 0, UINT32_MAX);
+    if (p->nthreads == 0) {
         if (!p->exiting) {
             p->exit_status = (code & 0xff) << 8;
         }
@@ -296,6 +301,19 @@ static void kill_sibling(void *ctx, struct task *t) {
     if (t->proc == p && t != sched_current() && sched_kill_task(t)) {
         p->nthreads--;
     }
+}
+
+#define SINGLE_THREAD_WAIT_MS 2000u
+
+int proc_become_single_threaded(struct proc *p) {
+    uint64_t deadline = time_monotonic_ns() + (uint64_t)SINGLE_THREAD_WAIT_MS * 1000000ull;
+    sched_for_each(kill_sibling, p);
+    while (p->nthreads > 1) {
+        if (sched_sleep(&p->nthreads, 0, deadline, false) == KERR_TIMEDOUT) {
+            return KERR_AGAIN;
+        }
+    }
+    return KERR_OK;
 }
 
 void proc_exit_group(int status) {

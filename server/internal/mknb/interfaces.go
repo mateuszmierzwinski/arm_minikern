@@ -32,3 +32,10 @@ type TokenSource interface {
 type Logger interface {
 	Printf(format string, args ...any)
 }
+
+// Signer signs an offer. It is an interface so that the server can be run
+// without one — an unsigned server is still useful on a network you own —
+// and so that a test can sign with a key it made up.
+type Signer interface {
+	Sign(message []byte) []byte
+}

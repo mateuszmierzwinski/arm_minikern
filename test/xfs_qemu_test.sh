@@ -136,7 +136,7 @@ pattern_before="$(tr -dc '\176' <"$vol" | wc -c)"
 log="$tmp/console2.log"
 timeout 300 qemu-system-arm -M orangepi-pc -display none -monitor none -serial "file:$log" \
     -nic user -kernel "$image" -initrd "$rootfs" \
-    -append "console=uart0 minikern.halt=poweroff minikern.nbd=$host_ip:$port/vol minikern.env.MINIKERN_XFS_MODE=write" ||
+    -append "console=uart0 minikern.halt=poweroff minikern.hangcheck=40 minikern.nbd=$host_ip:$port/vol minikern.env.MINIKERN_XFS_MODE=write" ||
     { echo "---- console"; cat "$log"; fail "qemu did not power off in phase two"; }
 
 echo "---- console (phase two)"
@@ -146,7 +146,9 @@ expect "PASS mount-rw"
 expect "PASS read-existing"
 expect "PASS write-data"
 expect "PASS read-back"
-expect "PASS refuse-create"
+expect "PASS create-file"
+expect "PASS list-after-create"
+expect "PASS create-twice"
 expect "PASS grow-into-own-block"
 expect "PASS refuse-grow"
 expect "ALL XFS PASS"
@@ -211,6 +213,15 @@ log_bb=$(xfs_db -r -c "sb 0" -c "print logstart" "$vol" | awk '{print $3}')
 log_daddr=$(xfs_logprint -t "$vol" | sed -n 's/.*daddr: \([0-9]*\).*/\1/p')
 echo "the log starts at fsb $log_bb, daddr $log_daddr; its first three blocks:"
 dd if="$vol" bs=512 skip="$log_daddr" count=3 2>/dev/null | hexdump -C | head -36
+
+echo "---- and the file the board created is really there"
+xfs_db -r -c "path /made-on-the-board" -c "print core.magic core.mode core.format core.size core.nlinkv2" \
+    "$vol" >"$tmp/created.log" 2>&1 || fail "xfs_db cannot find the file the board created"
+cat "$tmp/created.log"
+grep -q "core.magic = 0x494e" "$tmp/created.log" || fail "the created inode is not an inode"
+grep -q "core.mode = 0100644" "$tmp/created.log" || fail "the created inode has the wrong mode"
+grep -q "core.size = 0" "$tmp/created.log" || fail "the created inode is not empty"
+grep -q "core.nlinkv2 = 1" "$tmp/created.log" || fail "the created inode has the wrong link count"
 
 echo "---- and xfs_db agrees about the size the board recorded"
 xfs_db -r -c "path /data.bin" -c "print core.size" "$vol" >"$tmp/size.log" 2>&1 ||

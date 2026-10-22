@@ -15,6 +15,12 @@ const (
 	BlockSize           = 1024
 	MaxWindow           = 64 // blocks a single READ may ask for
 	OfferBody           = 40
+	// SignedOfferBody is an offer with an Ed25519 signature after it, over
+	// the session id, the image length and the digest — the three things
+	// that decide what a board will run. A board told which key to trust
+	// refuses an offer without one (core/net/netboot.h).
+	SignedOfferBody = OfferBody + 64
+	SignedBytes     = 40
 	ReadBody            = 8
 	BoardIDLen          = 16
 	MACLen              = 6

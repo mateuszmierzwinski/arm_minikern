@@ -98,7 +98,7 @@ func TestParseReadReadsTheWindow(t *testing.T) {
 // The OFFER's layout is the ABI the kernel parses: check it byte by byte.
 func TestEncodeOfferLayout(t *testing.T) {
 	img := NewImage("root.tar", bytes.Repeat([]byte{0xab}, 3000))
-	p, err := EncodeOffer(0x01020304, img, 0xcafef00d)
+	p, err := EncodeOffer(0x01020304, img, 0xcafef00d, nil)
 	if err != nil {
 		t.Fatalf("EncodeOffer: %v", err)
 	}

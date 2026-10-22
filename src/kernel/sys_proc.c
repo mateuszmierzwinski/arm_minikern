@@ -270,8 +270,13 @@ static int32_t sys_clone(struct trapframe *tf) {
      * wait4 for ever and every core goes idle. The caller is itself marked
      * dead and exits on its way back to user mode, so refusing here costs
      * it nothing. Found by the hang check printing the task table: a
-     * sleeping thread belonging to a process with no other threads. */
-    if (self->exiting) {
+     * sleeping thread belonging to a process with no other threads.
+     *
+     * The same applies to a thread that has itself been marked dead — by a
+     * sibling's exit_group, or by an execve clearing the way for a new
+     * image — which is why its own flag is checked too: a thread on its way
+     * out must not leave another behind it. */
+    if (self->exiting || sched_killed()) {
         return KERR_AGAIN;
     }
     if ((flags & CLONE_PIDFD) != 0) {

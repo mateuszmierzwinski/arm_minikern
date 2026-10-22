@@ -28,6 +28,12 @@
 #define MKNB_SWEEP_MAX   1024u  /* the largest subnet we will walk */
 #define MKNB_BOARD_ID    16u
 #define MKNB_OFFER_BODY  40u    /* block size, reserved, digest, token */
+/* A signed offer carries 64 more bytes: an Ed25519 signature over the
+ * session's id, the image's length and its digest — the three things that
+ * decide what this board will run. A server that does not sign is still
+ * understood, and still refused when a key has been configured. */
+#define MKNB_OFFER_SIGNED (MKNB_OFFER_BODY + 64u)
+#define MKNB_SIGNED_BYTES 40u   /* xid, length, digest: what the signature covers */
 #define MKNB_READ_BODY   8u     /* block count, reserved, token */
 #define MKNB_SWEEP_ROUNDS 3u    /* sweeps before giving up */
 #define MKNB_GATEWAY_GRACE_MS 400u /* the gateway's head start before the sweep */
@@ -100,6 +106,8 @@ struct netboot {
     uint8_t digest[32];
     uint8_t expected[32];       /* the only image this board will accept */
     bool pinned_digest;         /* ...when one was given */
+    uint8_t key[32];            /* the public key an offer must be signed with */
+    bool require_signature;     /* ...when one was given */
     uint32_t *bitmap;           /* one bit per block, the caller's */
     uint32_t window_base;
     uint32_t window_end;
@@ -135,6 +143,17 @@ int netboot_start(struct netboot *nb, struct netif *nif, uint8_t *image, uint32_
  *
  * **Called after `netboot_start`**, which begins a session by clearing it. */
 void netboot_expect_digest(struct netboot *nb, const uint8_t digest[32]);
+
+/* Accepts only offers signed by the holder of this public key.
+ *
+ * This is the thing a pinned digest is not: it authenticates the **server**
+ * rather than one image, so the server can change what it serves without
+ * every board being reconfigured, and nothing else on the subnet can make
+ * an offer this board will look at. The signature covers the session's own
+ * id, so a recorded offer cannot be replayed into a later boot.
+ *
+ * Called after `netboot_start`, which begins a session by clearing it. */
+void netboot_require_signature(struct netboot *nb, const uint8_t key[32]);
 
 /* Drives the sweep, the window re-requests and the deadline. */
 void netboot_tick(struct netboot *nb, uint64_t now_ms);

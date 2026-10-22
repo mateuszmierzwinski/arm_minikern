@@ -62,12 +62,25 @@ int xfs_log_check(struct xfs *fs);
  * because a write has to put the inode back where it came from. */
 void xfs_inode_place(const struct xfs *fs, uint64_t ino, uint64_t *device_block, uint32_t *boffset);
 
-/* Writes one inode core to the log as a committed transaction, then an
+/* One inode in a transaction: which inode, where on the device its chunk
+ * is and where in that chunk it sits — what recovery would need to find it
+ * — and its on-disk core. */
+struct xfs_log_inode_item {
+    uint64_t ino;
+    uint64_t chunk_block;
+    uint32_t boffset;
+    const uint8_t *core; /* the on-disk core, big-endian; converted on the way in */
+};
+
+#define XFS_LOG_MAX_ITEMS 2u
+
+/* Writes these inodes to the log as one committed transaction, then an
  * unmount record after it so the log is clean again (xfs_logwrite.c).
- * `chunk_block` is the device block holding the inode's chunk and
- * `boffset` the inode's byte offset within it, which is what recovery
- * would need to find it. */
-int xfs_log_inode(struct xfs *fs, uint64_t ino, uint64_t chunk_block, uint32_t boffset, const uint8_t *core);
+ *
+ * Several items rather than one because a change usually is several: a
+ * created file is a new inode *and* its parent's directory, and the point
+ * of a transaction is that they arrive together or not at all. */
+int xfs_log_inodes(struct xfs *fs, const struct xfs_log_inode_item *items, uint32_t n);
 
 /* One extent record, unpacked. */
 struct xfs_extent {

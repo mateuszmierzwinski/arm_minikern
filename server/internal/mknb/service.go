@@ -20,6 +20,10 @@ type Config struct {
 	MaxSessions       int
 	SessionsPerClient int
 	SessionTTL        time.Duration
+	// Signer signs every offer, when there is one. Without it the server
+	// still works and boards that were not told to expect a signature
+	// still boot from it — which is how a network you own stays simple.
+	Signer Signer
 }
 
 // Service is the server's logic: it answers probes with offers and serves
@@ -128,7 +132,7 @@ func (s *Service) offer(from netip.AddrPort, d Discover, img *Image) {
 		s.count(func(st *Stats) { st.Busy++ })
 		return
 	}
-	payload, err := EncodeOffer(d.XID, img, token)
+	payload, err := EncodeOffer(d.XID, img, token, s.cfg.Signer)
 	if err != nil {
 		s.log.Printf("cannot offer %s to %s: %v", img.Name, from, err)
 		return

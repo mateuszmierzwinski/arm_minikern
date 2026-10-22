@@ -28,9 +28,12 @@ struct trapframe;
  *
  * On failure nothing has changed and the caller returns the error to a
  * process that is still running its old image — the one property that makes
- * a failed exec harmless. It only supports a single-threaded caller and
- * answers KERR_AGAIN otherwise (TASKS.md P8.1), which is what Go's
- * `os/exec` needs: its child is a vfork with one thread. */
+ * a failed exec harmless. That is why the image is built before the other
+ * threads are ended: a multi-threaded caller loses its siblings (the new
+ * image must not share an address space with threads running the old one),
+ * and that cannot be undone, so it happens only once the exec is certain to
+ * go through. A sibling that will not stop within two seconds gives
+ * KERR_AGAIN. */
 int exec_replace(const char *path, const char *const *argv, uint32_t argc, const char *const *envp, uint32_t envc,
                  struct trapframe *tf);
 

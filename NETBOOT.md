@@ -153,7 +153,36 @@ image the board is expecting. A pin that cannot be parsed stops the boot,
 because a boot that looks protected and is not would be worse than none.
 
 What a pin is not is a signature. It names one image, so a new root
-filesystem means a new pin on every board. Authenticating the *server*
-instead — an Ed25519 signature over (xid, length, digest), with the public
-key in the kernel — is `TASKS.md` P5.5, and the pin is what makes it a
-convenience rather than a prerequisite.
+filesystem means a new pin on every board.
+
+## Signed offers
+
+`minikern.netboot.key=<64 hex characters>` is the other half: the board then
+accepts only offers signed by the holder of that key, so the **server** is
+what it trusts rather than one image, and the server can change what it
+serves without every board being reconfigured.
+
+A signed OFFER carries 64 more bytes after its body: an Ed25519 signature
+over the session's id, the image's length and its digest. The id is in
+there so that an offer recorded from one boot cannot be replayed into
+another. A server that does not sign is still understood — and still
+refused by a board that was told which key to trust.
+
+The server signs with `-sign-seed <file>`, a file of 64 hex characters, and
+prints the public key a board needs:
+
+```
+mknbserver 1.0.0 serving /srv/images on [::]:7634
+signing offers; boards need minikern.netboot.key=79b5562e8fe654...
+```
+
+The private half never leaves that machine, which is the point of a
+signature rather than a shared secret: the kernel image carries only the
+public key and can be handed to anyone.
+
+**Verification is written from scratch here**, like the rest of this tree —
+SHA-512, the field of 2^255-19, and the curve — and there is deliberately
+**no signing**: a secret in a kernel image that is given away is not a
+secret. It is the plain implementation rather than the quick one, because
+this verifies one signature per boot and being able to read the code is
+worth more than the microseconds.

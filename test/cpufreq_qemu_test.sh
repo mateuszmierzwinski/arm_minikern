@@ -16,6 +16,16 @@ log="$tmp/cpufreq.log"
 
 command -v qemu-system-arm >/dev/null || { echo "qemu-system-arm is not installed" >&2; exit 1; }
 
+run() {
+    status=0
+    timeout 180 qemu-system-arm -M orangepi-pc -display none -monitor none \
+        -serial "file:$log" -nic user -kernel "$image" -initrd "$rootfs" \
+        -append "console=uart0 minikern.halt=poweroff minikern.hangcheck=60 minikern.net=off minikern.netstat=1 minikern.cpufreq=test$1" \
+        || status=$?
+    cat "$log"
+    [ "$status" -eq 0 ] || { echo "FAIL: qemu exited $status (124 = hang)" >&2; exit 1; }
+}
+
 status=0
 timeout 180 qemu-system-arm -M orangepi-pc -display none -monitor none \
     -serial "file:$log" -nic user -kernel "$image" -initrd "$rootfs" \
@@ -47,4 +57,21 @@ echo "ok: $points distinct operating points were applied"
 # It must come back down the other side of the ramp, not sit at the bottom:
 # the last decision of a cooling CPU under load is to speed up again.
 tail -40 "$log" | grep -qF "(load," || { echo "FAIL: it never recovered as the sensor cooled" >&2; exit 1; }
+# ── the operating points the supply gates ──────────────────────────────────
+#
+# The points above 816 MHz need the higher VDD_CPUX, and which pin switches
+# that is a board fact given on the command line. Without it those points
+# must not be offered at all — asking for a frequency the core cannot be fed
+# at is the one mistake here that does not announce itself.
+grep -q "1008000 kHz" "$log" &&
+    { echo "FAIL: a point needing the higher supply was used with no pin to raise it" >&2; exit 1; }
+echo "ok: without a supply pin, only the points the fixed supply can feed were used"
+
+log="$tmp/cpufreq-vdd.log"
+run " minikern.vddcpux=PA10"
+expect "cpufreq: VDD_CPUX switches on PA10"
+expect "1008000 kHz at 1300 mV"
+expect "freqtest ok"
+echo "ok: with a supply pin, the whole published table is reached"
+
 echo PASS

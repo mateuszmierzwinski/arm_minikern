@@ -2,6 +2,7 @@
 
 #include "arch/arm/layout.h"
 #include "board/h3/h3.h"
+#include "board/h3/pio.h"
 #include "core/errno.h"
 
 /* PLL_CPUX and the CPU clock source. Datasheet addresses, **never run on
@@ -68,12 +69,29 @@ static uint32_t supply_for(uint32_t mv) {
     return mv <= VDD_LOW_MV ? VDD_LOW_MV : VDD_HIGH_MV;
 }
 
+/* The pin that switches the supply, once a board has told us which it is. */
+static struct gpio_pin vdd_pin;
+static bool vdd_pin_known;
+
+void h3_cpuclock_use_vdd_pin(struct gpio_pin pin) {
+    vdd_pin = pin;
+    vdd_pin_known = true;
+    h3_pio_output(pin);
+    h3_pio_write(pin, false); /* start low: the voltage the board boots at */
+}
+
+/* Selects the supply level. Without a pin, the only honest thing is to do
+ * nothing — and `cpux_set` refuses the points that would need the higher
+ * level, so nothing asks for one. */
 static void set_supply(uint32_t mv) {
-    /* The GPIO that selects it is board wiring this kernel does not drive
-     * yet (TASKS.md P11.3): until it does, only points that the current
-     * supply can feed are offered, which is what h3_cpu_policy() limits
-     * itself to. */
-    (void)mv;
+    if (vdd_pin_known) {
+        h3_pio_write(vdd_pin, mv > VDD_LOW_MV);
+    }
+}
+
+/* True when the board can supply this voltage. */
+static bool can_supply(uint32_t mv) {
+    return vdd_pin_known || supply_for(mv) <= VDD_LOW_MV;
 }
 
 /* Moves the CPU to khz at mv.
@@ -91,6 +109,9 @@ static int cpux_set(void *self, uint32_t khz, uint32_t mv) {
     (void)self;
     if (rc != KERR_OK) {
         return rc;
+    }
+    if (!can_supply(mv)) {
+        return KERR_NOTSUP; /* no pin to raise the supply with: refuse, do not brown out */
     }
     if (supply_for(mv) > VDD_LOW_MV) {
         set_supply(supply_for(mv)); /* up before the frequency */

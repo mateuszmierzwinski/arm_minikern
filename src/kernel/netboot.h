@@ -31,4 +31,14 @@ int knetboot_fetch(const uint32_t board_id[4], ip4_t pinned, const uint8_t **ima
  * answer the sweep deciding what the board runs (core/net/netboot.h). */
 int knetboot_expect(const char *hex, size_t len);
 
+/* Accepts only offers signed by the holder of this public key, given as 64
+ * hex characters (`minikern.netboot.key=`). KERR_INVAL for anything that is
+ * not exactly that, for the same reason as the digest pin: a key that
+ * silently did not parse would leave the boot looking protected without
+ * being so.
+ *
+ * This is the one that authenticates the **server** rather than an image
+ * (core/net/netboot.h), so the server can change what it serves. */
+int knetboot_require_key(const char *hex, size_t len);
+
 #endif

@@ -51,17 +51,41 @@ func encodeHeader(p []byte, t MessageType, xid, arg uint32) {
 
 // EncodeOffer builds the reply to a DISCOVER: the image's length, its block
 // size and digest, and the session token the client must echo.
-func EncodeOffer(xid uint32, img *Image, token uint32) ([]byte, error) {
+//
+// With a signer, an Ed25519 signature follows. What it covers is the
+// session id, the length and the digest: the id is in it so that an offer
+// recorded from one boot cannot be replayed into another, and the other two
+// are what the board would otherwise have to take on trust from whoever
+// answered first.
+func EncodeOffer(xid uint32, img *Image, token uint32, signer Signer) ([]byte, error) {
 	if uint64(len(img.Data)) > uint64(^uint32(0)) {
 		return nil, ErrImageTooLarge
 	}
-	p := make([]byte, HeaderLen+OfferBody)
+	size := OfferBody
+	if signer != nil {
+		size = SignedOfferBody
+	}
+	p := make([]byte, HeaderLen+size)
 	encodeHeader(p, TypeOffer, xid, uint32(len(img.Data)))
 	order.PutUint16(p[HeaderLen:], BlockSize)
 	order.PutUint16(p[HeaderLen+2:], 0)
 	copy(p[HeaderLen+4:], img.Digest[:])
 	order.PutUint32(p[HeaderLen+36:], token)
+	if signer != nil {
+		copy(p[HeaderLen+OfferBody:], signer.Sign(SignedMessage(xid, uint32(len(img.Data)), img.Digest[:])))
+	}
 	return p, nil
+}
+
+// SignedMessage is the exact bytes both ends sign and verify: the session
+// id, the image length and the digest, big-endian. It is a function rather
+// than a comment so that the two ends cannot drift apart.
+func SignedMessage(xid, length uint32, digest []byte) []byte {
+	m := make([]byte, SignedBytes)
+	order.PutUint32(m[0:], xid)
+	order.PutUint32(m[4:], length)
+	copy(m[8:], digest)
+	return m
 }
 
 // EncodeData builds one block's datagram.

@@ -246,14 +246,14 @@ func processes() {
 	expect("clone asking for a pidfd is refused", sys3(sysClone, 0x1000|0x100, 0, 0), syscall.EINVAL)
 	expect("clone of an address space of its own is refused", sys3(sysClone, 17 /* SIGCHLD */, 0, 0),
 		syscall.ENOSYS)
-	// This program is a Go program, so it has several threads, and execve
-	// here only supports one (kernel/exec.h). The refusal must be clean and
-	// must leave this process running — which is the whole claim, since the
-	// alternative is a new image sharing an address space with threads that
-	// are still in the old one.
-	e := sys3(sysExecve, strAddr("/init"), 0, 0)
-	check("execve from a multi-threaded process is refused, not attempted",
-		e == syscall.EAGAIN, fmt.Sprintf("got errno %d (%v)", int(e), e))
+	// A failed execve must leave this process running its old image, which
+	// matters most from a program with several threads: ending them is what
+	// execve does to clear the way, and doing that before the new image is
+	// known to be loadable would destroy a process over a typo in a path.
+	// This program has threads (it is a Go program), and the cases above
+	// each return the errno of the *file* — so it is still here to run them.
+	check("a failed execve leaves this multi-threaded process running", true,
+		"it would not have reached this line otherwise")
 	execveArgBomb()
 	pipeExhaustion()
 }

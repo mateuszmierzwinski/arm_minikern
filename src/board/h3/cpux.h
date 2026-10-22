@@ -16,7 +16,19 @@
 #ifndef MINIKERN_BOARD_H3_CPUX_H
 #define MINIKERN_BOARD_H3_CPUX_H
 
+#include "core/gpio.h"
 #include "core/ports.h"
+
+/* Names the pin that switches VDD_CPUX, which unlocks the operating points
+ * the lower supply cannot feed.
+ *
+ * Which pin it is belongs to the board, not the chip: it is in the
+ * schematic in front of you and differs between boards that share this
+ * H3, so it is given on the kernel command line
+ * (`minikern.vddcpux=`) rather than compiled in as a guess. Without it,
+ * only the points the fixed supply can feed are offered — which is the
+ * safe direction to be wrong in. */
+void h3_cpuclock_use_vdd_pin(struct gpio_pin pin);
 
 /* The port over the real PLL and regulator. */
 struct cpuclock_port h3_cpuclock_port(void);

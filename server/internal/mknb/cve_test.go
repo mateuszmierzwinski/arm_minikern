@@ -193,7 +193,7 @@ func TestCVEOversizedImageIsRefused(t *testing.T) {
 	img := &Image{Name: "huge.tar", Data: nil}
 	// Fake the length without allocating: the guard reads len(Data), so a
 	// real check needs a real slice; assert the guard's boundary instead.
-	if _, err := EncodeOffer(1, NewImage("ok", make([]byte, 16)), 1); err != nil {
+	if _, err := EncodeOffer(1, NewImage("ok", make([]byte, 16)), 1, nil); err != nil {
 		t.Fatalf("a small image was refused: %v", err)
 	}
 	if img.Blocks() != 0 {

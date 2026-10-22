@@ -166,6 +166,19 @@ int xfs_file_read(struct xfs *fs, const struct xfs_inode *ip, uint64_t off, void
  *
  * The write goes through the buffer cache and is not durable until
  * xfs_flush. */
+/* Creates a regular file called name in dir, and gives back its inode
+ * number. mode is the permission bits; now_s is the wall clock, because a
+ * filesystem does not have one of its own.
+ *
+ * It needs a filesystem that already has room: an inode free in a chunk
+ * that will still have one afterwards, and a parent directory that still
+ * lives inside its own inode. Each limit answers with its own errno rather
+ * than being worked around — KERR_NOSPC, KERR_NOTSUP, KERR_EXIST — because
+ * the alternative is a btree operation this does not implement, and a
+ * half-done btree is worse than a refusal (core/xfs/xfs_create.c). */
+int xfs_create(struct xfs *fs, const struct xfs_inode *dir, const char *name, uint32_t namelen, uint16_t mode,
+               uint64_t now_s, uint64_t *ino_out);
+
 int xfs_file_write(struct xfs *fs, struct xfs_inode *ip, uint64_t off, const void *buf,
                    uint32_t len, uint32_t *put);
 

@@ -17,6 +17,7 @@
 #define O_WRONLY    1u
 #define O_RDWR      2u
 #define O_CREAT     0100u
+#define O_EXCL      0200u
 #define O_TRUNC     01000u
 #define O_APPEND    02000u
 #define O_NONBLOCK  04000u

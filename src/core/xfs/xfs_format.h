@@ -72,6 +72,9 @@
 #define XFS_DI_VERSION    4u   /* u8: 3 for v5 */
 #define XFS_DI_FORMAT     5u   /* u8: XFS_DINODE_FMT_* */
 #define XFS_DI_NLINK      16u  /* u32 */
+#define XFS_DI_ATIME      32u  /* two u32: seconds, then nanoseconds */
+#define XFS_DI_MTIME      40u
+#define XFS_DI_CTIME      48u
 #define XFS_DI_SIZE       56u  /* u64 */
 #define XFS_DI_NBLOCKS    64u  /* u64 */
 #define XFS_DI_EXTSIZE    72u  /* u32 */
@@ -81,9 +84,11 @@
 #define XFS_DI_AFORMAT    83u  /* u8 */
 #define XFS_DI_FLAGS      90u  /* u16 */
 #define XFS_DI_GEN        92u  /* u32 */
-#define XFS_DI_NEXT_UNLINKED 96u /* u32 */
+#define XFS_DI_NEXT_UNLINKED 96u /* u32: the unlinked list's link, null when none */
+#define XFS_NULL_AGINO       0xffffffffu
 #define XFS_DI_CRC        100u /* u32, little-endian */
 #define XFS_DI_FLAGS2     120u /* u64 */
+#define XFS_DI_CRTIME     144u /* two u32 */
 #define XFS_DI_INO        152u /* u64: the inode's own number, a self-check */
 #define XFS_DI_UUID       160u /* 16 bytes */
 #define XFS_DI_V3_SIZE    176u /* the core; the literal area follows */
@@ -146,6 +151,59 @@
 /* The entry types a filesystem with the ftype feature stores are part of
  * what a caller reads, so they live in xfs.h with the field that carries
  * them (struct xfs_dirent). */
+
+/* ── the group headers ───────────────────────────────────────────────────
+ * Each allocation group begins with four sectors: a copy of the
+ * superblock, the free-space header (AGF), the inode header (AGI) and the
+ * free list (AGFL). Measured on a filesystem mkfs.xfs made (XFS.md §10). */
+#define XFS_AGI_MAGIC   0x58414749u /* "XAGI" */
+#define XFS_AGI_SECTOR  2u          /* which sector of the group's first block */
+
+#define XFS_AGI_SEQNO      8u   /* u32 */
+#define XFS_AGI_LENGTH     12u  /* u32 */
+#define XFS_AGI_COUNT      16u  /* u32: inodes this group has */
+#define XFS_AGI_ROOT       20u  /* u32: the inode btree's root block */
+#define XFS_AGI_LEVEL      24u  /* u32: how many levels it has, 1 for a lone leaf */
+#define XFS_AGI_FREECOUNT  28u  /* u32: free inodes in this group */
+#define XFS_AGI_NEWINO     32u  /* u32 */
+#define XFS_AGI_CRC        312u /* u32, little-endian */
+#define XFS_AGI_UUID       296u /* 16 bytes */
+#define XFS_AGI_FREE_ROOT  328u /* u32: the free-inode btree's root block */
+#define XFS_AGI_FREE_LEVEL 332u /* u32 */
+
+/* The superblock's counters, which a create has to keep in step. */
+#define XFS_SB_ICOUNT  128u /* u64 */
+#define XFS_SB_IFREE   136u /* u64 */
+
+/* ── the inode btrees ────────────────────────────────────────────────────
+ * Two trees of the same shape: every inode chunk (`IAB3`), and the chunks
+ * that still have a free inode (`FIB3`). A short-form btree block is a
+ * 56-byte header and then its records. */
+#define XFS_INOBT_MAGIC  0x49414233u /* "IAB3" */
+#define XFS_FINOBT_MAGIC 0x46494233u /* "FIB3" */
+
+#define XFS_BTREE_LEVEL   4u  /* u16 */
+#define XFS_BTREE_NUMRECS 6u  /* u16 */
+#define XFS_BTREE_UUID    32u /* 16 bytes */
+#define XFS_BTREE_CRC     52u /* u32, little-endian */
+#define XFS_BTREE_RECORDS 56u /* where the records start */
+
+/* One record of either tree, with sparse inodes off: the first inode of a
+ * chunk, how many of its 64 are free, and which. A set bit is free. */
+#define XFS_INOBT_REC_SIZE      16u
+#define XFS_INOBT_REC_STARTINO  0u /* u32 */
+#define XFS_INOBT_REC_FREECOUNT 4u /* u32 */
+#define XFS_INOBT_REC_FREE      8u /* u64 */
+#define XFS_INODES_PER_CHUNK    64u
+
+/* ── shortform directories ──────────────────────────────────────────────
+ * An entry is namelen(u8) offset(u16) name[] ftype(u8) inumber(u32), and
+ * the offset is where the entry would sit in a block-form directory: the
+ * first is 96 — a 64-byte header plus sixteen bytes each for "." and ".." —
+ * and each one after advances by (12 + namelen) rounded up to eight.
+ * Measured against four files mkfs.xfs put in a directory (XFS.md §10). */
+#define XFS_DIR_SF_FIRST_OFFSET 96u
+#define XFS_DIR_SF_ENTRY_FIXED  12u /* an entry's bytes in a data block, less the name */
 
 /* ── the log ──────────────────────────────────────────────────────────── */
 #define XLOG_MAGIC 0xfeedbabeu

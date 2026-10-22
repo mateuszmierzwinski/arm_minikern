@@ -228,7 +228,8 @@ static int record_new_size(struct xfs *fs, const struct xfs_inode *ip, uint64_t 
     put_be64(di + XFS_DI_SIZE, size);
     put_le32(di + XFS_DI_CRC, 0);
     put_le32(di + XFS_DI_CRC, crc32c(di, fs->inodesize));
-    rc = xfs_log_inode(fs, ip->ino, block, boffset, di);
+    struct xfs_log_inode_item item = {.ino = ip->ino, .chunk_block = block, .boffset = boffset, .core = di};
+    rc = xfs_log_inodes(fs, &item, 1);
     if (rc == KERR_OK) {
         bcache_dirty(b);
     }

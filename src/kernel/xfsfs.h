@@ -33,6 +33,10 @@ bool xfsfs_mounted(void);
 const char *xfsfs_prefix(void);
 
 /* Opens a path **relative to the mount point** ("" is the mount's root). */
+/* The permissions a created file gets. There is no umask here and no user
+ * to apply one to: one process runs, and it owns everything it makes. */
+#define XFSFS_CREATE_MODE 0100644u
+
 int xfsfs_open(const char *rest, uint32_t flags, struct file **out);
 
 /* True when this file is one of ours: the directory listing needs to know

@@ -106,6 +106,20 @@ void proc_close_on_exec(struct proc *p);
  * what its process is waiting to become. */
 void proc_dump(void);
 
+/* Leaves the calling thread as the only one in its process, which is what
+ * execve needs: the new image must not share an address space with threads
+ * still running the old one.
+ *
+ * A sibling on another core cannot be stopped synchronously — it is marked
+ * and ends itself at its next entry into the kernel, which the tick makes a
+ * millisecond — so this waits for the count to fall, and gives up with
+ * KERR_AGAIN rather than waiting for ever if one does not go.
+ *
+ * It is **not** reversible: the siblings are gone whether the exec that
+ * follows succeeds or not, so the caller runs it only once the new image is
+ * known to be loadable (kernel/exec.c). */
+int proc_become_single_threaded(struct proc *p);
+
 /* Renames the process, which is what /proc/self/stat and the logs show. */
 void proc_rename(struct proc *p, const char *name);
 

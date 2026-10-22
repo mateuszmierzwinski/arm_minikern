@@ -19,6 +19,7 @@ import (
 
 	"github.com/mateuszmierzwinski/arm_minikern/server/internal/adapters/imagestore"
 	"github.com/mateuszmierzwinski/arm_minikern/server/internal/adapters/udptransport"
+	"github.com/mateuszmierzwinski/arm_minikern/server/internal/adapters/edsigner"
 	"github.com/mateuszmierzwinski/arm_minikern/server/internal/mknb"
 )
 
@@ -29,6 +30,7 @@ var (
 	quiet       = flag.Bool("quiet", false, "do not log each offer and transfer")
 	showVersion = flag.Bool("version", false, "print the version and exit")
 	readyFile   = flag.String("ready-file", "", "write the bound address here once serving (for tests)")
+	signSeed    = flag.String("sign-seed", "", "file holding 64 hex characters of Ed25519 seed; offers are then signed")
 )
 
 func init() {
@@ -53,6 +55,22 @@ type discardLogger struct{}
 func (discardLogger) Printf(string, ...any) {}
 
 // chooseLogger returns the logger the flags asked for.
+// loadSigner returns the signer for -sign-seed, or nil when none was
+// given. It prints the public key, because that is what a board has to be
+// configured with (`minikern.netboot.key=`) and asking an operator to
+// derive it themselves is how it ends up wrong.
+func loadSigner() (mknb.Signer, error) {
+	if *signSeed == "" {
+		return nil, nil
+	}
+	signer, err := edsigner.FromSeedFile(*signSeed)
+	if err != nil {
+		return nil, err
+	}
+	log.Printf("signing offers; boards need minikern.netboot.key=%s", signer.PublicKeyHex())
+	return signer, nil
+}
+
 func chooseLogger() mknb.Logger {
 	if *quiet {
 		return discardLogger{}
@@ -96,8 +114,12 @@ func run() error {
 	}
 	defer conn.Close()
 	logger := chooseLogger()
+	signer, err := loadSigner()
+	if err != nil {
+		return err
+	}
 	service := mknb.NewService(imagestore.New(*images), conn, systemClock{}, mknb.RandomTokens{}, logger,
-		mknb.Config{MaxSessions: *maxSessions})
+		mknb.Config{MaxSessions: *maxSessions, Signer: signer})
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	log.Printf("mknbserver %s serving %s on %s", version(), *images, conn.LocalAddr())

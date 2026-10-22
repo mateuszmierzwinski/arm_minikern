@@ -74,7 +74,9 @@ func writePhase() {
 	check("read-existing", readExisting())
 	check("write-data", writeData())
 	check("read-back", readBack())
-	check("refuse-create", refuseCreate())
+	check("create-file", createFile())
+	check("list-after-create", listAfterCreate())
+	check("create-twice", createTwice())
 	check("grow-into-own-block", growIntoOwnBlock())
 	check("refuse-grow", refuseGrow())
 }
@@ -169,12 +171,53 @@ func readBack() error {
 	return nil
 }
 
-// refuseCreate and refuseGrow check the line this kernel draws: data into
-// blocks a file has, and nothing that would change metadata.
-func refuseCreate() error {
-	if f, err := os.OpenFile(mount+"/new.bin", os.O_CREATE|os.O_WRONLY, 0o644); err == nil {
+// refuseGrow checks the line this kernel still draws: a write may reach the
+// end of the blocks a file already owns, and no further, because growing
+// past them needs the block allocator.
+// The file this creates, and what it writes into it.
+const created = mount + "/made-on-the-board"
+
+// createFile makes a file in the mounted filesystem. It is the allocator's
+// whole claim: an inode comes out of the inode btrees and an entry appears
+// in the parent's directory, and the host's xfs_repair is what judges it.
+func createFile() error {
+	f, err := os.OpenFile(created, os.O_RDWR|os.O_CREATE, 0o644)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = f.Close() }()
+	info, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if info.Size() != 0 {
+		return fmt.Errorf("a new file is %d bytes", info.Size())
+	}
+	return f.Sync()
+}
+
+// listAfterCreate proves the entry is really in the directory, by reading
+// it back the ordinary way rather than by trusting the create.
+func listAfterCreate() error {
+	names, err := os.ReadDir(mount)
+	if err != nil {
+		return err
+	}
+	for _, e := range names {
+		if e.Name() == "made-on-the-board" {
+			return nil
+		}
+	}
+	return fmt.Errorf("the new file is not in the listing")
+}
+
+// createTwice must fail: O_EXCL means what it says, and a directory may not
+// hold two entries of one name.
+func createTwice() error {
+	f, err := os.OpenFile(created, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o644)
+	if err == nil {
 		_ = f.Close()
-		return fmt.Errorf("a new file was created on a filesystem with no journal")
+		return fmt.Errorf("creating the same name twice succeeded")
 	}
 	return nil
 }

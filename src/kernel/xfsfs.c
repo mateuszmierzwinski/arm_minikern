@@ -7,6 +7,7 @@
 #include "core/xfs/xfs.h"
 #include "kernel/mem.h"
 #include "kernel/nbd.h"
+#include "kernel/time.h"
 #include "kernel/vfs.h"
 
 /* The one mount. A second filesystem would need a mount table, and there
@@ -146,6 +147,57 @@ static int file_for(const struct xfs_inode *ip, uint32_t flags, struct file **ou
     return KERR_OK;
 }
 
+/* Splits a path into the directory it names and the last component.
+ * Returns the length of the directory part, which is 1 — just the root —
+ * when there is only one component. */
+static uint32_t split_parent(const char *path, uint32_t len, const char **name, uint32_t *namelen) {
+    uint32_t cut = 0;
+    for (uint32_t i = 0; i < len; i++) {
+        cut = path[i] == '/' ? i : cut;
+    }
+    *name = path + cut + 1u;
+    *namelen = len - cut - 1u;
+    return cut == 0 ? 1u : cut;
+}
+
+/* Creates the file a failed O_CREAT lookup was looking for.
+ *
+ * The parent is looked up and the name taken from the path, which is all
+ * the filesystem needs: it refuses by itself anything it cannot do — a
+ * directory that has outgrown its inode, a chunk with one inode left — and
+ * each refusal comes back to the caller as the errno for that reason
+ * rather than as "read-only" (core/xfs/xfs.h). */
+/* Not inlined on purpose: an inode here carries its whole inline fork, and
+ * this function's plus its caller's together overflow an 8 KiB kernel stack
+ * (CLAUDE.md §10). A static buffer is not the answer — a lookup sleeps on
+ * network I/O, so another open would clobber it. */
+__attribute__((noinline)) static int create_then_open(char *path, uint32_t len, uint32_t flags,
+                                                      struct file **out) {
+    /* One inode structure for both roles — the parent, then the file that
+     * was created in it — because an inode here carries its whole inline
+     * fork, and three of them at once overflow an 8 KiB kernel stack
+     * (CLAUDE.md §10). The parent is not needed once xfs_create returns. */
+    struct xfs_inode node;
+    const char *name;
+    uint32_t namelen, dirlen = split_parent(path, len, &name, &namelen);
+    char keep = path[dirlen];
+    uint64_t ino = 0;
+    int rc;
+    path[dirlen] = '\0';
+    rc = xfs_path_lookup(&mounted.fs, path, &node);
+    path[dirlen] = keep;
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    rc = xfs_create(&mounted.fs, &node, name, namelen, XFSFS_CREATE_MODE,
+                    time_realtime_ns() / 1000000000ull, &ino);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    rc = xfs_inode_read(&mounted.fs, ino, &node);
+    return rc == KERR_OK ? file_for(&node, flags, out) : rc;
+}
+
 int xfsfs_open(const char *rest, uint32_t flags, struct file **out) {
     struct xfs_inode ip;
     char path[XFS_NAME_MAX + 2];
@@ -157,8 +209,8 @@ int xfsfs_open(const char *rest, uint32_t flags, struct file **out) {
     if ((flags & O_ACCMODE) != O_RDONLY && mounted.read_only) {
         return KERR_ROFS;
     }
-    if ((flags & (O_CREAT | O_TRUNC)) != 0) {
-        return KERR_ROFS; /* both would change metadata */
+    if ((flags & O_TRUNC) != 0) {
+        return KERR_NOTSUP; /* shortening a file frees blocks: the allocator's */
     }
     path[i++] = '/';
     for (const char *p = rest; *p != '\0' && i + 1 < sizeof path; p++) {
@@ -166,6 +218,12 @@ int xfsfs_open(const char *rest, uint32_t flags, struct file **out) {
     }
     path[i] = '\0';
     rc = xfs_path_lookup(&mounted.fs, path, &ip);
+    if (rc == KERR_NOENT && (flags & O_CREAT) != 0 && !mounted.read_only) {
+        return create_then_open(path, i, flags, out);
+    }
+    if (rc == KERR_OK && (flags & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL)) {
+        return KERR_EXIST;
+    }
     return rc == KERR_OK ? file_for(&ip, flags, out) : rc;
 }
 

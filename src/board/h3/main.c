@@ -26,9 +26,12 @@
 #include "kernel/fault.h"
 #include "kernel/irq.h"
 #include "board/h3/cpux.h"
+#include "core/gpio.h"
 #include "board/h3/ths.h"
+#include "board/h3/wdt.h"
 #include "kernel/klock.h"
 #include "kernel/thermal.h"
+#include "kernel/watchdog.h"
 #include "kernel/xfsfs.h"
 #include "kernel/mem.h"
 #include "kernel/net.h"
@@ -333,14 +336,39 @@ static void bring_up_network(void) {
 
 #define CPUFREQ_INTERVAL_MS 200u  /* decide five times a second */
 
+/* Starts the watchdog if the command line asks.
+ *
+ * Off by default, and for a plain reason rather than an unverifiable one:
+ * a board that reboots itself is the right answer for something running
+ * unattended and the wrong one for something being debugged, and the kernel
+ * cannot tell which it is. QEMU models this watchdog, so unlike the thermal
+ * sensor and the PLLs this path is tested (`minikern.selftest=wedge`). */
+static void bring_up_watchdog(void) {
+    struct watchdog_port port = {.start = h3_wdt_start, .pet = h3_wdt_pet, .stop = h3_wdt_stop};
+    uint32_t seconds = (uint32_t)cmdline_number("minikern.watchdog", 0);
+    uint32_t got;
+    if (seconds == 0) {
+        return;
+    }
+    got = watchdog_start(&port, seconds);
+    if (got == 0) {
+        kprintf("watchdog: %u s is not an interval this chip offers, not started\n", seconds);
+        return;
+    }
+    kprintf("watchdog: the board reboots if the kernel stops ticking for %u s\n", got);
+}
+
 /* The H3's published operating points, lowest first, as mainline's table
- * gives them — not invented here (the operator's instruction). Only the
- * points the NEO's fixed supply can feed are offered, because the GPIO that
- * switches VDD_CPUX is not driven yet (board/h3/cpux.c). */
-static struct cpufreq_policy h3_cpu_policy(void) {
+ * gives them — not invented here (the operator's instruction).
+ *
+ * The points above 816 MHz need the higher supply, so they are offered only
+ * when the board has said which pin switches it (`minikern.vddcpux=`).
+ * Offering them without that would ask for a frequency the core cannot be
+ * fed at, which is the one mistake here that does not announce itself. */
+static struct cpufreq_policy h3_cpu_policy(bool can_raise_vdd) {
     struct cpufreq_policy p = {
-        .opps = {{480000, 1040}, {648000, 1040}, {816000, 1100}},
-        .nopps = 3,
+        .opps = {{480000, 1040}, {648000, 1040}, {816000, 1100}, {912000, 1200}, {1008000, 1300}},
+        .nopps = can_raise_vdd ? 5u : 3u,
         .throttle_mC = 80000,
         .critical_mC = 95000,
         .hysteresis_mC = 5000,
@@ -348,6 +376,31 @@ static struct cpufreq_policy h3_cpu_policy(void) {
         .load_down_pct = 20,
     };
     return p;
+}
+
+/* Takes the VDD_CPUX pin from the command line, if it is there. True when
+ * the supply can be raised, which is what decides whether the operating
+ * points above 816 MHz may be offered at all.
+ *
+ * `drive` is false when the governor is running against fakes: the pin still
+ * decides which points exist, because that decision is the thing worth
+ * testing, but no register is touched. */
+static bool use_vdd_pin(bool drive) {
+    struct gpio_pin pin;
+    size_t len = 0;
+    const char *v = cmdline_value(boot_cmdline, "minikern.vddcpux", &len);
+    if (v == NULL) {
+        return false;
+    }
+    if (!gpio_parse(v, (uint32_t)len, &pin)) {
+        kprintf("cpufreq: minikern.vddcpux=\"%.*s\" is not a pin, ignored\n", (int)len, v);
+        return false;
+    }
+    if (drive) {
+        h3_cpuclock_use_vdd_pin(pin);
+    }
+    kprintf("cpufreq: VDD_CPUX switches on P%c%u\n", 'A' + pin.port, pin.pin);
+    return true;
 }
 
 /* Starts the frequency governor if the command line asks.
@@ -359,7 +412,7 @@ static struct cpufreq_policy h3_cpu_policy(void) {
  * proves everything except the two register writes; `on` drives the real
  * hardware and wants the board in front of you. */
 static void bring_up_cpufreq(void) {
-    struct cpufreq_policy policy = h3_cpu_policy();
+    struct cpufreq_policy policy;
     struct thermal_port sensor;
     struct cpuclock_port clock;
     bool fake = cmdline_equals(boot_cmdline, "minikern.cpufreq", "test");
@@ -367,6 +420,7 @@ static void bring_up_cpufreq(void) {
     if (!fake && !cmdline_equals(boot_cmdline, "minikern.cpufreq", "on")) {
         return;
     }
+    policy = h3_cpu_policy(use_vdd_pin(!fake));
     sensor = fake ? h3_thermal_fake_port() : h3_thermal_port();
     clock = fake ? h3_cpuclock_fake_port() : h3_cpuclock_port();
     rc = thermal_start(&sensor, &clock, &policy, CPUFREQ_INTERVAL_MS);
@@ -377,6 +431,7 @@ static void bring_up_cpufreq(void) {
 /* Reports how init ended, then ends the boot the way the command line asks. */
 static void init_exited(void *self, const struct proc *p) {
     (void)self;
+    watchdog_stop(); /* a power-off must not be interrupted by a reboot */
     /* Whatever the filesystem still holds goes to the device before the
      * machine stops (kernel/xfsfs.h). */
     (void)xfsfs_flush_all();
@@ -427,6 +482,24 @@ static bool pin_root_digest(void) {
     return true;
 }
 
+/* Applies minikern.netboot.key, if it is there. Like the digest pin, an
+ * unusable value stops the boot: the whole point is that this board takes
+ * its filesystem from one machine, and a boot that looked protected and
+ * was not would be worse than none. */
+static bool trust_offer_key(void) {
+    size_t len = 0;
+    const char *v = cmdline_value(boot_cmdline, "minikern.netboot.key", &len);
+    if (v == NULL) {
+        return true;
+    }
+    if (knetboot_require_key(v, len) != KERR_OK) {
+        kprintf("netboot: minikern.netboot.key must be 64 hex characters, refusing to boot\n");
+        return false;
+    }
+    kprintf("netboot: accepting only offers signed by %.*s\n", (int)len, v);
+    return true;
+}
+
 /* The root filesystem: the netbooted one when minikern.netboot asked for
  * it and it arrived, else the initrd the loader passed. Returns false when
  * there is no root to mount. */
@@ -437,8 +510,8 @@ static bool mount_root(const struct bootinfo *info) {
     uint32_t bytes;
     ip4_t pinned = 0;
     if (v != NULL && (len == 0 || ip4_parse(v, (uint32_t)len, &pinned) == KERR_OK)) {
-        if (!pin_root_digest()) {
-            return false; /* the pin was asked for and is unusable: do not boot */
+        if (!pin_root_digest() || !trust_offer_key()) {
+            return false; /* it was asked for and is unusable: do not boot */
         }
         if (knetboot_fetch(chip_id, pinned, &image, &bytes) == KERR_OK) {
             vfs_mount_root(image, bytes);
@@ -531,6 +604,7 @@ void kmain(uint32_t r0, uint32_t machine, uint32_t r2, uint32_t entry_cpsr) {
     syscall_set_trace(cmdline_equals(boot_cmdline, "minikern.strace", "1"));
     sched_set_hangcheck((uint32_t)cmdline_number("minikern.hangcheck", 0));
     bring_up_cpufreq();
+    bring_up_watchdog();
     maybe_selftest(boot_cmdline);
     kprintf("minikern: boot complete\n");
     if (!start_init(&info) && halt_requested()) {

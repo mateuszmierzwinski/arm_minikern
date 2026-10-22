@@ -18,6 +18,7 @@ go_library(
     deps = [
         "//server/internal/adapters/imagestore",
         "//server/internal/adapters/udptransport",
+        "//server/internal/adapters/edsigner",
         "//server/internal/mknb",
     ],
 )

@@ -85,6 +85,8 @@ static uint8_t *reserve_image(void) {
  * clears the session, so handing it the digest earlier would lose it. */
 static uint8_t expected[32];
 static bool expected_set;
+static uint8_t trusted_key[32];
+static bool key_set;
 
 static int begin(struct netif *nif, const uint32_t board_id[4], ip4_t pinned, uint8_t *buf) {
     uint8_t id[MKNB_BOARD_ID];
@@ -97,6 +99,9 @@ static int begin(struct netif *nif, const uint32_t board_id[4], ip4_t pinned, ui
     int rc = netboot_start(&client, nif, buf, IMAGE_CAPACITY, bitmap, xid, nif->mac, id, pinned);
     if (rc == KERR_OK && expected_set) {
         netboot_expect_digest(&client, expected); /* after the start, which clears the session */
+    }
+    if (rc == KERR_OK && key_set) {
+        netboot_require_signature(&client, trusted_key);
     }
     return rc;
 }
@@ -112,8 +117,8 @@ static int unhex(char c) {
     return c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
 }
 
-int knetboot_expect(const char *hex, size_t len) {
-    uint8_t *digest = expected;
+/* 64 hex characters into 32 bytes, or KERR_INVAL. */
+static int parse_32(const char *hex, size_t len, uint8_t out[32]) {
     if (len != 64u) {
         return KERR_INVAL;
     }
@@ -122,10 +127,21 @@ int knetboot_expect(const char *hex, size_t len) {
         if (hi < 0 || lo < 0) {
             return KERR_INVAL;
         }
-        digest[i] = (uint8_t)((hi << 4) | lo);
+        out[i] = (uint8_t)((hi << 4) | lo);
     }
-    expected_set = true;
     return KERR_OK;
+}
+
+int knetboot_expect(const char *hex, size_t len) {
+    int rc = parse_32(hex, len, expected);
+    expected_set = rc == KERR_OK;
+    return rc;
+}
+
+int knetboot_require_key(const char *hex, size_t len) {
+    int rc = parse_32(hex, len, trusted_key);
+    key_set = rc == KERR_OK;
+    return rc;
 }
 
 int knetboot_fetch(const uint32_t board_id[4], ip4_t pinned, const uint8_t **image, uint32_t *len) {

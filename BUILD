@@ -34,6 +34,13 @@ cc_library(
 # The frequency policy: pure, so it is host-tested, and separate from the
 # board adapters it decides for (which QEMU cannot judge at all).
 cc_library(
+    name = "gpio",
+    srcs = ["src/core/gpio.c"],
+    hdrs = ["src/core/gpio.h"],
+    strip_include_prefix = "src",
+)
+
+cc_library(
     name = "cpufreq",
     srcs = ["src/core/cpufreq.c"],
     hdrs = ["src/core/cpufreq.h"],
@@ -44,6 +51,31 @@ cc_library(
     name = "crc32c",
     srcs = ["src/lib/crc32c.c"],
     hdrs = ["src/lib/crc32c.h"],
+    strip_include_prefix = "src",
+)
+
+cc_library(
+    name = "ed25519",
+    srcs = ["src/lib/ed25519.c"],
+    hdrs = ["src/lib/ed25519.h"],
+    strip_include_prefix = "src",
+    deps = [
+        ":fe25519",
+        ":sha512",
+    ],
+)
+
+cc_library(
+    name = "fe25519",
+    srcs = ["src/lib/fe25519.c"],
+    hdrs = ["src/lib/fe25519.h"],
+    strip_include_prefix = "src",
+)
+
+cc_library(
+    name = "sha512",
+    srcs = ["src/lib/sha512.c"],
+    hdrs = ["src/lib/sha512.h"],
     strip_include_prefix = "src",
 )
 
@@ -74,6 +106,7 @@ cc_library(
     strip_include_prefix = "src",
     deps = [
         ":core",
+        ":ed25519",
         ":kfmt",
         ":sha256",
     ],
@@ -243,6 +276,7 @@ cc_library(
         ":block",
         ":core",
         ":cpufreq",
+        ":gpio",
         ":kernel_hdrs",
         ":kfmt",
         ":xfs",
@@ -256,16 +290,20 @@ cc_library(
         "src/board/h3/cpux.c",
         "src/board/h3/emac.c",
         "src/board/h3/main.c",
+        "src/board/h3/pio.c",
         "src/board/h3/sid.c",
         "src/board/h3/ths.c",
+        "src/board/h3/wdt.c",
         "src/board/h3/uart.c",
     ],
     hdrs = [
         "src/board/h3/cpux.h",
         "src/board/h3/emac.h",
         "src/board/h3/h3.h",
+        "src/board/h3/pio.h",
         "src/board/h3/sid.h",
         "src/board/h3/ths.h",
+        "src/board/h3/wdt.h",
         "src/board/h3/uart.h",
     ],
     local_defines = ['MINIKERN_VERSION=\\"%s.0\\"' % MINIKERN_VERSION],
@@ -275,6 +313,7 @@ cc_library(
         ":arch_arm",
         ":core",
         ":cpufreq",
+        ":gpio",
         ":kernel",
         ":kernel_hdrs",
     ],
@@ -358,6 +397,52 @@ cc_test(
     srcs = ["test/bootinfo_test.c"],
     deps = [
         ":core",
+        ":ktest",
+    ],
+)
+
+cc_test(
+    name = "ed25519_test",
+    size = "small",
+    srcs = [
+        "test/ed25519_test.c",
+        "test/ed_vectors.h",
+    ],
+    deps = [
+        ":ed25519",
+        ":ktest",
+    ],
+)
+
+cc_test(
+    name = "fe25519_test",
+    size = "small",
+    srcs = [
+        "test/fe25519_test.c",
+        "test/fe_vectors.h",
+    ],
+    deps = [
+        ":fe25519",
+        ":ktest",
+    ],
+)
+
+cc_test(
+    name = "sha512_test",
+    size = "small",
+    srcs = ["test/sha512_test.c"],
+    deps = [
+        ":ktest",
+        ":sha512",
+    ],
+)
+
+cc_test(
+    name = "gpio_test",
+    size = "small",
+    srcs = ["test/gpio_test.c"],
+    deps = [
+        ":gpio",
         ":ktest",
     ],
 )
@@ -477,14 +562,21 @@ filegroup(
     ]) + [
         "src/core/errno.h",
         "src/core/ports.h",
+        "src/lib/ed25519.c",
+        "src/lib/ed25519.h",
+        "src/lib/fe25519.c",
+        "src/lib/fe25519.h",
         "src/lib/kfmt.c",
         "src/lib/kfmt.h",
         "src/lib/sha256.c",
         "src/lib/sha256.h",
+        "src/lib/sha512.c",
+        "src/lib/sha512.h",
         "test/ktest.h",
         "test/net_frames.h",
         "test/net_test.c",
         "test/netboot_test.c",
+        "test/offer_vector.h",
         "test/tcp_hostile_test.c",
         "test/tcp_test.c",
     ],
@@ -609,7 +701,10 @@ sh_test(
 cc_test(
     name = "netboot_test",
     size = "small",
-    srcs = ["test/netboot_test.c"],
+    srcs = [
+        "test/netboot_test.c",
+        "test/offer_vector.h",
+    ],
     deps = [
         ":ktest",
         ":net",
@@ -818,12 +913,31 @@ sh_test(
         "'ok   a pipe carries bytes to the child'",
         "'ok   the environment reaches the new image'",
         "'ok   every argument reaches the new image'",
+        "'ok   a process with threads can replace its own image'",
         "'ok   execing something that is not there fails cleanly'",
         "'exectest ok'",
         "'init exited with status 7'",
     ],
     data = [
         ":exectest_rootfs",
+        ":minikern.uImage",
+    ],
+    tags = ["manual"],
+)
+
+# P8.11: the watchdog, in both directions — a wedged kernel is rebooted, and
+# a healthy one is left alone. QEMU models this device, so unlike the thermal
+# sensor and the PLLs it is tested rather than hoped for.
+sh_test(
+    name = "watchdog_qemu_test",
+    size = "medium",
+    srcs = ["test/watchdog_qemu_test.sh"],
+    args = [
+        "$(rootpath :minikern.uImage)",
+        "$(rootpath :hello_gc_rootfs)",
+    ],
+    data = [
+        ":hello_gc_rootfs",
         ":minikern.uImage",
     ],
     tags = ["manual"],
@@ -1041,6 +1155,7 @@ test_suite(
         ":go_abi_qemu_test",
         ":go_hello_qemu_test",
         ":cpufreq_qemu_test",
+        ":watchdog_qemu_test",
         ":exec_qemu_test",
         ":smp_qemu_test",
         ":tinygo_qemu_test",

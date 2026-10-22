@@ -239,6 +239,41 @@ static int flush_record(struct xfs *fs, uint64_t bb, uint32_t sectors) {
     return bcache_pwrite(fs->cache, base + bb * XLOG_SECTOR, record, bytes);
 }
 
+/* Zeroes the blocks after a batch, so that nothing a *previous* batch wrote
+ * is still there.
+ *
+ * The head of the log is found by looking at one word per basic block for
+ * the cycle number (xfs_log.c), so a block left over from a longer batch
+ * still carries that cycle and still looks like part of the log. A smaller
+ * batch written over a larger one duly left one, and `xfs_repair`
+ * reported a log with "valuable metadata changes" — it had found that
+ * orphan past the unmount record and had no reason to think it was rubbish.
+ *
+ * The window is as long as the longest record this writer can produce plus
+ * its unmount record, which is what makes it enough: nothing it could have
+ * written before reaches further. */
+#define XLOG_CLEAR_BLOCKS (XLOG_MAX_SECTORS + 1u + 2u)
+
+static int clear_after(struct xfs *fs, uint64_t bb) {
+    uint64_t base = xfs_fsb_to_block(fs, fs->logstart) * (uint64_t)fs->blocksize;
+    uint32_t left = XLOG_CLEAR_BLOCKS;
+    /* In passes the size of the record buffer, because the window to clear
+     * is longer than that buffer: zeroing all of it in one go wrote past
+     * the end of `record` and over whatever static followed it, which came
+     * back as a kernel that spun instead of finishing. */
+    zero(record, sizeof record);
+    while (left > 0) {
+        uint32_t now = left < XLOG_MAX_SECTORS ? left : XLOG_MAX_SECTORS;
+        int rc = bcache_pwrite(fs->cache, base + bb * XLOG_SECTOR, record, now * XLOG_SECTOR);
+        if (rc != KERR_OK) {
+            return rc;
+        }
+        bb += now;
+        left -= now;
+    }
+    return KERR_OK;
+}
+
 /* The unmount record, which says the filesystem was put down properly. It
  * is the same shape the formatter writes, and writing it after every batch
  * is what keeps the log clean — and so what keeps our own reader, which
@@ -257,7 +292,8 @@ static int write_unmount(struct xfs *fs, uint64_t bb) {
     put_header(fs, bb, 1, 1);
     pack_cycles(record, 1);
     seal(1);
-    return flush_record(fs, bb, 1);
+    rc = flush_record(fs, bb, 1);
+    return rc != KERR_OK ? rc : clear_after(fs, bb + 2u);
 }
 
 /* How many 512-byte sectors the built operations occupy. */
@@ -273,38 +309,51 @@ static uint32_t used_sectors(void) {
  * then two writes that must happen in that order, and splitting it would
  * hand a half-built static record to a second function (Rule 11, Naming/
  * Locking). */
-int xfs_log_inode(struct xfs *fs, uint64_t ino, uint64_t chunk_block, uint32_t boffset, const uint8_t *core) {
+/* One inode item: the format header that says which inode and which parts
+ * of it, then the core itself. Two operations, as its ilf_size says. */
+static int put_inode_item(const struct xfs *fs, const struct xfs_log_inode_item *item) {
     uint8_t ilf[ILF_STRUCT_SIZE];
-    uint8_t thdr[TRANS_HDR_SIZE];
     uint8_t logged[XFS_LOG_DINODE_SIZE];
-    uint32_t sectors;
     int rc;
-    zero(record, sizeof record);
-    record_used = 0;
     zero(ilf, sizeof ilf);
     put_le16(ilf + ILF_TYPE, XFS_LI_INODE);
-    put_le16(ilf + ILF_SIZE, 2); /* this item occupies two operations */
+    put_le16(ilf + ILF_SIZE, 2);
     put_le32(ilf + ILF_FIELDS, XFS_ILOG_CORE);
-    put_le64(ilf + ILF_INO, ino);
-    put_le64(ilf + ILF_BLKNO, chunk_block * (fs->blocksize / XLOG_SECTOR));
+    put_le64(ilf + ILF_INO, item->ino);
+    put_le64(ilf + ILF_BLKNO, item->chunk_block * (fs->blocksize / XLOG_SECTOR));
     put_le32(ilf + ILF_LEN, fs->blocksize / XLOG_SECTOR);
-    put_le32(ilf + ILF_BOFFSET, boffset);
+    put_le32(ilf + ILF_BOFFSET, item->boffset);
+    rc = put_op(XFS_LOG_TID, 0, ilf, sizeof ilf);
+    log_dinode_from_disk(logged, item->core);
+    return rc != KERR_OK ? rc : put_op(XFS_LOG_TID, 0, logged, XFS_LOG_DINODE_SIZE);
+}
+
+int xfs_log_inodes(struct xfs *fs, const struct xfs_log_inode_item *items, uint32_t n) {
+    uint8_t thdr[TRANS_HDR_SIZE];
+    uint32_t sectors;
+    int rc;
+    if (n == 0 || n > XFS_LOG_MAX_ITEMS) {
+        return KERR_INVAL;
+    }
+    zero(record, sizeof record);
+    record_used = 0;
     zero(thdr, sizeof thdr);
     put_le32(thdr + TRANS_HDR_MAGIC, XFS_TRANS_HEADER_MAGIC);
     put_le32(thdr + TRANS_HDR_TYPE, XFS_TRANS_SETATTR_SIZE);
     put_le32(thdr + TRANS_HDR_TID, XFS_LOG_TID);
-    put_le32(thdr + TRANS_HDR_NUM_ITEMS, 1);
+    put_le32(thdr + TRANS_HDR_NUM_ITEMS, n);
     rc = put_op(XFS_LOG_TID, XLOG_START_TRANS, NULL, 0);
     rc = rc != KERR_OK ? rc : put_op(XFS_LOG_TID, 0, thdr, sizeof thdr);
-    rc = rc != KERR_OK ? rc : put_op(XFS_LOG_TID, 0, ilf, sizeof ilf);
-    log_dinode_from_disk(logged, core);
-    rc = rc != KERR_OK ? rc : put_op(XFS_LOG_TID, 0, logged, XFS_LOG_DINODE_SIZE);
+    for (uint32_t i = 0; rc == KERR_OK && i < n; i++) {
+        rc = put_inode_item(fs, &items[i]);
+    }
     rc = rc != KERR_OK ? rc : put_op(XFS_LOG_TID, XLOG_COMMIT_TRANS, NULL, 0);
     if (rc != KERR_OK) {
         return rc;
     }
     sectors = used_sectors();
-    put_header(fs, 0, sectors, 5);
+    /* Three operations frame the transaction and two carry each item. */
+    put_header(fs, 0, sectors, 3u + 2u * n);
     pack_cycles(record, sectors);
     seal(sectors);
     rc = flush_record(fs, 0, sectors);
