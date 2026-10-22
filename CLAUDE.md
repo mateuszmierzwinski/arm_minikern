@@ -56,8 +56,13 @@ Step by step: each phase in `TASKS.md` ends with something that boots and is tes
 | P5 Netboot | **Done in QEMU (2026-10-21).** Our own MKNB protocol (NETBOOT.md): a unicast sweep finds the server, the archive arrives in windowed blocks and is verified against SHA-256 before anything is mounted. The server is a Go program in this tree. |
 | P6 Full Go (gc) | **Done for one core (2026-10-21).** Go 1.26 binaries run unchanged: threads, futex, epoll timers, async preemption by SIGURG, GC, signals. SMP is not started. |
 | P7 Sockets | **Done for UDP and TCP (2026-10-21).** Go's `net` package works: UDP both ways, TCP active and passive open, and a complete HTTP exchange (client *and* server) inside the guest. |
+| P9 Storage | **NBD, XFS read-only and formatting done (2026-10-22).** Our own NBD client over our own TCP, a buffer cache, `/dev/nbd0`, a Go NBD server in-tree — and an XFS v5 reader that mounts filesystems Linux made, lists every directory shape and reads files byte for byte, refusing every feature it does not fully understand and every dirty log. A Go program formats a volume over the network (`userland/internal/xfsmk`) and `mount("/dev/nbd0", "/mnt", "xfs", …)` mounts it; `xfs_repair` finds nothing wrong with what the board writes (`XFS.md`). |
 
-**The goal is met in QEMU:** a standard `GOOS=linux GOARCH=arm` Go binary, and a TinyGo one, run unchanged on a kernel that copies no Linux code — and a Go program can now fetch its own root filesystem over the network and talk TCP and UDP. 30 Bazel test targets prove it on every change.
+A Go program on the board can now also reach a **network block device** and
+read an **XFS filesystem** off it — the volume being a file on a server, and
+the filesystem one `mkfs.xfs` made.
+
+**The goal is met in QEMU:** a standard `GOOS=linux GOARCH=arm` Go binary, and a TinyGo one, run unchanged on a kernel that copies no Linux code — and a Go program can now fetch its own root filesystem over the network and talk TCP and UDP. 47 Bazel test targets prove it on every change.
 
 ---
 
@@ -208,6 +213,13 @@ green. `:qemu_tests` is a `test_suite` naming them all:
 | `net_sockets_qemu_test` | P7: Go's `net` over UDP and TCP, both directions, plus HTTP inside the guest |
 | `netboot_qemu_test` | P5: the board sweeps, finds the real Go server, fetches and verifies its root filesystem, and runs a Go init from it |
 | `net_sanitized_test` | every network test rebuilt with clang under ASan and UBSan |
+| `xfs_sanitized_test` | the XFS reader likewise: it parses somebody's filesystem |
+| `net_nbd_live_test` | our NBD **client** against `qemu-nbd`, a server nobody here wrote |
+| `nbd_server_live_test` | our NBD **server** against `nbdinfo`, `nbdcopy` and `qemu-io` |
+| `nbd_qemu_test` | P9.1: a Go program on the board reads and writes a volume on a server, and the host checks the file afterwards with `cmp` |
+| `xfs_live_test` | P9.2: the XFS reader against filesystems `mkfs.xfs` made, judged by `xfs_repair` |
+| `mkfsxfs_live_test` | P9.3: the Go formatter's output, judged by `xfs_repair` and then read by our own reader |
+| `xfs_qemu_test` | P9.3: the board formats a filesystem over the network, mounts it, reads it — and `xfs_repair` on the host approves it |
 
 **Userland programs** live in `userland/cmd/<name>/main.go` and build with rules_go
 (`goos = "linux"`, `goarch = "arm"`, `pure = "on"`). `minikern_rootfs` (in `minikern.bzl`)
@@ -226,7 +238,8 @@ Kernel command line (all optional):
 | `minikern.selftest=undef\|dabt\|pabt` | take that exception on purpose |
 | `minikern.net=off` | leave the network down |
 | `minikern.netboot[=<ip>]` | fetch the root filesystem over the network; with an address, probe only that one and never sweep |
-| `minikern.netstat=1` | print the interface and TCP counters when init exits |
+| `minikern.nbd=<ip>[:<port>][/<export>]` | attach a network block device as `/dev/nbd0` before init runs (port 10809 by default) |
+| `minikern.netstat=1` | print the interface, TCP and block-cache counters when init exits |
 | `minikern.env.NAME=VALUE` | put `NAME=VALUE` in init's environment |
 
 ---
@@ -238,6 +251,7 @@ src/
 ├── lib/        freestanding helpers, no kernel knowledge (host-tested)
 │   ├── kfmt.*      printf-style formatter (tested against libc)
 │   ├── div64.*     64-bit division; aeabi_div.S binds it to the EABI names
+│   ├── crc32c.*    CRC-32C, which every v5 XFS metadata block carries
 │   └── kmem.c      memset / memcpy / memmove / memcmp (kernel only)
 ├── core/       the hexagon: pure, portable C, host-tested; includes only core/ and lib/
 │   ├── ports.h     every port: console, console input, power, page source, irq chip
@@ -250,6 +264,11 @@ src/
 │   ├── ustack.*    the process start state (argc, argv, envp, auxv)
 │   ├── tar.*       ustar, read in place
 │   ├── console.*   kprintf over the console port
+│   ├── blockdev.h  a block device: fixed-size blocks, addressed by index
+│   ├── bcache.*    a buffer cache over one, because the device is a network away
+│   ├── nbd.*       the NBD client: a volume that is a file on a server
+│   ├── xfs/        an XFS v5 reader (XFS.md): superblock, inodes, extents,
+│   │               directories in all three shapes, and a clean-log check
 │   └── net/        the IPv4 stack, all pure and host-tested
 │       ├── net.h       the one public header (netif, ports, UDP, ICMP)
 │       ├── net_eth.c   Ethernet II framing and the input entry point
@@ -278,18 +297,24 @@ src/
 │   ├── net.*       the live interface: EMAC frames in, tick, DHCP, echo service
 │   ├── netboot.*   fetches the root filesystem before init runs
 │   ├── dma.*       an uncached window of RAM for descriptor rings and buffers
+│   ├── nbd.*       the live NBD client: our TCP as its transport, /dev/nbd0
+│   ├── xfsfs.*     an XFS filesystem in the namespace (mount, read, list)
 │   ├── socket.*    BSD sockets over the stack;  sock_udp.c, sock_tcp.c
 │   ├── vfs.*       files and the namespace;  tarfs.*, devfs.*, procfs.*
 │   └── syscall.* + sys_<domain>.c   the syscall table, one file per domain
 └── board/h3/   the NanoPi NEO: memory map, UART, EMAC, SID, and main.c
                  (the composition root)
 
-server/         the netboot server, in Go: cmd/mknbserver plus a hexagon in
-                internal/ (mknb = the protocol, adapters = the filesystem and
-                the socket). Its tests include the amplification suite.
+server/         the servers, in Go, each a hexagon in internal/ with its
+                adapters: cmd/mknbserver (netboot, NETBOOT.md) and
+                cmd/nbdserver (a volume file over NBD). Both carry their own
+                adversarial suites — amplification for one, traversal and
+                out-of-range writes for the other.
 userland/       Go programs the kernel runs: cmd/hello, cmd/goabi (the ABI
                 suite), cmd/hostile (the syscall attack suite), cmd/nettest
-                (the socket suite), cmd/netbootinit, plus rootfs/ files.
+                (the socket suite), cmd/nbdtest, cmd/xfstest, cmd/netbootinit,
+                plus rootfs/ files — and internal/xfsmk, the XFS formatter,
+                which is user-space code on purpose (XFS.md §7).
 test/tools/     host-side helpers for the tests (netecho).
 ```
 
@@ -467,10 +492,14 @@ syscall interface above. No `/proc/sys` tree is wanted.
 
 - **The driver is our own** (`board/h3/emac.c`), from the datasheet's EMAC chapter
   and checked against QEMU's model. Chained rings: 64 RX, 8 TX, 1600-byte buffers.
-  They live in the **DMA window**: 1 MiB of RAM mapped a second time, normal
-  non-cacheable, at `0xE0000000` (`kernel/dma`), so the caches never need
-  maintenance. Receive is interrupt-driven (SPI 82); transmit kicks the DMA on
-  every send. The MAC address comes from the chip's SID, so a board keeps it.
+  They live in the **DMA window**: 1 MiB of RAM, normal non-cacheable, at
+  `0xE0000000` (`kernel/dma`), so the caches never need maintenance in steady
+  state. Creating it does: the memory arrives zeroed through the cacheable linear
+  map, so it is cleaned and invalidated out of the cache before the attributes
+  change and its cacheable alias is then unmapped — one page is never reachable
+  under two cacheabilities (§10). Receive is interrupt-driven (SPI 82); transmit
+  kicks the DMA on every send. The MAC address comes from the chip's SID, so a
+  board keeps it.
 - **The stack is our own** (`core/net`): Ethernet II, ARP, IPv4 with a loopback
   path, ICMP echo, UDP, a DHCP client, and **TCP**. It is pure, so it is tested on
   the host with crafted frames, hostile frames and mutation fuzzers, under ASan.
@@ -572,6 +601,21 @@ syscall interface above. No `/proc/sys` tree is wanted.
   `test/tools/netecho`, a Go program, and verify the host side independently first.
 - **`filter-dump` cannot attach to a board's built-in NIC**, so there is no easy
   pcap of the EMAC. `minikern.netstat=1` and the TCP counters exist for that reason.
+- **Zeroing memory is a cache operation.** `dma_init` took its 1 MiB window from
+  `page_alloc`, which zeroes through the kernel's **cacheable** linear map, and then
+  mapped the same physical memory non-cacheable for the EMAC. Nothing cleaned the
+  cache in between, and 1 MiB is larger than the A7's L1 + the H3's L2, so the CPU
+  was left holding dirty lines full of zeroes for memory a device now owned: they
+  are written back whenever the cache chooses to evict them, over a packet, long
+  after the handover. The symptom would have been exactly the kind of bug that eats
+  a week — intermittent RX/TX corruption on silicon, impossible to reproduce in
+  QEMU, which models no caches at all. The window is now cleaned and invalidated
+  (`mmu_flush_dcache_range`, DCCIMVAC by VA) **before** the attributes change, and
+  its cacheable alias is then unmapped, because two mappings of one page with
+  different cacheability is a mismatched-attributes alias that the architecture does
+  not keep coherent (ARM ARM B2.9). `minikern.selftest=dma-alias` proves the alias
+  is really gone — the only half of this QEMU can judge — and that an accidental
+  access faults instead of corrupting a frame.
 - **A test that does nothing must not pass.** `net_sanitized_test.sh` found its
   include roots by walking up to a directory named `minikern`, and picked the test
   mains out of its arguments with `/test/`. Both assumed the monorepo's path.

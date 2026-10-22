@@ -19,6 +19,14 @@ struct frame_sink knet_init(const uint8_t mac[ETH_ALEN], const struct netdev_por
 /* Starts DHCP and the tick (once the device is up). */
 void knet_start(uint32_t xid);
 
+/* Waits, with interrupts open, until DHCP has given the interface an
+ * address. KERR_OK, or KERR_TIMEDOUT after timeout_ms.
+ *
+ * Anything that dials out at boot must call this first: the network comes
+ * up in the background, so without it the first SYN leaves with no source
+ * address and is never answered (CLAUDE.md §10). */
+int knet_wait_address(uint32_t timeout_ms);
+
 /* The interface, for later layers (sockets). */
 struct netif *knet_interface(void);
 

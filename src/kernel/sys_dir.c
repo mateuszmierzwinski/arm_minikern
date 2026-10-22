@@ -9,6 +9,7 @@
 
 #include <stddef.h>
 #include "kernel/vfs.h"
+#include "kernel/xfsfs.h"
 
 #define DT_DIR 4u
 #define DT_REG 8u
@@ -110,22 +111,48 @@ static void emit_entries(struct file *f, uint8_t *buf, uint32_t cap, uint32_t *u
     f->pos = len;
 }
 
+/* A mounted filesystem lists its own directories. The position means
+ * different things to each one — an archive offset here, an entry count
+ * there — which is why the file's owner decides. */
+static int32_t list_mounted(struct file *f, uint8_t *buf, uint32_t cap) {
+    uint32_t advanced = 0;
+    int32_t used = xfsfs_getdents(f, buf, cap, &advanced);
+    if (used > 0) {
+        f->pos += advanced;
+    }
+    return used;
+}
+
 /* getdents64(fd, dirp, count). */
 static int32_t sys_getdents64(struct trapframe *tf) {
-    static uint8_t buf[4096];
     struct file *f = fd_file((int32_t)tf->r[0]);
-    uint32_t used = 0, cap = tf->r[2] < sizeof buf ? tf->r[2] : sizeof buf;
+    uint8_t buf[512];
+    uint32_t cap = tf->r[2] < sizeof buf ? tf->r[2] : (uint32_t)sizeof buf;
+    uint32_t used = 0;
+    int32_t rc;
     if (f == NULL) {
         return KERR_BADF;
     }
     if ((f->mode & S_IFMT) != S_IFDIR) {
         return KERR_NOTDIR;
     }
-    if (emit_mounts(f, buf, cap, &used)) {
+    if (xfsfs_owns(f)) {
+        rc = list_mounted(f, buf, cap);
+        if (rc <= 0) {
+            return rc;
+        }
+        used = (uint32_t)rc;
+    } else {
+        if (!emit_mounts(f, buf, cap, &used)) {
+            return (int32_t)used;  /* the mounts filled the buffer */
+        }
         emit_entries(f, buf, cap, &used);
+        if (used == 0 && f->pos < DIR_POS_START && cap < 32u) {
+            return KERR_INVAL;
+        }
     }
-    if (used == 0 && f->pos < DIR_POS_START && cap < 32u) {
-        return KERR_INVAL;
+    if (used == 0) {
+        return 0;
     }
     return mm_copy_out(proc_current()->mm, tf->r[1], buf, used) == KERR_OK ? (int32_t)used : KERR_FAULT;
 }

@@ -1,5 +1,5 @@
 /* sys_file — descriptors and files: open/openat, close, read, write, readv,
- * writev, pread64, lseek/_llseek, ioctl, fcntl(64), fstat64/fstatat64,
+ * writev, pread64/pwrite64, fsync, lseek/_llseek, ioctl, fcntl(64), fstat64,
  * getdents64, dup/dup2/dup3, readlinkat, getcwd, faccessat. User buffers
  * go through a kernel bounce buffer; file ops never see user pointers. */
 #include "core/errno.h"
@@ -10,6 +10,7 @@
 
 #include <stddef.h>
 #include "kernel/vfs.h"
+#include "kernel/xfsfs.h"
 
 #define AT_FDCWD (-100)
 #define AT_EMPTY_PATH 0x1000u
@@ -250,9 +251,11 @@ static int32_t sys_writev(struct trapframe *tf) {
     return vector_io(tf, true);
 }
 
-/* Only memory-backed files have positions; everything else is a stream. */
+/* Files and block devices have positions; a character device, a socket and
+ * a pipe are streams. */
 static bool seekable(const struct file *f) {
-    return (f->mode & S_IFMT) == S_IFREG;
+    uint32_t type = f->mode & S_IFMT;
+    return type == S_IFREG || type == S_IFBLK;
 }
 
 /* pread64(fd, buf, count, pad, off_lo, off_hi): the position is kept. */
@@ -271,6 +274,37 @@ static int32_t sys_pread64(struct trapframe *tf) {
     n = read_into(f, tf->r[1], tf->r[2]);
     f->pos = saved;
     return n;
+}
+
+/* pwrite64(fd, buf, count, pad, off_lo, off_hi): the position is kept. It
+ * is what Go's WriteAt uses, so a program can write a disk image without
+ * seeking (mkfs does exactly this). */
+static int32_t sys_pwrite64(struct trapframe *tf) {
+    struct file *f = fd_file((int32_t)tf->r[0]);
+    uint64_t saved;
+    int32_t n;
+    if (f == NULL || !writable(f)) {
+        return KERR_BADF;
+    }
+    if (!seekable(f)) {
+        return KERR_SPIPE;
+    }
+    saved = f->pos;
+    f->pos = ((uint64_t)tf->r[5] << 32) | tf->r[4];
+    n = write_from(f, tf->r[1], tf->r[2]);
+    f->pos = saved;
+    return n;
+}
+
+/* fsync and fdatasync: make what was written durable. A file with nothing
+ * behind it (a tty, a memory file) has nothing to do and says so, as Linux
+ * does for a device that cannot fail.  */
+static int32_t sys_fsync(struct trapframe *tf) {
+    struct file *f = fd_file((int32_t)tf->r[0]);
+    if (f == NULL) {
+        return KERR_BADF;
+    }
+    return f->ops->fsync != NULL ? f->ops->fsync(f) : KERR_OK;
 }
 
 static int64_t seek(struct file *f, int64_t off, uint32_t whence) {
@@ -299,6 +333,33 @@ static int32_t sys_llseek(struct trapframe *tf) {
         return (int32_t)r;
     }
     return mm_copy_out(cur()->mm, tf->r[3], &r, sizeof r);
+}
+
+/* mount(source, target, fstype, flags, data).
+ *
+ * Narrow by design: the only filesystem this kernel can mount is the XFS
+ * on its network block device, and it mounts it read-only. Everything else
+ * is refused by name rather than half-attempted — Go's syscall.Mount
+ * reaches this, so a program gets the ordinary errors it expects. */
+static bool same_string(const char *a, const char *b) {
+    while (*a != '\0' && *a == *b) {
+        a++;
+        b++;
+    }
+    return *a == *b;
+}
+
+static int32_t sys_mount(struct trapframe *tf) {
+    char source[32], target[48], fstype[16];
+    if (mm_copy_string_in(cur()->mm, source, tf->r[0], sizeof source) <= 0 ||
+        mm_copy_string_in(cur()->mm, target, tf->r[1], sizeof target) <= 0 ||
+        mm_copy_string_in(cur()->mm, fstype, tf->r[2], sizeof fstype) <= 0) {
+        return KERR_FAULT;
+    }
+    if (!same_string(fstype, "xfs") || !same_string(source, "/dev/nbd0")) {
+        return KERR_NODEV; /* no such filesystem type, or no such device */
+    }
+    return xfsfs_mount(target);
 }
 
 static int32_t sys_ioctl(struct trapframe *tf) {
@@ -509,7 +570,11 @@ const struct syscall_entry sys_file_table[] = {
     {140, "_llseek", sys_llseek},
     {145, "readv", sys_readv},
     {146, "writev", sys_writev},
+    {21, "mount", sys_mount},
+    {118, "fsync", sys_fsync},
+    {148, "fdatasync", sys_fsync},
     {180, "pread64", sys_pread64},
+    {181, "pwrite64", sys_pwrite64},
     {183, "getcwd", sys_getcwd},
     {197, "fstat64", sys_fstat64},
     {221, "fcntl64", sys_fcntl},

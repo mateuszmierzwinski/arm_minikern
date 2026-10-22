@@ -20,9 +20,18 @@ void mmu_switch_user(uint32_t l1_phys) {
     mmu_flush_tlb();
 }
 
-void mmu_map_kernel_section(uint32_t virt, uint32_t phys, uint32_t attrs) {
-    boot_l1[virt >> SECTION_SHIFT] = (phys & 0xfff00000u) | attrs;
+/* Writes one section entry of the kernel's table and flushes the TLB. */
+static void set_kernel_section(uint32_t virt, uint32_t entry) {
+    boot_l1[virt >> SECTION_SHIFT] = entry;
     mmu_flush_tlb();
+}
+
+void mmu_map_kernel_section(uint32_t virt, uint32_t phys, uint32_t attrs) {
+    set_kernel_section(virt, (phys & 0xfff00000u) | attrs);
+}
+
+void mmu_unmap_kernel_section(uint32_t virt) {
+    set_kernel_section(virt, 0);
 }
 
 void mmu_clear_user(void) {
@@ -36,6 +45,15 @@ void mmu_init(void) {
         boot_l1[i] = 0;
     }
     mmu_flush_tlb();
+}
+
+void mmu_flush_dcache_range(const void *virt, uint32_t len) {
+    uintptr_t at = (uintptr_t)virt & ~(uintptr_t)(CACHE_LINE - 1u);
+    uintptr_t end = (uintptr_t)virt + len;
+    for (; at < end; at += CACHE_LINE) {
+        __asm__ volatile("mcr p15, 0, %0, c7, c14, 1" : : "r"(at) : "memory");  /* DCCIMVAC */
+    }
+    __asm__ volatile("dsb" : : : "memory");
 }
 
 void mmu_sync_icache(const void *virt, uint32_t len) {

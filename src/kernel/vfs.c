@@ -6,6 +6,7 @@
 #include "kernel/procfs.h"
 #include "kernel/sched.h"
 #include "kernel/tarfs.h"
+#include "kernel/xfsfs.h"
 
 static uint32_t next_ino = 1;
 static int poll_channel;
@@ -44,6 +45,9 @@ int vfs_open(const char *path, uint32_t flags, struct file **out, int *alias_fd)
     }
     if (under(path, "/proc", &rest)) {
         return procfs_open(rest, flags, out);
+    }
+    if (xfsfs_mounted() && under(path, xfsfs_prefix(), &rest)) {
+        return xfsfs_open(rest, flags, out);
     }
     return tarfs_open(path, flags, out);
 }

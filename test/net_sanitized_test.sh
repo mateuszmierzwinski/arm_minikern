@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# net_sanitized_test.sh <sources...>: builds the network tests with clang
-# under AddressSanitizer and UndefinedBehaviorSanitizer and runs each. The
-# stack and the netboot client read hostile input, so an out-of-bounds read
-# that happens not to crash must still fail a test. clang's compiler-rt
-# provides the runtimes (Fedora's gcc libasan is not installed here), hence
-# a script rather than a cc_test.
+# net_sanitized_test.sh <sources...>: builds the given test mains with clang
+# under AddressSanitizer and UndefinedBehaviorSanitizer and runs each.
+#
+# It is used by every suite whose input is hostile by definition — the
+# network stack, the netboot client, TCP, the XFS reader — because an
+# out-of-bounds read that happens not to crash must still fail a test.
+# clang's compiler-rt provides the runtimes (Fedora's gcc libasan is not
+# installed here), hence a script rather than a cc_test.
 set -euo pipefail
 command -v clang >/dev/null || { echo "clang is not installed" >&2; exit 1; }
 tmp="${TEST_TMPDIR:-$(mktemp -d)}"
@@ -20,7 +22,11 @@ case "$1" in
 src/* | test/*) root="." ;;
 *) echo "cannot tell the project root from $1" >&2; exit 1 ;;
 esac
-[ -d "$root/src/core/net" ] || { echo "$root is not the project root" >&2; exit 1; }
+# The include roots must both be there. Naming one subdirectory instead
+# would tie this script to one suite, which is how it came to be called
+# "net_sanitized" while running the filesystem's tests too.
+[ -d "$root/src" ] && [ -d "$root/test" ] ||
+    { echo "$root does not look like the project root" >&2; exit 1; }
 
 # Every library source, plus one test main at a time. The test directory is
 # matched at a path boundary, not by "/test/": at the workspace root the path

@@ -26,6 +26,7 @@
 #define S_IFMT   0170000u
 #define S_IFDIR  0040000u
 #define S_IFCHR  0020000u
+#define S_IFBLK  0060000u
 #define S_IFREG  0100000u
 #define S_IFLNK  0120000u
 
@@ -35,6 +36,7 @@ struct file_ops {
     int32_t (*read)(struct file *f, void *buf, uint32_t n);   /* at f->pos, advances it */
     int32_t (*write)(struct file *f, const void *buf, uint32_t n);
     int (*ioctl)(struct file *f, uint32_t cmd, uint32_t arg);
+    int (*fsync)(struct file *f);                             /* NULL: nothing to make durable */
     void (*release)(struct file *f);
     uint32_t (*poll)(struct file *f);  /* EPOLLIN/EPOLLOUT now; NULL: not pollable */
 };

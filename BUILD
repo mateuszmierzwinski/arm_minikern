@@ -32,6 +32,13 @@ cc_library(
 )
 
 cc_library(
+    name = "crc32c",
+    srcs = ["src/lib/crc32c.c"],
+    hdrs = ["src/lib/crc32c.h"],
+    strip_include_prefix = "src",
+)
+
+cc_library(
     name = "sha256",
     srcs = ["src/lib/sha256.c"],
     hdrs = ["src/lib/sha256.h"],
@@ -61,6 +68,43 @@ cc_library(
         ":kfmt",
         ":sha256",
     ],
+)
+
+# The storage stack below any filesystem: the block-device port, a buffer
+# cache over it, and the NBD client that reaches a volume on the network.
+# Pure, so the host tests drive it against a RAM device and a fake server,
+# and the live test drives it against qemu-nbd (CLAUDE.md §11).
+# The XFS reader: pure, so the host tests drive it against images made by
+# Linux's own mkfs.xfs and judged by xfs_repair (CLAUDE.md §13).
+cc_library(
+    name = "xfs",
+    srcs = glob(["src/core/xfs/*.c"]),
+    hdrs = [
+        "src/core/xfs/xfs.h",
+        "src/core/xfs/xfs_format.h",
+        "src/core/xfs/xfs_internal.h",
+    ],
+    strip_include_prefix = "src",
+    deps = [
+        ":block",
+        ":core",
+        ":crc32c",
+    ],
+)
+
+cc_library(
+    name = "block",
+    srcs = [
+        "src/core/bcache.c",
+        "src/core/nbd.c",
+    ],
+    hdrs = [
+        "src/core/bcache.h",
+        "src/core/blockdev.h",
+        "src/core/nbd.h",
+    ],
+    strip_include_prefix = "src",
+    deps = [":core"],
 )
 
 cc_library(
@@ -169,9 +213,11 @@ cc_library(
     target_compatible_with = _H3,
     deps = [
         ":arch_hdrs",
+        ":block",
         ":core",
         ":net",
         ":pgtable",
+        ":xfs",
     ],
 )
 
@@ -182,9 +228,11 @@ cc_library(
     target_compatible_with = _H3,
     deps = [
         ":arch_arm",
+        ":block",
         ":core",
         ":kernel_hdrs",
         ":kfmt",
+        ":xfs",
     ],
     alwayslink = True,
 )
@@ -297,6 +345,16 @@ cc_test(
 )
 
 cc_test(
+    name = "crc32c_test",
+    size = "small",
+    srcs = ["test/crc32c_test.c"],
+    deps = [
+        ":crc32c",
+        ":ktest",
+    ],
+)
+
+cc_test(
     name = "sha256_test",
     size = "small",
     srcs = ["test/sha256_test.c"],
@@ -343,6 +401,26 @@ cc_test(
 ]]
 
 cc_test(
+    name = "bcache_test",
+    size = "small",
+    srcs = ["test/bcache_test.c"],
+    deps = [
+        ":block",
+        ":ktest",
+    ],
+)
+
+cc_test(
+    name = "nbd_test",
+    size = "small",
+    srcs = ["test/nbd_test.c"],
+    deps = [
+        ":block",
+        ":ktest",
+    ],
+)
+
+cc_test(
     name = "net_test",
     size = "small",
     srcs = ["test/net_test.c"],
@@ -382,6 +460,122 @@ filegroup(
         "test/tcp_hostile_test.c",
         "test/tcp_test.c",
     ],
+)
+
+# The kernel's NBD client as a host binary, so it can be driven against
+# qemu-nbd — a server nobody here wrote (test/net_nbd_live_test.sh).
+cc_binary(
+    name = "nbd_probe",
+    testonly = True,
+    srcs = ["test/nbd_probe.c"],
+    tags = ["manual"],
+    deps = [":block"],
+)
+
+sh_test(
+    name = "net_nbd_live_test",
+    size = "small",
+    srcs = ["test/net_nbd_live_test.sh"],
+    args = ["$(rootpath :nbd_probe)"],
+    data = [":nbd_probe"],
+    tags = ["manual"],
+)
+
+# Our NBD server, driven by reference clients (nbdinfo, nbdcopy, qemu-io)
+# and then by our own: the other half of net_nbd_live_test.
+sh_test(
+    name = "nbd_server_live_test",
+    size = "small",
+    srcs = ["test/nbd_server_live_test.sh"],
+    args = [
+        "$(rootpath //server/cmd/nbdserver)",
+        "$(rootpath :nbd_probe)",
+    ],
+    data = [
+        ":nbd_probe",
+        "//server/cmd/nbdserver",
+    ],
+    tags = ["manual"],
+)
+
+# The XFS reader against images made by Linux's mkfs.xfs, judged by
+# xfs_repair: the only standard worth holding a filesystem reader to.
+cc_binary(
+    name = "xfs_probe",
+    testonly = True,
+    srcs = ["test/xfs_probe.c"],
+    tags = ["manual"],
+    deps = [":xfs"],
+)
+
+sh_test(
+    name = "xfs_live_test",
+    size = "medium",
+    srcs = ["test/xfs_live_test.sh"],
+    args = ["$(rootpath :xfs_probe)"],
+    data = [":xfs_probe"],
+    tags = ["manual"],
+)
+
+cc_test(
+    name = "xfs_test",
+    size = "small",
+    srcs = ["test/xfs_test.c"],
+    deps = [
+        ":crc32c",
+        ":ktest",
+        ":xfs",
+    ],
+)
+
+# The XFS reader under ASan and UBSan: it parses somebody's filesystem, so
+# an out-of-bounds read that happens not to crash must still fail a test.
+sh_test(
+    name = "xfs_sanitized_test",
+    size = "small",
+    srcs = ["test/net_sanitized_test.sh"],
+    args = ["$(rootpaths :xfs_sanitized_srcs)"],
+    data = [":xfs_sanitized_srcs"],
+    tags = ["manual"],
+)
+
+filegroup(
+    name = "xfs_sanitized_srcs",
+    srcs = glob(["src/core/xfs/*.c"]) + [
+        "src/core/bcache.c",
+        "src/core/console.c",
+        "src/core/bcache.h",
+        "src/core/blockdev.h",
+        "src/core/console.h",
+        "src/core/errno.h",
+        "src/core/ports.h",
+        "src/core/xfs/xfs.h",
+        "src/core/xfs/xfs_format.h",
+        "src/core/xfs/xfs_internal.h",
+        "src/lib/crc32c.c",
+        "src/lib/crc32c.h",
+        "src/lib/kfmt.c",
+        "src/lib/kfmt.h",
+        "test/ktest.h",
+        "test/xfs_test.c",
+    ],
+)
+
+# P9.3: the Go formatter, judged by xfs_repair and then read by the kernel's
+# own reader — our formatter, Linux's judgement, our reader.
+sh_test(
+    name = "mkfsxfs_live_test",
+    size = "medium",
+    srcs = ["test/mkfsxfs_live_test.sh"],
+    args = [
+        "$(rootpath //userland/cmd/mkfsxfs:mkfsxfs_host)",
+        "$(rootpath :xfs_probe)",
+    ],
+    data = [
+        ":xfs_probe",
+        "//userland/cmd/mkfsxfs:mkfsxfs_host",
+    ],
+    tags = ["manual"],
 )
 
 cc_test(
@@ -479,6 +673,16 @@ minikern_rootfs(
 minikern_rootfs(
     name = "netboot_rootfs",
     init = "//userland/cmd/netbootinit",
+)
+
+minikern_rootfs(
+    name = "xfstest_rootfs",
+    init = "//userland/cmd/xfstest",
+)
+
+minikern_rootfs(
+    name = "nbdtest_rootfs",
+    init = "//userland/cmd/nbdtest",
 )
 
 minikern_rootfs(
@@ -646,6 +850,45 @@ sh_test(
     tags = ["manual"],
 )
 
+# P9.1 end to end: a Go program on the board reads and writes a volume that
+# is a file on the server, over our TCP and our NBD client, and the host
+# checks the file afterwards byte for byte.
+sh_test(
+    name = "nbd_qemu_test",
+    size = "medium",
+    srcs = ["test/nbd_qemu_test.sh"],
+    args = [
+        "$(rootpath :minikern.uImage)",
+        "$(rootpath :nbdtest_rootfs)",
+        "$(rootpath //server/cmd/nbdserver)",
+    ],
+    data = [
+        ":minikern.uImage",
+        ":nbdtest_rootfs",
+        "//server/cmd/nbdserver",
+    ],
+    tags = ["manual"],
+)
+
+# P9.3 end to end: the board formats an XFS filesystem over the network,
+# mounts it, reads it back — and then Linux's xfs_repair judges the file.
+sh_test(
+    name = "xfs_qemu_test",
+    size = "medium",
+    srcs = ["test/xfs_qemu_test.sh"],
+    args = [
+        "$(rootpath :minikern.uImage)",
+        "$(rootpath :xfstest_rootfs)",
+        "$(rootpath //server/cmd/nbdserver)",
+    ],
+    data = [
+        ":minikern.uImage",
+        ":xfstest_rootfs",
+        "//server/cmd/nbdserver",
+    ],
+    tags = ["manual"],
+)
+
 # Boots the real image under qemu-system-arm and checks the boot log. Needs
 # QEMU and the cross toolchain on the host, hence manual.
 sh_test(
@@ -663,13 +906,21 @@ sh_test(
     tags = ["manual"],
 )
 
-# Every QEMU test, by name, since manual targets escape wildcards:
+# Every test that needs a host tool — QEMU, clang's sanitizers, qemu-nbd —
+# by name, since manual targets escape wildcards:
 #   bazel test //:qemu_tests
 test_suite(
     name = "qemu_tests",
     tags = ["manual"],
     tests = [
         ":boot_qemu_test",
+        ":nbd_qemu_test",
+        ":mkfsxfs_live_test",
+        ":xfs_live_test",
+        ":xfs_qemu_test",
+        ":xfs_sanitized_test",
+        ":nbd_server_live_test",
+        ":net_nbd_live_test",
         ":cve_syscall_qemu_test",
         ":net_qemu_test",
         ":netboot_qemu_test",

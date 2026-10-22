@@ -67,4 +67,10 @@ selftest() {
 selftest undef "undefined instruction"
 selftest dabt "data abort"
 selftest pabt "prefetch abort"
+
+# The DMA window's cacheable alias is unmapped when the window is created, so
+# that no physical page is reachable under two cacheabilities. Reading it by
+# its linear address must abort — the half of that fix QEMU can judge.
+selftest dma-alias "data abort"
+expect "reading the retired dma alias at 0xc"
 echo PASS

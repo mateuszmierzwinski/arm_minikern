@@ -9,6 +9,27 @@ Legend: `[x]` done · `[ ]` to do · `[~]` partial
 
 ---
 
+## The order, and why (operator, 2026-10-22)
+
+1. **P0.9, the real NEO, before anything concurrent.** SMP bugs are memory-ordering
+   bugs, and QEMU's TCG reproduces neither Cortex-A7 reordering, nor caches, nor real
+   interrupt timing; writing SMP before the board has booted is debugging two
+   unknowns at once. **Operator-blocked**: it needs the board, U-Boot installed (root)
+   and the serial adapter.
+2. **The cheap wins** — P7.5 DNS, P8.9 `clock_settime`, P8.10 a writable `/tmp`,
+   P8.11 a watchdog. Each is small and removes a reason this is awkward to use.
+3. **P9, XFS over NBD.**
+4. **P10, SMP**, stage 1 only, until profiling argues for more.
+5. **P11, thermal before frequency scaling.** On the H3, DVFS is a thermal tool
+   rather than a power one.
+6. **P5.5, signing the netboot offer**: the gate between a lab toy and something
+   that could be deployed.
+7. **P8.1, `fork`/`execve`/`wait4`**, and with them a test that runs Go's `os/exec`
+   on the board — the last of the named extras, because every other item above is
+   independent of it.
+
+---
+
 ## P0 — Boot (it starts, it talks, it knows where it is)
 
 - [x] **P0.1 Toolchain and image (2026-10-21).** A project-local platform plus a
@@ -156,17 +177,31 @@ Legend: `[x]` done · `[ ]` to do · `[~]` partial
       lossy, duplicating, reordering wire, and 12 hostile-input cases.
 - [x] **P7.4 The milestone**, `net_sockets_qemu_test`: Go's `net` over UDP and TCP in
       both directions, including a full HTTP client and server inside the guest.
-- [ ] P7.5 DNS, so Go can dial a name rather than an address (the lease already
-      carries the resolver).
+- [ ] **P7.5 DNS**, so Go can dial a name rather than an address. No kernel
+      resolver: synthesize `/etc/resolv.conf` from the DHCP DNS option and let Go's
+      pure-Go resolver do the rest in user space.
 - [ ] P7.6 `SO_RCVTIMEO`/`SO_SNDTIMEO` and `poll`/`select`, for programs that are
       not Go.
 
 ## P8 — Hardening and gaps (found on the way)
 
-- [ ] `fork`/`execve`/`wait4`: there is one process today. Go's `os/exec` needs them.
+- [ ] **P8.1 `fork`/`execve`/`wait4`**: there is one process today. Go's `os/exec`
+      needs them, and the proof is a QEMU test in which a Go program starts another
+      program, pipes to it and reaps it.
 - [ ] TCP congestion control (it sends what the peer's window allows, which is
       right on a LAN and wrong on a WAN), SACK, and out-of-order reassembly.
+- [x] **The DMA window's cache state (2026-10-22).** `page_alloc` zeroes through the
+      cacheable linear map, so handing that memory to a device left dirty lines to be
+      written back over a packet later. It is cleaned and invalidated before the
+      attributes change, and the cacheable alias unmapped so no page is reachable
+      under two cacheabilities. `minikern.selftest=dma-alias` proves the alias faults.
+      *Learned:* a QEMU-only test suite cannot see a cache bug at all (CLAUDE.md §10).
 - [ ] An RTC driver (the H3 has one, and so does QEMU) instead of `minikern.epoch=`.
+- [ ] **P8.9 `clock_settime`**, so an NTP client written in Go can fix the clock and
+      `minikern.epoch=` can go (the NEO's RTC has no battery anyway).
+- [ ] **P8.10 A writable `/tmp`** (tmpfs): a lot of Go code assumes it can write
+      somewhere.
+- [ ] **P8.11 A watchdog driver**, needed before this ever runs unattended.
 - [ ] A real entropy source (the H3 crypto engine's PRNG, or timing jitter): today's
       `getrandom` is xoshiro128** seeded from the timer and chip ID, which is fine for
       hash seeds and not fine for keys.
@@ -175,3 +210,72 @@ Legend: `[x]` done · `[ ]` to do · `[~]` partial
 - [ ] Out-of-memory policy: today a fault that cannot get a page kills the process.
 - [ ] Relative `..` in paths, symlinks with relative targets.
 - [ ] The VFP state is saved on every switch. Make it lazy once switches are frequent.
+
+---
+
+## P9 — XFS over the network (NBD)
+
+The volume is a file on the server and the board mounts it over the network. XFS is
+the right choice here **because Linux can check our work**: `mkfs.xfs` makes the test
+images, `xfs_repair -n` judges whether what we wrote is still a valid filesystem, and
+`xfs_db` inspects any structure. The hard rule, in CI: **`xfs_repair -n` is clean
+after every test.**
+
+- [x] **P9.1 The block layer (2026-10-22).** An NBD client over our own TCP (newstyle fixed
+      handshake; `NBD_CMD_READ`/`WRITE`/`FLUSH`/`DISC`), a buffer cache over it, and
+      `/dev/nbd0` so a userland program can reach the volume. The server is Go,
+      serving an image file. Tested both ways round — our client against `qemu-nbd`
+      as a reference server, and our server against a reference client — so neither
+      end is only ever checked by the other. *Done:* `core/nbd.c` (20 hostile
+      cases), `core/bcache.c` (13), the Go server (8 targets incl. its CVE
+      suite), both live tests, and `nbd_qemu_test` end to end with the host
+      verifying the image byte for byte. *Learned:* a refused export must
+      leave the handshake open, which only a reference client revealed; and
+      anything dialling out at boot must wait for the DHCP lease first.
+- [x] **P9.2 Read-only mount (2026-10-22).** v5 images from Linux `mkfs.xfs` with a minimal
+      feature set: `crc` and `finobt` on, `reflink` and `rmap` off. Superblock and AG
+      headers, the inode btree, extent-format files, shortform and block directories.
+      **Refuse to mount a dirty log, or any unsupported feature flag.** That refusal
+      is what keeps it non-destructive.
+- [x] **P9.3 mkfs, in Go, in userland (2026-10-22)**, writing to `/dev/nbd0`.
+      Formatting does not belong in the kernel, it is far easier to write in Go, and
+      `xfs_repair` validates the result. *Done:* `userland/internal/xfsmk` (the same
+      package formats a file on the build machine and `/dev/nbd0` on the board),
+      `mkfsxfs`, a `mount` syscall and `kernel/xfsfs.c` so a Go program can mount
+      what it wrote, and `xfs_qemu_test`: the board formats a 512 MiB filesystem
+      over the network, mounts it, reads it, and **xfs_repair on the host finds
+      nothing wrong with it**. *Learned:* five numbers came from xfs_repair's own
+      complaints rather than from any document (XFS.md §7) — among them that the log
+      record header's cycle-data array is 64 entries, not 56.
+- [ ] **P9.4 Writes.** The log first. No log recovery at first: keep refusing a dirty
+      log and let Linux `xfs_repair` deal with a crash until replay exists.
+
+---
+
+## P10 — SMP across the four cores
+
+Stage 1 is a big kernel lock on purpose. The payoff is Go running `GOMAXPROCS=4` in
+*user* space, and this kernel spends little time in itself.
+
+- [ ] **P10.1 Bring up CPUs 1–3** with PSCI `CPU_ON` (U-Boot provides PSCI on the
+      H3): a GIC CPU interface, generic timer, stack and current-thread pointer each.
+- [ ] **P10.2 One spinlock around the kernel**, replacing "IRQs masked = locked"
+      (CLAUDE.md §2). TLB maintenance becomes the broadcast forms (`TLBIMVAIS` and
+      friends), plus a reschedule IPI.
+- [ ] **P10.3 Fix what the single-core assumption bought.** `futex` and the scheduler
+      are where the bugs will be.
+- [ ] **P10.4 Finer locks only where profiling says so** — likely futex, the network
+      stack, the run queue. Not designed up front.
+
+---
+
+## P11 — Thermal, then frequency scaling
+
+- [ ] **P11.1 The THS thermal sensor and a throttle policy.** Four A7s at full clock
+      on a NEO with no heatsink overheat, which is what makes this the first half.
+- [ ] **P11.2 Frequency changes**: reprogram PLL_CPUX and switch VDD_CPUX. On the NEO
+      that regulator is GPIO-switched and two-level, so there are two voltage tiers
+      rather than a curve. **Take the operating points from mainline's H3 OPP table;
+      do not invent them.**
+- [ ] **P11.3 A governor last, and least.** `wfi` in idle plus PSCI `CPU_OFF` for
+      unused cores saves more on this chip than frequency stepping does.

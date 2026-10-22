@@ -26,6 +26,7 @@
 #include "kernel/irq.h"
 #include "kernel/mem.h"
 #include "kernel/net.h"
+#include "kernel/nbd.h"
 #include "kernel/netboot.h"
 #include "kernel/panic.h"
 #include "kernel/proc.h"
@@ -213,6 +214,55 @@ static uint32_t cmdline_number(const char *key, uint32_t fallback) {
     return n;
 }
 
+/* Splits "<ip>[:<port>][/<export>]" into its three parts. The export name
+ * may be empty, which asks the server for its default volume. */
+static int parse_nbd_target(const char *s, size_t len, ip4_t *ip, uint16_t *port, char *name, uint32_t cap) {
+    size_t at = 0;
+    uint32_t i = 0;
+    while (at < len && s[at] != ':' && s[at] != '/') {
+        at++;
+    }
+    if (ip4_parse(s, (uint32_t)at, ip) != KERR_OK) {
+        return KERR_INVAL;
+    }
+    if (at < len && s[at] == ':') {
+        uint32_t n = 0;
+        for (at++; at < len && s[at] >= '0' && s[at] <= '9'; at++) {
+            n = n * 10u + (uint32_t)(s[at] - '0');
+        }
+        if (n == 0 || n > 65535u) {
+            return KERR_INVAL;
+        }
+        *port = (uint16_t)n;
+    }
+    at += at < len && s[at] == '/' ? 1u : 0u;
+    for (; at < len && i + 1 < cap; at++, i++) {
+        name[i] = s[at];
+    }
+    name[i] = '\0';
+    return at == len ? KERR_OK : KERR_INVAL;
+}
+
+/* minikern.nbd=<ip>[:<port>][/<export>]: attaches a network block device as
+ * /dev/nbd0 before init runs, so a program can format, mount, read or
+ * write it. A failure is reported and the boot carries on: the volume is
+ * not the root filesystem. */
+static void attach_nbd(void) {
+    size_t len = 0;
+    const char *v = cmdline_value(boot_cmdline, "minikern.nbd", &len);
+    char name[32];
+    ip4_t ip = 0;
+    uint16_t port = KNBD_DEFAULT_PORT;
+    if (v == NULL) {
+        return;
+    }
+    if (parse_nbd_target(v, len, &ip, &port, name, sizeof name) != KERR_OK) {
+        kprintf("nbd: minikern.nbd=\"%.*s\" is not <ip>[:<port>][/<export>], ignored\n", (int)len, v);
+        return;
+    }
+    (void)knbd_connect(ip, port, name);
+}
+
 /* The network: the EMAC under the stack, then DHCP in the background.
  * minikern.net=off leaves it down. */
 static void bring_up_network(void) {
@@ -244,6 +294,7 @@ static void init_exited(void *self, const struct proc *p) {
     (void)self;
     if (cmdline_equals(boot_cmdline, "minikern.netstat", "1")) {
         knet_report();
+        knbd_report();
     }
     if ((p->exit_status & 0x7f) != 0) {
         kprintf("minikern: init killed by signal %d\n", p->exit_status & 0x7f);
@@ -332,6 +383,7 @@ static bool start_init(const struct bootinfo *info) {
         kprintf("minikern: no root filesystem, nothing to run\n");
         return false;
     }
+    attach_nbd();
     init_path(path, sizeof path);
     proc_set_exit_hook(&hook);
     envc = build_env(envp, ENV_MAX);

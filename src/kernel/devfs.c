@@ -84,22 +84,32 @@ static const struct file_ops zero_ops = {.read = zero_read, .write = sink_write}
 static const struct file_ops full_ops = {.read = zero_read, .write = full_write};
 static const struct file_ops random_ops = {.read = random_read, .write = sink_write};
 
-/* One /dev entry: its name, ops and device number. */
+/* One /dev entry. mode of 0 means an ordinary character device; a size of
+ * 0 means a stream, which is what every built-in node is. */
 struct dev_node {
     const char *name;
     const struct file_ops *ops;
     uint32_t rdev;
+    uint32_t mode;
+    uint32_t size;
 };
 
+/* Nodes registered at run time (devfs_register). Four is more than the
+ * board has devices to discover. */
+#define DEV_DYNAMIC_MAX 4u
+
+static struct dev_node dynamic[DEV_DYNAMIC_MAX];
+static uint32_t dynamic_count;
+
 static const struct dev_node nodes[] = {
-    {"console", &console_ops, (5u << 8) | 1u},
-    {"tty", &console_ops, (5u << 8) | 0u},
-    {"ttyS0", &console_ops, (DEV_TTY_MAJOR << 8) | 64u},
-    {"null", &null_ops, (DEV_MEM_MAJOR << 8) | 3u},
-    {"zero", &zero_ops, (DEV_MEM_MAJOR << 8) | 5u},
-    {"full", &full_ops, (DEV_MEM_MAJOR << 8) | 7u},
-    {"random", &random_ops, (DEV_MEM_MAJOR << 8) | 8u},
-    {"urandom", &random_ops, (DEV_MEM_MAJOR << 8) | 9u},
+    {.name = "console", .ops = &console_ops, .rdev = (5u << 8) | 1u},
+    {.name = "tty", .ops = &console_ops, .rdev = (5u << 8) | 0u},
+    {.name = "ttyS0", .ops = &console_ops, .rdev = (DEV_TTY_MAJOR << 8) | 64u},
+    {.name = "null", .ops = &null_ops, .rdev = (DEV_MEM_MAJOR << 8) | 3u},
+    {.name = "zero", .ops = &zero_ops, .rdev = (DEV_MEM_MAJOR << 8) | 5u},
+    {.name = "full", .ops = &full_ops, .rdev = (DEV_MEM_MAJOR << 8) | 7u},
+    {.name = "random", .ops = &random_ops, .rdev = (DEV_MEM_MAJOR << 8) | 8u},
+    {.name = "urandom", .ops = &random_ops, .rdev = (DEV_MEM_MAJOR << 8) | 9u},
 };
 
 static const char *const aliases[] = {"stdin", "stdout", "stderr"};
@@ -118,12 +128,39 @@ void devfs_set_console(const struct console_port *out, const struct console_inpu
 }
 
 static struct file *open_node(const struct dev_node *n, uint32_t flags) {
-    struct file *f = file_new_memory(n->ops, NULL, 0, S_IFCHR | 0666u);
+    struct file *f = file_new_memory(n->ops, NULL, n->size, n->mode != 0 ? n->mode : S_IFCHR | 0666u);
     if (f != NULL) {
         f->rdev = n->rdev;
         f->flags = flags;
     }
     return f;
+}
+
+/* The node called name, built-in or registered, or NULL. */
+static const struct dev_node *find_node(const char *name) {
+    for (uint32_t i = 0; i < sizeof nodes / sizeof nodes[0]; i++) {
+        if (str_eq(name, nodes[i].name)) {
+            return &nodes[i];
+        }
+    }
+    for (uint32_t i = 0; i < dynamic_count; i++) {
+        if (str_eq(name, dynamic[i].name)) {
+            return &dynamic[i];
+        }
+    }
+    return NULL;
+}
+
+int devfs_register(const char *name, const struct file_ops *ops, uint32_t rdev, uint32_t mode, uint32_t size) {
+    if (find_node(name) != NULL) {
+        return KERR_EXIST;
+    }
+    if (dynamic_count == DEV_DYNAMIC_MAX) {
+        return KERR_NOMEM;
+    }
+    dynamic[dynamic_count++] =
+        (struct dev_node){.name = name, .ops = ops, .rdev = rdev, .mode = mode, .size = size};
+    return KERR_OK;
 }
 
 struct file *devfs_console_file(uint32_t flags) {
@@ -137,11 +174,10 @@ int devfs_open(const char *name, uint32_t flags, struct file **out, int *alias_f
             return VFS_ALIAS;
         }
     }
-    for (uint32_t i = 0; i < sizeof nodes / sizeof nodes[0]; i++) {
-        if (str_eq(name, nodes[i].name)) {
-            *out = open_node(&nodes[i], flags);
-            return *out == NULL ? KERR_NOMEM : KERR_OK;
-        }
+    const struct dev_node *node = find_node(name);
+    if (node != NULL) {
+        *out = open_node(node, flags);
+        return *out == NULL ? KERR_NOMEM : KERR_OK;
     }
     if (name[0] == '\0') {
         *out = file_new_memory(&null_ops, NULL, 0, S_IFDIR | 0755u);

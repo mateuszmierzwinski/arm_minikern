@@ -21,6 +21,19 @@ void mmu_clear_user(void);
  * aligned) with the given section attributes. */
 void mmu_map_kernel_section(uint32_t virt, uint32_t phys, uint32_t attrs);
 
+/* Removes one 1 MiB section from the kernel half, so every access to it
+ * faults. Used to retire a mapping whose memory is reached another way. */
+void mmu_unmap_kernel_section(uint32_t virt);
+
+/* Cleans and invalidates [virt, virt+len) to the point of coherency: what
+ * the caches hold for that memory is written back and then dropped.
+ *
+ * This is what has to happen before the same physical memory is used
+ * through a non-cacheable mapping (a DMA window). A dirty line left behind
+ * is written back whenever the cache feels like evicting it — long after
+ * the handover, over whatever the device has put there since. */
+void mmu_flush_dcache_range(const void *virt, uint32_t len);
+
 /* Flushes every TLB entry; called after any change to a live table. */
 void mmu_flush_tlb(void);
 

@@ -2,6 +2,8 @@
 
 #include "core/console.h"
 #include "core/net/tcp.h"
+#include "core/errno.h"
+#include "kernel/irq.h"
 #include "kernel/random.h"
 #include "kernel/time.h"
 
@@ -94,6 +96,17 @@ void knet_report(void) {
             t->connections, t->retransmits, t->resets_sent, t->drop_checksum, t->drop_malformed,
             t->drop_no_socket, t->drop_out_of_window, t->drop_out_of_order, t->drop_backlog_full,
             t->drop_bad_reset);
+}
+
+int knet_wait_address(uint32_t timeout_ms) {
+    uint64_t deadline = time_monotonic_ns() / 1000000u + timeout_ms;
+    while (knet.nif.ip == 0) {
+        if (time_monotonic_ns() / 1000000u >= deadline) {
+            return KERR_TIMEDOUT;
+        }
+        irq_wait();
+    }
+    return KERR_OK;
 }
 
 struct netif *knet_interface(void) {

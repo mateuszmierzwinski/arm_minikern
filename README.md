@@ -54,7 +54,7 @@ Prerequisites, on Fedora:
 
 ```bash
 sudo dnf install gcc-arm-linux-gnu binutils-arm-linux-gnu uboot-tools dtc \
-                 qemu-system-arm clang tinygo
+                 qemu-system-arm qemu-img libnbd xfsprogs clang tinygo
 ```
 
 Plus **Bazel 9** (`.bazelversion` pins 9.2.0; bazelisk picks it up). The gc Go
@@ -63,8 +63,8 @@ host Go is needed for them. TinyGo is optional — only the TinyGo targets need 
 it wants a host Go between 1.19 and 1.25, whose path is `TINYGO_GOROOT` in
 [`toolchain/paths.bzl`](toolchain/paths.bzl): **edit that line to your own install.**
 
-The image (`minikern.elf`, `.bin` and `.uImage`), the 21 host test targets, and the
-10 further ones that need QEMU:
+The image (`minikern.elf`, `.bin` and `.uImage`), the 30 host test targets, and the
+17 further ones that need QEMU, `qemu-nbd` or xfsprogs:
 
 ```bash
 bazel build //:minikern
@@ -76,7 +76,10 @@ The QEMU tests shell out to host tools, so they are tagged `manual` and a wildca
 build never runs them — **run `:qemu_tests` by name after any change.** They cover
 both boot paths, the deliberate exceptions, a TinyGo and a gc hello-world, the Go ABI
 suite, 42 hostile syscalls, the network milestone, Go's sockets, a complete netboot,
-and every network test again under ASan and UBSan.
+every network test again under ASan and UBSan, our NBD client against `qemu-nbd` and
+our NBD server against `nbdinfo`, `nbdcopy` and `qemu-io`, the XFS reader against
+filesystems `mkfs.xfs` made, and the board formatting a filesystem over the network
+for `xfs_repair` to judge.
 
 Boot it by hand with a Go program as init:
 
@@ -104,7 +107,8 @@ Ctrl-A X quits. The guest answers UDP on port 7 (echo). Forward it with
 | `minikern.selftest=undef\|dabt\|pabt` | take that exception on purpose |
 | `minikern.net=off` | leave the network down |
 | `minikern.netboot[=<ip>]` | fetch the root filesystem over the network; with an address, probe only that one |
-| `minikern.netstat=1` | print the network counters when init exits |
+| `minikern.nbd=<ip>[:<port>][/<export>]` | attach a network block device as `/dev/nbd0` (NBD, port 10809 by default) |
+| `minikern.netstat=1` | print the network and block-cache counters when init exits |
 | `minikern.env.NAME=VALUE` | put `NAME=VALUE` in init's environment |
 
 ## Netbooting
@@ -140,6 +144,36 @@ offer is signed (`NETBOOT.md` §5, `TASKS.md` P5.5). The server does carry the
 amplification defence a block protocol needs — a random session token the client
 echoes on every request, so a forged source address cannot aim 16 KiB of traffic at
 a victim with a 24-byte datagram.
+
+## Storage over the network
+
+The volume is a file on a server, reached over **NBD** — a protocol everything else
+already speaks, so each end of ours is tested against a reference implementation
+rather than only against the other end:
+
+```bash
+bazel build //server/cmd/nbdserver
+mkdir -p /tmp/volumes && truncate -s 512M /tmp/volumes/vol.img
+bazel run //server/cmd/nbdserver -- -volumes /tmp/volumes &
+# then boot with minikern.nbd=<your address>:10809/vol
+```
+
+On the board, `/dev/nbd0` is an ordinary file to a Go program: open it, seek it,
+read and write it. A Go program can **format** it as XFS
+(`userland/internal/xfsmk`) and the kernel can **mount** it:
+
+```go
+syscall.Mount("/dev/nbd0", "/mnt", "xfs", syscall.MS_RDONLY, "")
+```
+
+XFS was chosen because **Linux can check our work**: `mkfs.xfs` makes the test
+images, `xfs_repair -n` says whether what we wrote is still a valid filesystem, and
+`xfs_db` prints any structure in doubt. That is the standard the tests hold it to —
+including one in which the board formats a filesystem over the network and
+`xfs_repair` on the host finds nothing wrong with it. The reader is read-only and
+**refuses** anything it does not fully understand: a feature flag it has not heard
+of, a dirty log, a btree-format fork. [`XFS.md`](XFS.md) has the measured on-disk
+facts and the whole support matrix.
 
 ## Writing an init
 
@@ -181,6 +215,8 @@ they are the first thing that will need a scope and a serial cable.
   architecture and its rules, what "Go binaries run unchanged" actually requires
   (measured, syscall by syscall), and every pitfall this project has already paid for.
 - [`NETBOOT.md`](NETBOOT.md) — the MKNB protocol, wire format and threat model.
+- [`XFS.md`](XFS.md) — how this kernel reads and writes XFS, what it refuses, and
+  the on-disk facts it was built from, measured rather than assumed.
 - [`TASKS.md`](TASKS.md) — the phased plan, what is done and what is next.
 
 ## License

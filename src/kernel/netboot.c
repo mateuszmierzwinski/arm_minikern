@@ -24,19 +24,6 @@ static uint64_t now_ms(void) {
     return time_monotonic_ns() / 1000000u;
 }
 
-/* Idles with interrupts open until the lease arrives. */
-static int wait_for_lease(struct netif *nif) {
-    uint64_t deadline = now_ms() + LEASE_WAIT_MS;
-    while (nif->ip == 0) {
-        if (now_ms() >= deadline) {
-            kprintf("netboot: no address after %u s, giving up\n", LEASE_WAIT_MS / 1000u);
-            return KERR_TIMEDOUT;
-        }
-        irq_wait();
-    }
-    return KERR_OK;
-}
-
 /* Reports what was fetched, with the digest the server named. */
 static void report_image(const struct netboot *nb) {
     char ip[16], hex[65];
@@ -108,7 +95,10 @@ static int begin(struct netif *nif, const uint32_t board_id[4], ip4_t pinned, ui
 int knetboot_fetch(const uint32_t board_id[4], ip4_t pinned, const uint8_t **image, uint32_t *len) {
     struct netif *nif = knet_interface();
     uint8_t *buf;
-    int rc = wait_for_lease(nif);
+    int rc = knet_wait_address(LEASE_WAIT_MS);
+    if (rc != KERR_OK) {
+        kprintf("netboot: no address after %u s, giving up\n", LEASE_WAIT_MS / 1000u);
+    }
     if (rc != KERR_OK) {
         return rc;
     }
