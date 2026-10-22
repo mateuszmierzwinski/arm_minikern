@@ -138,10 +138,15 @@ kernel on 2026-10-21:
   the driver sets exactly those bits and they read back. They had been written off as
   "unverified on silicon" together with the PHY-select register, which was three
   things treated as one — the gates and resets are in the block QEMU models.
-- System-control `EMAC_EPHY_CLK_REG` (`0x01C00030`) selects the internal PHY,
-  powers it up and sets its MDIO address (1). The bit layout must be checked against
-  the datasheet. This register is the difference between "link up" and "nothing" on
-  real hardware, while QEMU does not model it at all.
+- System-control `EMAC_EPHY_CLK_REG` (`0x01C00030`) selects the internal PHY, powers
+  it up and sets its MDIO address (1). **Every field is corroborated** against an
+  implementation that runs on this hardware (2026-10-22): address at bit 20, clock
+  selection at bit 18 (1 = 24 MHz), internal-PHY select at bit 15, and bit 16 is
+  *shutdown*, active high — so the value is `0x148000` and leaving bit 16 clear is
+  what powers the PHY up. The low bits select MII/RGMII and are 0 for MII, which the
+  internal PHY needs. What is **not** verified is the effect: QEMU stubs this block,
+  dropping the write and reading back the reset value `0x58000`, which has shutdown
+  set. This register is the difference between "link up" and "nothing" on a board.
 - **Pin controllers: there are two.** PA..PH are the main one (`0x01C20800`); **PL is
   port 0 of the always-on one** (`0x01F02C00`), which needs its clock ungated from the
   R_CCU (`0x01F01400 + 0x28`, bit 0) first. That matters because **the CPU-supply

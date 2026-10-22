@@ -53,8 +53,12 @@ static void report_emac_clocks(void) {
             mmio(H3_CCU_BASE, CCU_BUS_RST0));
     kprintf("hw: ccu bus_gate4 %08x (internal PHY gate is bit 0)\n", mmio(H3_CCU_BASE, CCU_BUS_GATE4));
     kprintf("hw: ccu bus_rst2  %08x (internal PHY reset is bit 2)\n", mmio(H3_CCU_BASE, CCU_BUS_RST2));
-    kprintf("hw: syscon ephy_clk %08x at 01c00030 — **the register QEMU does not model**: "
-            "on silicon it selects the internal PHY, powers it and sets its MDIO address\n",
+    /* Expected after the driver has run: PHY address 1 at bit 20, the
+     * 24 MHz clock at bit 18, internal-PHY select at bit 15, and shutdown
+     * (bit 16) **clear**. QEMU drops writes to this block, so it shows the
+     * reset value 00058000 here — which has shutdown set, i.e. no PHY. */
+    kprintf("hw: syscon ephy_clk %08x at 01c00030 (expected 00148000: addr 1, 24 MHz, internal, "
+            "not shut down; QEMU drops the write and shows 00058000)\n",
             mmio(H3_SYSCON_BASE, SYSCON_EPHY_CLK));
 }
 

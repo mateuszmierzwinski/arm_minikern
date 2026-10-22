@@ -64,10 +64,27 @@
 #define CCU_EMAC_BIT     (1u << 17)
 #define CCU_EPHY_BIT     (1u << 0)
 #define CCU_EPHY_RST_BIT (1u << 2)
+/* The system-control register that decides whether there is a PHY at all.
+ *
+ * Every field here is **corroborated** against an implementation that runs
+ * on this hardware (2026-10-22, CLAUDE.md §3): the PHY address at bit 20,
+ * the clock selection at bit 18 (1 = 24 MHz, which is what the internal PHY
+ * wants), the internal-PHY select at bit 15, and bit 16 as *shutdown* —
+ * active high, so leaving it clear is what powers the PHY up. The register
+ * is written whole rather than read-modify-written, which is what that
+ * implementation does on this path too; the MII/RGMII selection bits in the
+ * low end are then 0, which is the MII setting the internal PHY needs.
+ *
+ * What remains unverified is not the value but its **effect**: QEMU stubs
+ * this block, so the write is dropped and a readback gives the reset value
+ * (`0x58000` — which has shutdown *set*, so writing this register is the
+ * difference between a PHY and nothing). Only a board can show that it
+ * takes. */
 #define SYSCON_EPHY_CLK  0x30u
 #define EPHY_ADDR_SHIFT  20u
-#define EPHY_CLK_24M     (1u << 18)
-#define EPHY_SELECT_INT  (1u << 15)
+#define EPHY_CLK_24M     (1u << 18)   /* 1: 24 MHz, 0: 25 MHz */
+#define EPHY_SELECT_INT  (1u << 15)   /* 1: internal PHY, 0: external */
+#define EPHY_SHUTDOWN    (1u << 16)   /* 1: shutdown — left clear on purpose */
 
 /* PHY registers (IEEE 802.3 clause 22). */
 #define MII_BMCR         0u
@@ -131,6 +148,8 @@ static void power_on(void) {
     io_set(H3_CCU_BASE + CCU_BUS_GATE4, CCU_EPHY_BIT);
     io_set(H3_CCU_BASE + CCU_BUS_RST0, CCU_EMAC_BIT);
     io_set(H3_CCU_BASE + CCU_BUS_RST2, CCU_EPHY_RST_BIT);
+    /* EPHY_SHUTDOWN is deliberately absent: the reset value has it set, and
+     * clearing it is what powers the internal PHY up. */
     *(volatile uint32_t *)io_virt(H3_SYSCON_BASE + SYSCON_EPHY_CLK) =
         (INTERNAL_PHY_ADDR << EPHY_ADDR_SHIFT) | EPHY_CLK_24M | EPHY_SELECT_INT;
 }

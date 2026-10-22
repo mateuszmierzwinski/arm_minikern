@@ -295,7 +295,11 @@ Three registers and a pin are all that is left unverified, and they are the ones
 no model to check them against:
 
 - **`EMAC_EPHY_CLK_REG` (`0x01C00030`)**, which selects the internal PHY, powers it
-  and sets its MDIO address. On a board this register is the difference between "link
+  and sets its MDIO address. Its *value* is corroborated field by field against an
+  implementation that runs on this hardware (`0x148000`: address 1, 24 MHz clock,
+  internal PHY, and shutdown left clear); what a board has to show is that the write
+  **takes effect**, since QEMU drops it and reads back the reset value `0x58000`,
+  which has shutdown set. On a board this one register is the difference between "link
   up" and nothing. (The EMAC's clock gates and resets are *not* in this category —
   they live in the clock block, which QEMU does model, and all four are verified.)
 - **Which of two temperature conversions the silicon means.** The datasheet gives

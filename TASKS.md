@@ -131,11 +131,20 @@ Legend: `[x]` done · `[ ]` to do · `[~]` partial
       the main controller, wrong about the chip), which pinned the bug in place. PL now
       routes to the always-on controller at `0x01F02C00`, with its R_CCU gate ungated
       first — the same trap the sensor fell into.
-      **What is left, and why it cannot be done here** — one register and one constant:
-      the syscon PHY-select register (`01c00030`; QEMU stubs that block, so the write
-      is dropped and the readback is the reset value), and which of the two temperature
-      conversions the silicon means, which is the same question as whether the sensor
-      produces samples at all. So `minikern.cpufreq=on` has still never read a real
+      **The PHY-select register's value is now corroborated too** (2026-10-22), field
+      by field, against an implementation that runs on this hardware: address at bit
+      20, clock selection at bit 18 (1 = 24 MHz), internal-PHY select at bit 15, and
+      bit 16 is *shutdown*, active high — so `0x148000`, with bit 16 left clear to
+      power the PHY up, and the low MII/RGMII bits at 0 as the internal PHY needs.
+      Writing the register whole rather than read-modify-write is what that
+      implementation does on this path as well. So the open question is no longer
+      "is the value right" but "does the write take", which only a board can show:
+      QEMU drops it and reads back the reset value `0x58000` — which has shutdown
+      *set*, i.e. no PHY at all.
+      **What is left, and why it cannot be done here** — two measurements, not two
+      unknowns: whether that register write takes effect on silicon, and which of the
+      two temperature conversions the die actually follows, which is the same question
+      as whether the sensor produces samples at all. So `minikern.cpufreq=on` has still never read a real
       temperature, and the banner has never appeared on the NEO's own header. That
       needs the board, a 3.3 V serial adapter and root to write a card — and then one
       command: boot the card with `minikern.hwreport=1` and read the report.
