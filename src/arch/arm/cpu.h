@@ -2,6 +2,7 @@
 #ifndef MINIKERN_ARCH_ARM_CPU_H
 #define MINIKERN_ARCH_ARM_CPU_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #define ARM_MODE_MASK 0x1fu
@@ -38,7 +39,22 @@ struct vfp_state {
     uint32_t fpscr;
 };
 
+/* The cycle counter the virtual timer counts on, read as 32 bits: its low
+ * bits are what a timing sample is made of (kernel/entropy.h). */
+static inline uint32_t arm_cycle_counter(void) {
+    uint32_t lo, hi;
+    __asm__ volatile("mrrc p15, 1, %0, %1, c14" : "=r"(lo), "=r"(hi));
+    (void)hi;
+    return lo;
+}
+
 void arm_vfp_enable(void);
+
+/* Switches the unit off for the running thread, so that its next
+ * floating-point instruction traps; and asks whether it is on. Together
+ * they are how the VFP state is moved only when it is used. */
+void arm_vfp_off(void);
+bool arm_vfp_is_on(void);
 void arm_vfp_save(struct vfp_state *s);
 void arm_vfp_restore(const struct vfp_state *s);
 

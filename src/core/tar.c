@@ -64,20 +64,63 @@ static void append(char *out, uint32_t *at, const uint8_t *src, uint32_t n) {
     out[*at] = '\0';
 }
 
+/* True when the next component of path is exactly `name`. */
+static bool component_is(const char *path, const char *name) {
+    uint32_t i = 0;
+    for (; name[i] != '\0'; i++) {
+        if (path[i] != name[i]) {
+            return false;
+        }
+    }
+    return path[i] == '/' || path[i] == '\0';
+}
+
+/* Drops the last component already written to out. */
+static uint32_t drop_last(char *out, uint32_t n) {
+    while (n > 0 && out[n - 1] != '/') {
+        n--;
+    }
+    return n > 0 ? n - 1u : 0; /* and the slash before it */
+}
+
+/* Normalises a path: no leading slashes, no "." components, and ".."
+ * resolved against what came before it.
+ *
+ * Resolving ".." here rather than refusing it is what makes a relative path
+ * usable — `../etc/motd` is an ordinary thing for a program to open — and
+ * doing it **before** anything looks at the name is what stops it being a
+ * way out of the root: ".." at the top has nothing to remove, so it folds
+ * away rather than escaping. A path that is all ".." is the root itself. */
 int tar_normalise(const char *path, char *out) {
     uint32_t n = 0;
-    while (path[0] == '/' || (path[0] == '.' && path[1] == '/')) {
-        path += path[0] == '/' ? 1 : 2;
+    while (*path == '/') {
+        path++;
     }
-    while (path[n] != '\0') {
-        if (n + 1u >= TAR_NAME_MAX) {
-            return KERR_NAMETOOLONG;
+    while (*path != '\0') {
+        if (component_is(path, ".")) {
+            path += path[1] == '/' ? 2 : 1;
+            continue;
         }
-        out[n] = path[n];
-        n++;
-    }
-    while (n > 0 && out[n - 1] == '/') {
-        n--;
+        if (component_is(path, "..")) {
+            n = drop_last(out, n);
+            path += path[2] == '/' ? 3 : 2;
+            continue;
+        }
+        if (n > 0) {
+            if (n + 1u >= TAR_NAME_MAX) {
+                return KERR_NAMETOOLONG;
+            }
+            out[n++] = '/';
+        }
+        while (*path != '\0' && *path != '/') {
+            if (n + 1u >= TAR_NAME_MAX) {
+                return KERR_NAMETOOLONG;
+            }
+            out[n++] = *path++;
+        }
+        while (*path == '/') {
+            path++;
+        }
     }
     out[n] = '\0';
     return KERR_OK;

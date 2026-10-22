@@ -126,19 +126,92 @@ tinygo_binary = rule(
     attrs = {"src": attr.label(mandatory = True, allow_single_file = [".go"])},
 )
 
-def minikern_rootfs(name, init, **kwargs):
+def minikern_rootfs(name, init, extra = None, **kwargs):
     """A ustar root filesystem: init as /init (mode 0755) plus userland/rootfs.
+
+    `extra` maps further labels to the paths they take inside the archive,
+    for a root filesystem that has to carry something besides its init —
+    the board that serves a netboot image needs that image in it.
 
     Tagged manual: init may come from a host tool (TinyGo).
     """
+    files = {
+        init: "init",
+        "//:userland/rootfs/etc/motd": "etc/motd",
+    }
+    files.update(extra or {})
     pkg_tar(
         name = name,
         empty_dirs = ["etc"],
-        files = {
-            init: "init",
-            "//:userland/rootfs/etc/motd": "etc/motd",
+        files = files,
+        # Two symbolic links, one of each kind, so that every root
+        # filesystem carries something for the resolver to resolve: an
+        # absolute target and a **relative** one, which is the half that
+        # needs the link's own directory to be taken into account.
+        symlinks = {
+            "etc/motd.link": "/etc/motd",
+            "etc/motd.rel": "motd",
         },
         modes = {"init": "0755"},
         tags = ["manual"],
         **kwargs
     )
+
+# Whether this build stamps a build number into the kernel.
+#
+# Master Rule 28.1 says the build part of MAJOR.MINOR.BUILD comes from
+# Bazel's own stamp on a `--stamp` build, and is 0 otherwise. That rule is
+# written for Go, where `x_defs` with `{BUILD_TIMESTAMP}` resolves to 0 by
+# itself. A C rule cannot ask whether `--stamp` was passed — the Starlark
+# call that answers it is private API — so the opt-in here is a build
+# setting of our own with the same shape and the same default:
+#
+#     bazel build --//:stamp //...:minikern
+#
+# A release build passes it; every other build gets 0, which says plainly
+# that it does not know rather than printing a number that means nothing.
+StampInfo = provider(doc = "Whether to stamp a build number.", fields = ["value"])
+
+def _stamp_flag_impl(ctx):
+    return [StampInfo(value = ctx.build_setting_value)]
+
+stamp_flag = rule(
+    implementation = _stamp_flag_impl,
+    build_setting = config.bool(flag = True),
+    doc = "--//...:stamp — put the build time in the kernel's version.",
+)
+
+def _build_stamp_impl(ctx):
+    """A C file holding the build number, which is the clock's (Rule 28).
+
+    The number is Bazel's own build timestamp rather than anything in the
+    tree, so two builds of one series are always ordered and nobody chooses
+    a build number by hand.
+
+    The stamp file is an input only when stamping. Depending on it otherwise
+    would make every ordinary build re-run this action — and relink the
+    kernel — for a number that build is not allowed to use.
+    """
+    out = ctx.actions.declare_file(ctx.label.name + ".c")
+    stamping = ctx.attr._stamp[StampInfo].value
+    ctx.actions.run_shell(
+        inputs = [ctx.version_file] if stamping else [],
+        outputs = [out],
+        command = """set -e
+ts=0
+if [ -n "$1" ]; then
+    ts=$(awk '$1 == "BUILD_TIMESTAMP" { print $2 }' "$1")
+fi
+printf '#include "board/h3/version.h"\n\nconst uint32_t minikern_build = %su;\n' "${ts:-0}" > "$2"
+""",
+        arguments = [ctx.version_file.path if stamping else "", out.path],
+        mnemonic = "MinikernStamp",
+        progress_message = "Writing the build number into %s" % out.short_path,
+    )
+    return [DefaultInfo(files = depset([out]))]
+
+build_stamp = rule(
+    implementation = _build_stamp_impl,
+    attrs = {"_stamp": attr.label(default = "//:stamp")},
+    doc = "A C file defining minikern_build: the build time, or 0 without --//...:stamp.",
+)

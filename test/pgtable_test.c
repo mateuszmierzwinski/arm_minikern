@@ -119,8 +119,26 @@ static void test_out_of_tables(void) {
     KTEST_CHECK(pgtable_map(&pt, 0x10000u, 0x40000000u, PT_READ) == KERR_NOMEM);
 }
 
+/* A page with no permissions stays mapped: that is what lets a program
+ * protect a region and unprotect it without losing what it holds, and it is
+ * the whole difference between this and dropping the page. */
+static void a_page_with_no_permissions_is_still_mapped(void) {
+    uint32_t pa = 0, prot = 0xff;
+    fresh();
+    KTEST_CHECK(pgtable_map(&pt, 0x20000u, 0x41000000u, PT_READ | PT_WRITE) == KERR_OK);
+    KTEST_CHECK(pgtable_protect(&pt, 0x20000u, 0) == KERR_OK);
+    KTEST_CHECK(pgtable_lookup(&pt, 0x20000u, &pa, &prot) == KERR_OK);
+    KTEST_CHECK(pa == 0x41000000u); /* the same frame, still there */
+    KTEST_CHECK(prot == 0);         /* and nothing user space may do with it */
+    /* And back again, with the frame unchanged. */
+    KTEST_CHECK(pgtable_protect(&pt, 0x20000u, PT_READ | PT_WRITE) == KERR_OK);
+    KTEST_CHECK(pgtable_lookup(&pt, 0x20000u, &pa, &prot) == KERR_OK);
+    KTEST_CHECK(pa == 0x41000000u && prot == (PT_READ | PT_WRITE));
+}
+
 int main(void) {
     KTEST_RUN(test_map_and_lookup);
+    KTEST_RUN(a_page_with_no_permissions_is_still_mapped);
     KTEST_RUN(test_descriptor_encoding);
     KTEST_RUN(test_rejects_bad_requests);
     KTEST_RUN(test_unmap_range);

@@ -105,17 +105,20 @@ int mm_unmap(struct mm *mm, uint32_t addr, uint32_t len) {
 /* Re-applies a range's region rights to the pages already mapped in it.
  * PROT_NONE cannot be expressed by a present page, so those pages are
  * dropped (their contents with them: a documented limitation). */
+/* Applies a region's new protection to the pages of it that are resident.
+ *
+ * A protection of **none** keeps them: the page table can say "mapped, and
+ * user space may not touch it" (arch/arm/pgtable.c), so a program that
+ * protects a region and then unprotects it finds what it left there. Giving
+ * the pages back instead would hand it zeroes, which is a different
+ * program's behaviour. */
 static void reprotect_pages(struct mm *mm, uint32_t start, uint32_t end, uint32_t prot) {
     for (uint32_t va = start; va < end; va += PAGE) {
         uint32_t pa, old;
         if (pgtable_lookup(&mm->pt, va, &pa, &old) != KERR_OK) {
             continue;
         }
-        if (prot == 0) {
-            pgtable_unmap_range(&mm->pt, va, va + PAGE, release_frame, NULL);
-        } else {
-            pgtable_protect(&mm->pt, va, prot);
-        }
+        pgtable_protect(&mm->pt, va, prot);
     }
 }
 

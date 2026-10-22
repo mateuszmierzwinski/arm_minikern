@@ -200,6 +200,205 @@ static int32_t sys_epoll_wait(struct trapframe *tf) {
     }
 }
 
+/* ── poll and select ──────────────────────────────────────────────────────
+ *
+ * Go does not use either: its netpoller is epoll, which is why epoll came
+ * first. Everything else does — a shell, a C program, anything ported — and
+ * the two of them are the same question asked twice, so they share the
+ * waiting, the readiness and the deadline below.
+ */
+
+#define POLL_MAX_FDS 64u /* what one call may ask about */
+
+/* poll's bits, which are not epoll's. */
+#define POLLIN_BIT   0x001u
+#define POLLOUT_BIT  0x004u
+#define POLLERR_BIT  0x008u
+#define POLLHUP_BIT  0x010u
+#define POLLNVAL_BIT 0x020u
+
+/* One pollfd as user space lays it out: fd, what to watch, what happened. */
+struct user_pollfd {
+    int32_t fd;
+    uint16_t events;
+    uint16_t revents;
+};
+
+/* What a descriptor can say right now, in poll's bits.
+ *
+ * A descriptor that is not open is POLLNVAL rather than an error for the
+ * whole call: one bad entry in a list of sixty must not blind the caller to
+ * the other fifty-nine. */
+static uint16_t poll_state(struct proc *p, int32_t fd, uint16_t want) {
+    uint32_t ready;
+    struct file *f = fd >= 0 && (uint32_t)fd < PROC_MAX_FDS ? p->fds[fd] : NULL;
+    if (fd < 0) {
+        return 0; /* a negative fd is ignored, as poll(2) says */
+    }
+    if (f == NULL) {
+        return POLLNVAL_BIT;
+    }
+    ready = f->ops->poll != NULL ? f->ops->poll(f) : (EPOLLIN | EPOLLOUT);
+    uint16_t out = 0;
+    out |= (ready & EPOLLIN) != 0 && (want & POLLIN_BIT) != 0 ? POLLIN_BIT : 0;
+    out |= (ready & EPOLLOUT) != 0 && (want & POLLOUT_BIT) != 0 ? POLLOUT_BIT : 0;
+    /* Errors and hangups are reported whether they were asked for or not. */
+    out |= (ready & EPOLLERR) != 0 ? POLLERR_BIT : 0;
+    out |= (ready & EPOLLHUP) != 0 ? POLLHUP_BIT : 0;
+    return out;
+}
+
+/* Fills in revents for every entry and counts the ready ones. */
+static int32_t poll_scan(struct proc *p, struct user_pollfd *fds, uint32_t n) {
+    int32_t ready = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        fds[i].revents = poll_state(p, fds[i].fd, fds[i].events);
+        ready += fds[i].revents != 0 ? 1 : 0;
+    }
+    return ready;
+}
+
+/* The shared body of poll and select: scan, and sleep until something
+ * changes or the deadline passes. `deadline` of 0 means wait for ever, and
+ * a negative timeout is how both calls spell that. */
+static int32_t poll_wait(struct proc *p, struct user_pollfd *fds, uint32_t n, int32_t timeout_ms) {
+    uint64_t deadline = timeout_ms > 0 ? time_monotonic_ns() + (uint64_t)timeout_ms * 1000000ull : 0;
+    for (;;) {
+        int32_t ready = poll_scan(p, fds, n);
+        int rc;
+        if (ready != 0 || timeout_ms == 0) {
+            return ready;
+        }
+        rc = sched_sleep(vfs_poll_channel(), 0, deadline, true);
+        if (rc == KERR_INTR) {
+            return KERR_INTR;
+        }
+        if (rc == KERR_TIMEDOUT) {
+            return poll_scan(p, fds, n);
+        }
+    }
+}
+
+static int32_t sys_poll(struct trapframe *tf) {
+    struct user_pollfd fds[POLL_MAX_FDS];
+    uint32_t n = tf->r[1];
+    struct proc *p = proc_current();
+    int32_t ready;
+    if (n > POLL_MAX_FDS) {
+        return KERR_INVAL;
+    }
+    if (n > 0 && mm_copy_in(p->mm, fds, tf->r[0], n * (uint32_t)sizeof fds[0]) != KERR_OK) {
+        return KERR_FAULT;
+    }
+    ready = poll_wait(p, fds, n, (int32_t)tf->r[2]);
+    if (ready < 0) {
+        return ready;
+    }
+    if (n > 0 && mm_copy_out(p->mm, tf->r[0], fds, n * (uint32_t)sizeof fds[0]) != KERR_OK) {
+        return KERR_FAULT;
+    }
+    return ready;
+}
+
+/* select's three bitmaps, which are the same question in an older shape.
+ *
+ * It is built on poll rather than beside it: one implementation of "what is
+ * ready, and how long will you wait" is enough, and two would drift. */
+#define SELECT_WORDS ((POLL_MAX_FDS + 31u) / 32u)
+
+/* Turns the bitmaps into pollfds, and says how many there are. */
+static uint32_t select_to_poll(const uint32_t *r, const uint32_t *w, const uint32_t *e, uint32_t nfds,
+                               struct user_pollfd *fds) {
+    uint32_t n = 0;
+    for (uint32_t fd = 0; fd < nfds; fd++) {
+        uint16_t want = 0;
+        want |= (r[fd / 32u] >> (fd % 32u)) & 1u ? POLLIN_BIT : 0;
+        want |= (w[fd / 32u] >> (fd % 32u)) & 1u ? POLLOUT_BIT : 0;
+        want |= (e[fd / 32u] >> (fd % 32u)) & 1u ? POLLERR_BIT : 0;
+        if (want != 0) {
+            fds[n].fd = (int32_t)fd;
+            fds[n].events = want;
+            fds[n].revents = 0;
+            n++;
+        }
+    }
+    return n;
+}
+
+/* And back again. select counts a descriptor once per bitmap it is ready
+ * in, which is not how poll counts, so the total is recomputed here. */
+static int32_t poll_to_select(const struct user_pollfd *fds, uint32_t n, uint32_t *r, uint32_t *w,
+                              uint32_t *e) {
+    int32_t ready = 0;
+    for (uint32_t i = 0; i < SELECT_WORDS; i++) {
+        r[i] = 0;
+        w[i] = 0;
+        e[i] = 0;
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t fd = (uint32_t)fds[i].fd, bit = 1u << (fd % 32u);
+        if ((fds[i].revents & (POLLIN_BIT | POLLHUP_BIT)) != 0) {
+            r[fd / 32u] |= bit;
+            ready++;
+        }
+        if ((fds[i].revents & POLLOUT_BIT) != 0) {
+            w[fd / 32u] |= bit;
+            ready++;
+        }
+        if ((fds[i].revents & (POLLERR_BIT | POLLNVAL_BIT)) != 0) {
+            e[fd / 32u] |= bit;
+            ready++;
+        }
+    }
+    return ready;
+}
+
+/* A timeval, which is what select measures its patience in. */
+struct user_timeval {
+    uint32_t sec;
+    uint32_t usec;
+};
+
+static int32_t sys_select(struct trapframe *tf) {
+    uint32_t sets[3][SELECT_WORDS];
+    struct user_pollfd fds[POLL_MAX_FDS];
+    struct user_timeval tv = {0, 0};
+    struct proc *p = proc_current();
+    uint32_t nfds = tf->r[0], n;
+    int32_t timeout = -1, ready;
+    if (nfds > POLL_MAX_FDS) {
+        return KERR_INVAL;
+    }
+    for (uint32_t i = 0; i < 3u; i++) {
+        uint32_t uaddr = tf->r[1u + i];
+        for (uint32_t w = 0; w < SELECT_WORDS; w++) {
+            sets[i][w] = 0;
+        }
+        if (uaddr != 0 && mm_copy_in(p->mm, sets[i], uaddr, SELECT_WORDS * 4u) != KERR_OK) {
+            return KERR_FAULT;
+        }
+    }
+    if (tf->r[4] != 0) {
+        if (mm_copy_in(p->mm, &tv, tf->r[4], sizeof tv) != KERR_OK) {
+            return KERR_FAULT;
+        }
+        timeout = (int32_t)(tv.sec * 1000u + tv.usec / 1000u);
+    }
+    n = select_to_poll(sets[0], sets[1], sets[2], nfds, fds);
+    ready = poll_wait(p, fds, n, timeout);
+    if (ready < 0) {
+        return ready;
+    }
+    ready = poll_to_select(fds, n, sets[0], sets[1], sets[2]);
+    for (uint32_t i = 0; i < 3u; i++) {
+        if (tf->r[1u + i] != 0 &&
+            mm_copy_out(p->mm, tf->r[1u + i], sets[i], SELECT_WORDS * 4u) != KERR_OK) {
+            return KERR_FAULT;
+        }
+    }
+    return ready;
+}
+
 /* eventfd: a 64-bit counter; read takes it (or 1 in semaphore mode). */
 struct eventfd {
     uint64_t count;
@@ -277,6 +476,8 @@ static int32_t sys_eventfd2(struct trapframe *tf) {
 }
 
 const struct syscall_entry sys_poll_table[] = {
+    {142, "select", sys_select},
+    {168, "poll", sys_poll},
     {250, "epoll_create", sys_epoll_create1},
     {251, "epoll_ctl", sys_epoll_ctl},
     {252, "epoll_wait", sys_epoll_wait},

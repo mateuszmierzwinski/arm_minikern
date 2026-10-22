@@ -12,7 +12,13 @@
 #define L2_NORMAL_WB  0x44cu         /* TEX=001 C=1 B=1 S=1 */
 #define L2_AP_USER_RW 0x030u         /* APX=0 AP=11 */
 #define L2_AP_USER_RO 0x220u         /* APX=1 AP=10 */
-#define L2_APX        0x200u
+/* APX=0 AP=01: the kernel may touch it, user space may not. This is how a
+ * page with no permissions stays **mapped**: dropping it instead would
+ * throw away what it holds, so a program that protects a region and then
+ * unprotects it would find it zeroed (mm.c). */
+#define L2_AP_USER_NONE 0x010u
+#define L2_AP_MASK      0x230u
+#define L2_APX          0x200u
 #define L2_NG         0x800u
 #define PAGE_MASK     0xfffff000u
 #define USER_LIMIT    0x80000000u
@@ -32,7 +38,11 @@ static uint32_t l2_index(uint32_t va) {
 /* The descriptor bits for prot. */
 static uint32_t page_bits(uint32_t prot) {
     uint32_t bits = L2_SMALL | L2_NORMAL_WB | L2_NG;
-    bits |= (prot & PT_WRITE) ? L2_AP_USER_RW : L2_AP_USER_RO;
+    if (prot == 0) {
+        bits |= L2_AP_USER_NONE | L2_XN;
+    } else {
+        bits |= (prot & PT_WRITE) ? L2_AP_USER_RW : L2_AP_USER_RO;
+    }
     if ((prot & PT_EXEC) == 0) {
         bits |= L2_XN;
     }
@@ -40,7 +50,11 @@ static uint32_t page_bits(uint32_t prot) {
 }
 
 static uint32_t page_prot(uint32_t desc) {
-    uint32_t prot = PT_READ;
+    uint32_t prot;
+    if ((desc & L2_AP_MASK) == L2_AP_USER_NONE) {
+        return 0; /* mapped, and nothing user space may do with it */
+    }
+    prot = PT_READ;
     prot |= (desc & L2_APX) ? 0u : PT_WRITE;
     prot |= (desc & L2_XN) ? 0u : PT_EXEC;
     return prot;
@@ -114,9 +128,11 @@ int pgtable_lookup(const struct pgtable *pt, uint32_t va, uint32_t *pa, uint32_t
 
 int pgtable_protect(struct pgtable *pt, uint32_t va, uint32_t prot) {
     uint32_t *slot = mapped_slot(pt, va);
-    if (slot == NULL || prot == 0) {
-        return slot == NULL ? KERR_NOENT : KERR_INVAL;
+    if (slot == NULL) {
+        return KERR_NOENT;
     }
+    /* A protection of none is a protection, not an error: the page stays
+     * where it is and user space loses every way of reaching it. */
     *slot = (*slot & PAGE_MASK) | page_bits(prot);
     return KERR_OK;
 }

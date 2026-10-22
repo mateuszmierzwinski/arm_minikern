@@ -89,9 +89,17 @@ void tcp_cancel_timer(struct tcp_conn *c) {
 
 /* How much may be sent now: what is queued, bounded by the peer's window
  * and one segment. A zero window still allows nothing but the FIN. */
+/* How much may be in flight: the smaller of what the peer will hold and
+ * what the path will carry. Sending the first alone is right on a cable
+ * with nothing else on it and wrong anywhere else (tcp.h). */
+static uint32_t allowed(const struct tcp_conn *c) {
+    return c->snd_wnd < c->cwnd ? c->snd_wnd : c->cwnd;
+}
+
 static uint32_t sendable(const struct tcp_conn *c) {
     uint32_t unsent = tcp_unsent(c);
-    uint32_t room = c->snd_wnd > tcp_in_flight(c) ? c->snd_wnd - tcp_in_flight(c) : 0u;
+    uint32_t limit = allowed(c);
+    uint32_t room = limit > tcp_in_flight(c) ? limit - tcp_in_flight(c) : 0u;
     uint32_t n = unsent < room ? unsent : room;
     return n < TCP_MSS ? n : TCP_MSS;
 }
@@ -147,6 +155,14 @@ static void resend_oldest(struct tcp_conn *c) {
 
 /* The timer fired: resend the oldest unacknowledged segment, back off, and
  * give up after TCP_RETRIES. */
+void tcp_retransmit_oldest(struct tcp_conn *c) {
+    if (tcp_in_flight(c) > 0) {
+        c->stack->stats.fast_retransmits++;
+        resend_oldest(c);
+        c->rto_at_ms = c->stack->now_ms + c->rto_ms;
+    }
+}
+
 void tcp_retransmit(struct tcp_conn *c) {
     if (tcp_in_flight(c) == 0) {
         tcp_cancel_timer(c);
@@ -157,6 +173,15 @@ void tcp_retransmit(struct tcp_conn *c) {
         return;
     }
     c->stack->stats.retransmits++;
+    /* A timeout is the strong signal: not one segment missing but nothing
+     * getting through, so the window goes back to one segment and slow
+     * start begins again from half of where it was. Anything gentler here
+     * is what turns a congested path into a collapsed one. */
+    c->ssthresh = tcp_in_flight(c) / 2u;
+    c->ssthresh = c->ssthresh < 2u * TCP_MSS ? 2u * TCP_MSS : c->ssthresh;
+    c->cwnd = TCP_MSS;
+    c->in_recovery = false;
+    c->dup_acks = 0;
     resend_oldest(c);
     c->rto_ms = c->rto_ms * 2u > TCP_RTO_MAX_MS ? TCP_RTO_MAX_MS : c->rto_ms * 2u;
     c->rto_at_ms = c->stack->now_ms + c->rto_ms;

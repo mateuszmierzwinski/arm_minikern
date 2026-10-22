@@ -46,16 +46,55 @@ static struct file *open_dir(const char *name) {
     return f;
 }
 
-/* Resolves path to an entry, following one symlink level (absolute targets
- * are taken from the root, relative ones from the link's directory: only
- * absolute targets are supported for now). */
-static int lookup(const char *path, struct tar_entry *e) {
-    int rc = tar_lookup(root, root_len, path, e);
-    if (rc == KERR_OK && e->type == TAR_SYMLINK) {
-        if (e->link[0] != '/') {
-            return KERR_NOENT;
+/* Where a relative symlink target points: the link's own directory, then
+ * the target, normalised — so `../lib/x` from `/usr/bin/tool` becomes
+ * `usr/lib/x`. Normalising is what resolves the `..`, and it is also what
+ * keeps the result inside the root (core/tar.h). */
+static int resolve_relative(const char *path, const char *target, char *out) {
+    char joined[TAR_NAME_MAX];
+    uint32_t at = 0, cut = 0;
+    for (uint32_t i = 0; path[i] != '\0'; i++) {
+        cut = path[i] == '/' ? i + 1u : cut;
+    }
+    for (; at < cut && at + 1u < sizeof joined; at++) {
+        joined[at] = path[at];
+    }
+    for (uint32_t i = 0; target[i] != '\0'; i++) {
+        if (at + 1u >= sizeof joined) {
+            return KERR_NAMETOOLONG;
         }
-        rc = tar_lookup(root, root_len, e->link, e);
+        joined[at++] = target[i];
+    }
+    joined[at] = '\0';
+    return tar_normalise(joined, out);
+}
+
+/* Resolves path to an entry, following symlinks.
+ *
+ * An absolute target is taken from the root and a relative one from the
+ * link's own directory, which is what every other system does and what a
+ * relative target is for. More than a few links deep is a loop — a link to
+ * itself is the easy case, and two links to each other the next — so the
+ * depth is bounded rather than trusted. */
+#define SYMLINK_MAX_DEPTH 8u
+
+static int lookup(const char *path, struct tar_entry *e) {
+    char resolved[TAR_NAME_MAX];
+    int rc = tar_lookup(root, root_len, path, e);
+    for (uint32_t depth = 0; rc == KERR_OK && e->type == TAR_SYMLINK; depth++) {
+        if (depth >= SYMLINK_MAX_DEPTH) {
+            return KERR_LOOP;
+        }
+        if (e->link[0] == '/') {
+            rc = tar_normalise(e->link, resolved);
+        } else {
+            rc = resolve_relative(path, e->link, resolved);
+        }
+        if (rc != KERR_OK) {
+            return rc;
+        }
+        path = resolved;
+        rc = tar_lookup(root, root_len, resolved, e);
     }
     return rc;
 }

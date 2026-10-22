@@ -66,6 +66,18 @@ expect "smp: 4 cores scheduling"
 expect "init exited with status 7"
 expect_cores_busy 4
 
+# The floating-point state is moved only when a thread uses it, which is
+# only worth doing if it really is less often than every switch. The kernel
+# reports both numbers so the claim can be checked rather than believed.
+line=$(grep -o 'vfp: state moved.*' "$log" | tail -1)
+moved=$(echo "$line" | awk '{print $4}')
+switches=$(echo "$line" | awk '{print $7}')
+echo "$line"
+[ "$moved" -gt 0 ] || { echo "FAIL: the lazy path was never taken, so nothing was tested" >&2; exit 1; }
+[ "$moved" -lt "$switches" ] ||
+    { echo "FAIL: it moved $moved times in $switches switches, which is not lazy" >&2; exit 1; }
+echo "ok: the floating-point state moved $moved times in $switches switches"
+
 # The same program on one core: it must still pass, and must be told the truth.
 boot smp_off " minikern.smp=off"
 expect "smp: not starting the other cores"

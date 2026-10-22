@@ -14,8 +14,10 @@
 #include "arch/arm/trap.h"
 #include "board/h3/emac.h"
 #include "board/h3/h3.h"
+#include "board/h3/rtc.h"
 #include "board/h3/sid.h"
 #include "board/h3/uart.h"
+#include "board/h3/version.h"
 #include "core/bootinfo.h"
 #include "core/cmdline.h"
 #include "core/console.h"
@@ -49,7 +51,7 @@
 #include "kernel/vfs.h"
 
 #ifndef MINIKERN_VERSION
-#define MINIKERN_VERSION "0.0.0"
+#define MINIKERN_VERSION "0.0"
 #endif
 
 /* 16 KiB — the most an ATAG list may span from r2 before we stop reading. */
@@ -310,6 +312,101 @@ static void bring_up_cores(void) {
 
 /* The network: the EMAC under the stack, then DHCP in the background.
  * minikern.net=off leaves it down. */
+/* One hex digit, or -1. */
+static int hex_digit(char c) {
+    if (c >= '0' && c <= '9') {
+        return c - '0';
+    }
+    if (c >= 'a' && c <= 'f') {
+        return c - 'a' + 10;
+    }
+    return c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+}
+
+/* Replaces the hardware address with `minikern.mac=`, if it is given.
+ *
+ * The address normally comes from the chip's own serial number, so a board
+ * keeps it across reboots and two boards never share one. **Under QEMU
+ * every machine has the same serial number**, so two guests on one segment
+ * get one address between them and neither can talk to the other — which is
+ * how the two-guest netboot test failed before this existed. On real
+ * hardware it is the operator's override and nothing more. */
+static void override_mac(uint8_t mac[6]) {
+    size_t len = 0;
+    const char *v = cmdline_value(boot_cmdline, "minikern.mac", &len);
+    uint8_t parsed[6];
+    uint32_t at = 0;
+    if (v == NULL) {
+        return;
+    }
+    for (uint32_t i = 0; i < 6u; i++) {
+        int hi = at < len ? hex_digit(v[at]) : -1;
+        int lo = at + 1u < len ? hex_digit(v[at + 1u]) : -1;
+        if (hi < 0 || lo < 0) {
+            kprintf("net: minikern.mac=\"%.*s\" is not six hex pairs, ignored\n", (int)len, v);
+            return;
+        }
+        parsed[i] = (uint8_t)((hi << 4) | lo);
+        at += 2u + (at + 2u < len && v[at + 2u] == ':' ? 1u : 0u);
+    }
+    for (uint32_t i = 0; i < 6u; i++) {
+        mac[i] = parsed[i];
+    }
+}
+
+/* A run of decimal digits, or `missing` when there are none. */
+static uint32_t digits_in(const char *text, size_t len, uint32_t missing) {
+    uint32_t v = 0, seen = 0;
+    for (size_t i = 0; i < len && text[i] >= '0' && text[i] <= '9'; i++) {
+        v = v * 10u + (uint32_t)(text[i] - '0');
+        seen++;
+    }
+    return seen == 0 ? missing : v;
+}
+
+/* An address-valued option, or 0 when it is absent or not an address. */
+static ip4_t option_address(const char *key) {
+    size_t len = 0;
+    const char *v = cmdline_value(boot_cmdline, key, &len);
+    ip4_t addr = 0;
+    if (v != NULL && ip4_parse(v, (uint32_t)len, &addr) != KERR_OK) {
+        kprintf("net: %s=\"%.*s\" is not an address, ignored\n", key, (int)len, v);
+        return 0;
+    }
+    return addr;
+}
+
+/* Brings the interface up from `minikern.ip=<addr>/<prefix>` when it is
+ * given, with `minikern.gw=` and `minikern.dns=` beside it, and says so.
+ * False when no address was given, which is the ordinary DHCP path.
+ *
+ * An address that will not parse stops the network rather than quietly
+ * falling back to DHCP: a board told to use one address and silently using
+ * another is worse than a board with no network. */
+static bool start_static_address(void) {
+    size_t len = 0;
+    const char *v = cmdline_value(boot_cmdline, "minikern.ip", &len);
+    ip4_t addr = 0, gateway = 0, dns = 0;
+    uint32_t prefix = 24, at = 0;
+    char ip[16];
+    if (v == NULL) {
+        return false;
+    }
+    while (at < len && v[at] != '/') {
+        at++;
+    }
+    if (ip4_parse(v, at, &addr) != KERR_OK) {
+        kprintf("net: minikern.ip=\"%.*s\" is not an address, leaving the network down\n", (int)len, v);
+        return true;
+    }
+    prefix = at < len ? digits_in(v + at + 1u, len - at - 1u, 24u) : 24u;
+    gateway = option_address("minikern.gw");
+    dns = option_address("minikern.dns");
+    knet_start_static(addr, prefix, gateway, dns); /* which prints the result */
+    (void)ip;
+    return true;
+}
+
 static void bring_up_network(void) {
     struct netdev_port dev = h3_emac_netdev();
     struct emac_link link;
@@ -321,6 +418,7 @@ static void bring_up_network(void) {
         return;
     }
     h3_emac_mac_from_id(chip_id, mac);
+    override_mac(mac);
     sink = knet_init(mac, &dev);
     rc = h3_emac_init(mac, &sink, &link);
     if (rc != KERR_OK) {
@@ -330,11 +428,33 @@ static void bring_up_network(void) {
     kprintf("net: eth0 %02x:%02x:%02x:%02x:%02x:%02x, phy %04x:%04x at %u, link up %s %s duplex\n", mac[0],
             mac[1], mac[2], mac[3], mac[4], mac[5], link.phy_id >> 16, link.phy_id & 0xffffu, link.phy_addr,
             link.speed_100 ? "100M" : "10M", link.full_duplex ? "full" : "half");
+    if (start_static_address()) {
+        return;
+    }
     random_fill(&xid, sizeof xid);
     knet_start(xid);
 }
 
 #define CPUFREQ_INTERVAL_MS 200u  /* decide five times a second */
+
+/* The wall clock the kernel starts with: the board's own clock when it
+ * holds a real date, and `minikern.epoch=` otherwise.
+ *
+ * The command line wins when it is given, because an operator who says what
+ * time it is has a reason — and because that is how the tests pin a time
+ * (P8.9). An unset clock reads as zeroes and is refused by the conversion
+ * rather than turned into 1970-something (board/h3/rtc.h). */
+static uint64_t boot_epoch(void) {
+    uint64_t given = cmdline_number("minikern.epoch", 0);
+    uint64_t rtc = h3_rtc_now();
+    if (given != 0) {
+        return given;
+    }
+    if (rtc != 0) {
+        kprintf("rtc: %llu seconds since 1970\n", (unsigned long long)rtc);
+    }
+    return rtc;
+}
 
 /* Starts the watchdog if the command line asks.
  *
@@ -583,12 +703,15 @@ static bool start_init(const struct bootinfo *info) {
 }
 
 void kmain(uint32_t r0, uint32_t machine, uint32_t r2, uint32_t entry_cpsr) {
-    struct console_port uart = h3_uart0_console();
+    struct console_port uart;
+    h3_uart0_init(); /* own the console rather than inherit it (board/h3/uart.h) */
+    uart = h3_uart0_console();
     struct bootinfo info;
     (void)r0;
     power = psci_power_port();
     console_attach(&uart);
-    kprintf("\nminikern %s (NanoPi NEO / Allwinner H3), machine %u\n", MINIKERN_VERSION, machine);
+    kprintf("\nminikern %s.%u (NanoPi NEO / Allwinner H3), machine %u\n", MINIKERN_VERSION,
+            minikern_build, machine);
     report_cpu(entry_cpsr);
     info = read_bootinfo(r2);
     boot_cmdline = info.cmdline;
@@ -597,7 +720,7 @@ void kmain(uint32_t r0, uint32_t machine, uint32_t r2, uint32_t entry_cpsr) {
     mem_init(&info, r2, info.block_size);
     report_boot(&info, r2);
     kprintf("mem: %u KiB free\n", mem_free_pages() * 4u);
-    bring_up_kernel(cmdline_number("minikern.epoch", 0));
+    bring_up_kernel(boot_epoch());
     bring_up_console_input(&uart);
     bring_up_cores();
     bring_up_network();
@@ -610,6 +733,11 @@ void kmain(uint32_t r0, uint32_t machine, uint32_t r2, uint32_t entry_cpsr) {
     if (!start_init(&info) && halt_requested()) {
         finish();
     }
+    /* An idle core may power itself off rather than idle in `wfi`, which
+     * on this chip saves more than stepping the clock (arch/arm/smp.h). It
+     * is off unless asked for: an emulator spends no power, so there is
+     * nothing here to measure. */
+    smp_allow_parking(cmdline_equals(boot_cmdline, "minikern.cpuoff", "1"));
     /* The last thing the boot path does: until now it has been in the
      * kernel without the lock, and a second core in there would race it
      * (klock.h rule 4). */

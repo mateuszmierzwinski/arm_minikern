@@ -3,7 +3,7 @@ load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
 load("@rules_shell//shell:sh_test.bzl", "sh_test")
 load("//:version.bzl", "MINIKERN_VERSION")
 load("@rules_pkg//pkg:tar.bzl", "pkg_tar")
-load(":minikern.bzl", "device_tree", "h3_init", "kernel_image", "minikern_rootfs")
+load(":minikern.bzl", "build_stamp", "device_tree", "h3_init", "kernel_image", "minikern_rootfs", "stamp_flag")
 
 # minikern — a from-scratch kernel for the NanoPi NEO (Allwinner H3).
 #
@@ -33,6 +33,13 @@ cc_library(
 
 # The frequency policy: pure, so it is host-tested, and separate from the
 # board adapters it decides for (which QEMU cannot judge at all).
+cc_library(
+    name = "caldate",
+    srcs = ["src/core/caldate.c"],
+    hdrs = ["src/core/caldate.h"],
+    strip_include_prefix = "src",
+)
+
 cc_library(
     name = "gpio",
     srcs = ["src/core/gpio.c"],
@@ -284,13 +291,24 @@ cc_library(
     alwayslink = True,
 )
 
+# The build number, from Bazel's stamp. Off by default, so an ordinary
+# build reports 0 rather than a number that means nothing (minikern.bzl).
+stamp_flag(
+    name = "stamp",
+    build_setting_default = False,
+)
+
+build_stamp(name = "build_stamp")
+
 cc_library(
     name = "board_h3",
     srcs = [
+        ":build_stamp",
         "src/board/h3/cpux.c",
         "src/board/h3/emac.c",
         "src/board/h3/main.c",
         "src/board/h3/pio.c",
+        "src/board/h3/rtc.c",
         "src/board/h3/sid.c",
         "src/board/h3/ths.c",
         "src/board/h3/wdt.c",
@@ -301,16 +319,19 @@ cc_library(
         "src/board/h3/emac.h",
         "src/board/h3/h3.h",
         "src/board/h3/pio.h",
+        "src/board/h3/rtc.h",
         "src/board/h3/sid.h",
         "src/board/h3/ths.h",
         "src/board/h3/wdt.h",
         "src/board/h3/uart.h",
+        "src/board/h3/version.h",
     ],
-    local_defines = ['MINIKERN_VERSION=\\"%s.0\\"' % MINIKERN_VERSION],
+    local_defines = ['MINIKERN_VERSION=\\"%s\\"' % MINIKERN_VERSION],
     strip_include_prefix = "src",
     target_compatible_with = _H3,
     deps = [
         ":arch_arm",
+        ":caldate",
         ":core",
         ":cpufreq",
         ":gpio",
@@ -434,6 +455,16 @@ cc_test(
     deps = [
         ":ktest",
         ":sha512",
+    ],
+)
+
+cc_test(
+    name = "caldate_test",
+    size = "small",
+    srcs = ["test/caldate_test.c"],
+    deps = [
+        ":caldate",
+        ":ktest",
     ],
 )
 
@@ -798,6 +829,19 @@ minikern_rootfs(
     init = "//userland/cmd/netbootinit",
 )
 
+# The board that serves a netboot image carries that image in its own root
+# filesystem: there is nothing else on the segment to get it from.
+minikern_rootfs(
+    name = "netbootsrv_rootfs",
+    extra = {":hello_gc_rootfs": "srv/default.tar"},
+    init = "//server/cmd/mknbserver_board",
+)
+
+minikern_rootfs(
+    name = "oomtest_rootfs",
+    init = "//userland/cmd/oomtest",
+)
+
 minikern_rootfs(
     name = "freqtest_rootfs",
     init = "//userland/cmd/freqtest",
@@ -921,6 +965,74 @@ sh_test(
     data = [
         ":exectest_rootfs",
         ":minikern.uImage",
+    ],
+    tags = ["manual"],
+)
+
+# P11.4: an idle core powers itself off, and comes back when work appears —
+# which on this chip saves more than stepping the clock does.
+sh_test(
+    name = "cpuoff_qemu_test",
+    size = "large",
+    srcs = ["test/cpuoff_qemu_test.sh"],
+    args = [
+        "$(rootpath :minikern.uImage)",
+        "$(rootpath :goabi_rootfs)",
+    ],
+    data = [
+        ":goabi_rootfs",
+        ":minikern.uImage",
+    ],
+    tags = ["manual"],
+)
+
+# Two boots of one image must not produce the same random bytes: the
+# mechanism that makes them differ is harvesting interrupt timing.
+sh_test(
+    name = "entropy_qemu_test",
+    size = "medium",
+    srcs = ["test/entropy_qemu_test.sh"],
+    args = [
+        "$(rootpath :minikern.uImage)",
+        "$(rootpath :goabi_rootfs)",
+    ],
+    data = [
+        ":goabi_rootfs",
+        ":minikern.uImage",
+    ],
+    tags = ["manual"],
+)
+
+# P5.6: discovery between two guests on a segment of their own, so that
+# "it found the server" stops meaning "it found the host".
+sh_test(
+    name = "netboot_two_guests_test",
+    size = "medium",
+    srcs = ["test/netboot_two_guests_test.sh"],
+    args = [
+        "$(rootpath :minikern.uImage)",
+        "$(rootpath :netbootsrv_rootfs)",
+    ],
+    data = [
+        ":minikern.uImage",
+        ":netbootsrv_rootfs",
+    ],
+    tags = ["manual"],
+)
+
+# The out-of-memory policy: hand out optimistically, then kill the process
+# that cannot be given a page — with SIGKILL, not a segmentation fault.
+sh_test(
+    name = "oom_qemu_test",
+    size = "medium",
+    srcs = ["test/oom_qemu_test.sh"],
+    args = [
+        "$(rootpath :minikern.uImage)",
+        "$(rootpath :oomtest_rootfs)",
+    ],
+    data = [
+        ":minikern.uImage",
+        ":oomtest_rootfs",
     ],
     tags = ["manual"],
 )
@@ -1155,6 +1267,10 @@ test_suite(
         ":go_abi_qemu_test",
         ":go_hello_qemu_test",
         ":cpufreq_qemu_test",
+        ":cpuoff_qemu_test",
+        ":entropy_qemu_test",
+        ":netboot_two_guests_test",
+        ":oom_qemu_test",
         ":watchdog_qemu_test",
         ":exec_qemu_test",
         ":smp_qemu_test",

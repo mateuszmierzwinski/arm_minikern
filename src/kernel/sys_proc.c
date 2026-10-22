@@ -9,6 +9,7 @@
 #include "kernel/proc.h"
 #include "kernel/random.h"
 #include "kernel/syscall.h"
+#include "kernel/vfp.h"
 
 #include <stddef.h>
 
@@ -216,7 +217,11 @@ static struct task *clone_thread(struct trapframe *tf, uint32_t flags) {
     child->tls = (flags & CLONE_SETTLS) ? tf->r[3] : parent->tls;
     child->sig_blocked = parent->sig_blocked;
     child->clear_child_tid = (flags & CLONE_CHILD_CLEARTID) ? tf->r[4] : 0;
-    arm_vfp_save(&child->vfp);
+    /* The child starts with the parent's floating-point state, which may
+     * be in the registers rather than in the parent's structure: asking the
+     * unit for it is the only way to copy what the parent actually has. */
+    vfp_capture(parent);
+    child->vfp = parent->vfp;
     proc_attach_thread(parent->proc, child);
     return child;
 }
@@ -243,7 +248,8 @@ static int32_t clone_vfork(struct trapframe *tf, uint32_t flags) {
     ctf->r[0] = 0;
     ctf->sp_usr = tf->r[1] != 0 ? tf->r[1] : tf->sp_usr;
     t->tls = sched_current()->tls;
-    arm_vfp_save(&t->vfp);
+    vfp_capture(sched_current());
+    t->vfp = sched_current()->vfp;
     proc_attach_thread(child, t);
     sched_start(t);
     /* The child's struct outlives its exit — it becomes a zombie, because

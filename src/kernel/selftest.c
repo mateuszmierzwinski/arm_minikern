@@ -57,6 +57,16 @@ static void take_wedge(void) {
     }
 }
 
+/* Prints the real-time clock's registers raw, so that what they hold can be
+ * compared with what the host says the time is. A measurement, not a
+ * driver: the layout is a datasheet claim until it is read back. */
+static void take_rtc(void) {
+    static const uint32_t RTC_BASE = 0x01F00000u;
+    for (uint32_t off = 0; off <= 0x14u; off += 4u) {
+        kprintf("selftest: rtc+%02x = %08x\n", off, *(volatile uint32_t *)io_virt(RTC_BASE + off));
+    }
+}
+
 /* One deliberate fault per name: the C form of master Rule 6.3, so adding
  * a case is a row rather than another branch. */
 static const struct {
@@ -68,6 +78,7 @@ static const struct {
     {"pabt", take_pabt},
     {"dma-alias", take_dma_alias},
     {"wedge", take_wedge},
+    {"rtc", take_rtc},
 };
 
 void selftest_run(const char *name, unsigned len) {

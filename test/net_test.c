@@ -60,7 +60,15 @@ static uint32_t udp_frame(uint8_t *f, const uint8_t *dst_mac, ip4_t src, ip4_t d
 }
 
 /* A DHCP reply of type msg offering yiaddr, with the usual options. */
+static uint32_t dhcp_reply_leased(uint8_t *f, uint8_t msg, ip4_t yiaddr, uint32_t with_xid,
+                                  const uint8_t *chaddr, uint32_t lease);
+
 static uint32_t dhcp_reply(uint8_t *f, uint8_t msg, ip4_t yiaddr, uint32_t with_xid, const uint8_t *chaddr) {
+    return dhcp_reply_leased(f, msg, yiaddr, with_xid, chaddr, 86400);
+}
+
+static uint32_t dhcp_reply_leased(uint8_t *f, uint8_t msg, ip4_t yiaddr, uint32_t with_xid,
+                                  const uint8_t *chaddr, uint32_t lease) {
     uint8_t m[300] = {0};
     uint32_t at = 240;
     m[0] = 2;
@@ -75,7 +83,7 @@ static uint32_t dhcp_reply(uint8_t *f, uint8_t msg, ip4_t yiaddr, uint32_t with_
     m[at++] = 1, m[at++] = 4, fp32(m + at, IP4(255, 255, 255, 0)), at += 4;
     m[at++] = 3, m[at++] = 4, fp32(m + at, IP4(10, 0, 2, 2)), at += 4;
     m[at++] = 6, m[at++] = 4, fp32(m + at, IP4(10, 0, 2, 3)), at += 4;
-    m[at++] = 51, m[at++] = 4, fp32(m + at, 86400), at += 4;
+    m[at++] = 51, m[at++] = 4, fp32(m + at, lease), at += 4;
     m[at] = 255;
     return udp_frame(f, our_mac, IP4(10, 0, 2, 2), IP4_BROADCAST, 67, 68, m, sizeof m);
 }
@@ -129,6 +137,118 @@ static void test_dhcp_conversation(void) {
     KTEST_CHECK(bound_calls == 1 && nif.ip == IP4(10, 0, 2, 15));
     KTEST_CHECK(nif.gateway == IP4(10, 0, 2, 2) && nif.mask == IP4(255, 255, 255, 0) && nif.dns == IP4(10, 0, 2, 3));
     KTEST_CHECK(nif.lease_s == 86400);
+}
+
+/* A lease is a loan with a term. These four cases are its clock: ask the
+ * granting server at half, ask anyone at seven eighths, and stop using the
+ * address when it runs out — an address past its lease is someone else's to
+ * hand out, and keeping it is a conflict rather than a convenience. */
+static void bind_with_lease(uint8_t *f, uint32_t lease) {
+    fresh();
+    dhcp_start(&nif, xid);
+    net_input(&nif, f, dhcp_reply_leased(f, 2, IP4(10, 0, 2, 15), xid, our_mac, lease));
+    net_input(&nif, f, dhcp_reply_leased(f, 5, IP4(10, 0, 2, 15), xid, our_mac, lease));
+    KTEST_CHECK(nif.ip == IP4(10, 0, 2, 15) && nif.dhcp.state == DHCP_BOUND);
+}
+
+/* Advances the clock and ticks, as the kernel's timer hook would, and
+ * answers any ARP request that goes out on the way.
+ *
+ * A renewal is sent **to the server**, so it needs that server's hardware
+ * address first — and this stack believes only ARP replies it asked for, so
+ * the request has to be answered for the renewal to leave at all. Which is
+ * the real behaviour, not an artefact of the test. */
+static void run_until(uint64_t ms) {
+    uint8_t f[ETH_FRAME_MAX];
+    for (uint64_t t = nif.now_ms; t <= ms; t += 100u) {
+        net_tick(&nif, t);
+        for (uint32_t i = 0; i < cap.n; i++) {
+            if (frame_is_arp_request(cap.frame[i], cap.len[i], IP4(10, 0, 2, 2))) {
+                uint32_t len = frame_arp_reply(f, cap.frame[i], IP4(10, 0, 2, 2), gw_mac);
+                cap.frame[i][12] = 0; /* answered: do not answer it again */
+                net_input(&nif, f, len);
+            }
+        }
+    }
+}
+
+/* The last DHCP message we sent, or -1. The frames in between are the ARP
+ * exchange a unicast renewal needs first. */
+static int last_dhcp_frame(void) {
+    for (uint32_t i = cap.n; i-- > 0;) {
+        if (cap.len[i] >= 42u + 240u && fg16(cap.frame[i] + 12) == 0x0800u &&
+            fg16(cap.frame[i] + 36) == 67u) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+static void test_dhcp_renews_at_half_the_lease(void) {
+    uint8_t f[ETH_FRAME_MAX];
+    int at;
+    bind_with_lease(f, 100);           /* T1 at 50 s, T2 at 87.5 s */
+    cap.n = 0;
+    run_until(40000);
+    KTEST_CHECK(cap.n == 0);           /* nothing yet: the lease is young */
+    run_until(56000);                  /* past T1, and past the first retry */
+    KTEST_CHECK(nif.dhcp.state == DHCP_RENEWING);
+    at = last_dhcp_frame();
+    KTEST_CHECK(at >= 0);
+    if (at < 0) {
+        return;
+    }
+    KTEST_CHECK(sent_dhcp_type((uint32_t)at) == 3);  /* REQUEST */
+    /* A renewal goes **to the server**, from our own address, and carries
+     * the address in ciaddr rather than as a requested-address option. */
+    KTEST_CHECK(fg32(cap.frame[at] + 14 + 12) == IP4(10, 0, 2, 15));
+    KTEST_CHECK(fg32(cap.frame[at] + 14 + 16) == IP4(10, 0, 2, 2));
+    KTEST_CHECK(fg32(cap.frame[at] + 42 + 12) == IP4(10, 0, 2, 15));
+}
+
+static void test_dhcp_rebinds_at_seven_eighths(void) {
+    uint8_t f[ETH_FRAME_MAX];
+    bind_with_lease(f, 100);
+    cap.n = 0;
+    run_until(90000);                  /* past T2, with no server answering */
+    KTEST_CHECK(nif.dhcp.state == DHCP_REBINDING);
+    /* Rebinding has stopped expecting that server: it asks the subnet. */
+    int at = last_dhcp_frame();
+    KTEST_CHECK(at >= 0 && fg32(cap.frame[at] + 14 + 16) == IP4_BROADCAST);
+    KTEST_CHECK(nif.ip == IP4(10, 0, 2, 15)); /* still ours until it expires */
+}
+
+static void test_dhcp_gives_the_address_up_when_the_lease_expires(void) {
+    uint8_t f[ETH_FRAME_MAX];
+    bind_with_lease(f, 100);
+    run_until(101000);
+    KTEST_CHECK(nif.ip == 0);          /* not ours: it must not be used */
+    KTEST_CHECK(nif.dhcp.state == DHCP_SELECTING);
+}
+
+/* An answered renewal puts the clock back and keeps the address, without
+ * the bound callback firing again — nothing above has changed. */
+static void test_an_answered_renewal_extends_the_lease(void) {
+    uint8_t f[ETH_FRAME_MAX];
+    bind_with_lease(f, 100);
+    run_until(51000);
+    KTEST_CHECK(nif.dhcp.state == DHCP_RENEWING);
+    net_input(&nif, f, dhcp_reply_leased(f, 5, IP4(10, 0, 2, 15), xid, our_mac, 100));
+    KTEST_CHECK(nif.dhcp.state == DHCP_BOUND);
+    KTEST_CHECK(nif.ip == IP4(10, 0, 2, 15));
+    cap.n = 0;
+    run_until(90000);
+    KTEST_CHECK(cap.n == 0);           /* the new T1 is 50 s away again */
+}
+
+/* A server that says no takes the address away: it must not be used while
+ * another is being looked for. */
+static void test_a_naked_renewal_drops_the_address(void) {
+    uint8_t f[ETH_FRAME_MAX];
+    bind_with_lease(f, 100);
+    run_until(51000);
+    net_input(&nif, f, dhcp_reply_leased(f, 6, IP4(10, 0, 2, 15), xid, our_mac, 100));
+    KTEST_CHECK(nif.ip == 0 && nif.dhcp.state == DHCP_SELECTING);
 }
 
 static void test_dhcp_retransmits_with_backoff(void) {
@@ -474,6 +594,11 @@ int main(void) {
     KTEST_RUN(test_ip4_parse);
     KTEST_RUN(test_checksum_rfc1071);
     KTEST_RUN(test_dhcp_conversation);
+    KTEST_RUN(test_dhcp_renews_at_half_the_lease);
+    KTEST_RUN(test_dhcp_rebinds_at_seven_eighths);
+    KTEST_RUN(test_dhcp_gives_the_address_up_when_the_lease_expires);
+    KTEST_RUN(test_an_answered_renewal_extends_the_lease);
+    KTEST_RUN(test_a_naked_renewal_drops_the_address);
     KTEST_RUN(test_dhcp_retransmits_with_backoff);
     KTEST_RUN(test_dhcp_rejects_foreign_replies);
     KTEST_RUN(test_dhcp_hostile_options);

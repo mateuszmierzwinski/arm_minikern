@@ -100,6 +100,26 @@ static void test_normalise(void) {
     memset(longp, 'a', sizeof longp - 1);
     longp[sizeof longp - 1] = '\0';
     KTEST_CHECK(tar_normalise(longp, out) == KERR_NAMETOOLONG);
+    /* ".." is resolved against what came before it, and at the top it has
+     * nothing to remove — so it folds away rather than escaping the root,
+     * which is what makes resolving it here safe. */
+    KTEST_CHECK(tar_normalise("a/b/../c", out) == KERR_OK);
+    KTEST_CHECK_STR(out, "a/c");
+    KTEST_CHECK(tar_normalise("a/b/..", out) == KERR_OK);
+    KTEST_CHECK_STR(out, "a");
+    KTEST_CHECK(tar_normalise("../etc/motd", out) == KERR_OK);
+    KTEST_CHECK_STR(out, "etc/motd");
+    KTEST_CHECK(tar_normalise("../../../../etc/motd", out) == KERR_OK);
+    KTEST_CHECK_STR(out, "etc/motd");
+    KTEST_CHECK(tar_normalise("..", out) == KERR_OK);
+    KTEST_CHECK_STR(out, "");
+    KTEST_CHECK(tar_normalise("a/../..", out) == KERR_OK);
+    KTEST_CHECK_STR(out, "");
+    KTEST_CHECK(tar_normalise("/a/./b/../../c/", out) == KERR_OK);
+    KTEST_CHECK_STR(out, "c");
+    /* A name that merely starts with dots is not a dot component. */
+    KTEST_CHECK(tar_normalise("..hidden/.x", out) == KERR_OK);
+    KTEST_CHECK_STR(out, "..hidden/.x");
 }
 
 int main(int argc, char **argv) {

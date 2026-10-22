@@ -6,6 +6,7 @@
 package main
 
 import (
+	"crypto/rand"
 	"fmt"
 	"os"
 	"runtime"
@@ -257,10 +258,18 @@ func clockSet(epoch int64) bool {
 	return true
 }
 
+// timers wants a timer that fires once and a ticker that fires repeatedly,
+// which is what the netpoller's deadline machinery is for.
+//
+// The intervals are generous on purpose: under emulation on a loaded host
+// the guest's clock can run in fits, and a tighter version of this failed
+// about one run in twenty for no reason in the kernel. What is being tested
+// is that both kinds of timer arrive and that time moves forward, not how
+// punctual an emulated board is.
 func timers() bool {
 	start := time.Now()
-	t := time.NewTimer(30 * time.Millisecond)
-	tick := time.NewTicker(5 * time.Millisecond)
+	t := time.NewTimer(100 * time.Millisecond)
+	tick := time.NewTicker(10 * time.Millisecond)
 	n := 0
 loop:
 	for {
@@ -273,7 +282,91 @@ loop:
 	}
 	tick.Stop()
 	el := time.Since(start)
-	return el >= 30*time.Millisecond && el < 2*time.Second && n >= 3
+	return el >= 100*time.Millisecond && el < 10*time.Second && n >= 3
+}
+
+// symlinks reads a file through both kinds of symbolic link, which is what
+// the kernel's resolver has to get right: an absolute target is taken from
+// the root and a relative one from the link's own directory.
+func symlinks() error {
+	want, err := os.ReadFile("/etc/motd")
+	if err != nil {
+		return err
+	}
+	for _, link := range []string{"/etc/motd.link", "/etc/motd.rel"} {
+		got, err := os.ReadFile(link)
+		if err != nil {
+			return fmt.Errorf("reading through %s: %w", link, err)
+		}
+		if string(got) != string(want) {
+			return fmt.Errorf("%s gave different contents", link)
+		}
+	}
+	// And a path with ".." in it, resolved against what came before.
+	got, err := os.ReadFile("/etc/../etc/motd")
+	if err != nil {
+		return fmt.Errorf("a path with .. in it: %w", err)
+	}
+	if string(got) != string(want) {
+		return fmt.Errorf("the path with .. gave different contents")
+	}
+	return nil
+}
+
+// protectNone proves that taking a region's permissions away keeps what it
+// holds: a program that protects a page and unprotects it must find its own
+// bytes, not zeroes. Go does not depend on this, which is exactly why it
+// needs a test of its own.
+func protectNone() error {
+	const size = 4096
+	m, err := syscall.Mmap(-1, 0, size, syscall.PROT_READ|syscall.PROT_WRITE,
+		syscall.MAP_PRIVATE|syscall.MAP_ANON)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = syscall.Munmap(m) }()
+	for i := range m {
+		m[i] = byte(i * 3)
+	}
+	if err = syscall.Mprotect(m, syscall.PROT_NONE); err != nil {
+		return fmt.Errorf("PROT_NONE: %w", err)
+	}
+	if err = syscall.Mprotect(m, syscall.PROT_READ|syscall.PROT_WRITE); err != nil {
+		return fmt.Errorf("back to read-write: %w", err)
+	}
+	for i := range m {
+		if m[i] != byte(i*3) {
+			return fmt.Errorf("byte %d is %#02x: the page was thrown away", i, m[i])
+		}
+	}
+	return nil
+}
+
+// randomness reports what getrandom gives, so that the test can compare
+// two boots: the kernel's old seed was the timer and a chip serial number
+// that QEMU makes the same every time, so two boots produced the same
+// bytes. Mixing in the times at which interrupts arrive is what changes
+// that, and two boots differing is the only way to show it from here.
+//
+// It prints rather than judges: one run cannot tell whether bytes are
+// unpredictable, and pretending otherwise is how a test comes to bless a
+// constant.
+func randomness() error {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return err
+	}
+	zeroes := 0
+	for _, x := range b {
+		if x == 0 {
+			zeroes++
+		}
+	}
+	if zeroes == len(b) {
+		return fmt.Errorf("getrandom returned nothing but zeroes")
+	}
+	fmt.Printf("random: %x\n", b)
+	return nil
 }
 
 func main() {
@@ -287,7 +380,14 @@ func main() {
 	check("nil-deref-panic", nilDeref())
 	check("files", files())
 	check("tmpfs", tmpfs())
+	// Before the clock is set: it must already be right, from the board's
+	// own real-time clock. A kernel that could not read one starts in 1970,
+	// so the year alone settles it.
+	check("wall-clock-from-the-board", time.Now().Year() >= 2026)
 	check("clock-set", clockSet(1767225600)) // 2026-01-01, well past any boot default
+	check("symlinks", symlinks() == nil)
+	check("randomness", randomness() == nil)
+	check("protect-none-keeps-the-page", protectNone() == nil)
 	if failed {
 		os.Exit(1)
 	}

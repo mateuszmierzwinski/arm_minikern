@@ -6,17 +6,19 @@
  * What it implements: the state machine, sequence and acknowledgement
  * arithmetic with wraparound, a send queue with one retransmission timer
  * and exponential backoff, a receive queue with a real advertised window,
- * the MSS option, RST generation and validation, and a bounded accept
- * backlog.
+ * the MSS option, RST generation and validation, a bounded accept backlog,
+ * **congestion control** in Reno's shape — slow start, congestion
+ * avoidance, fast retransmit and fast recovery — and **reassembly** of
+ * segments that arrive before their turn.
  *
- * What it deliberately does not: congestion control (it sends what the
- * peer's window allows, which on a LAN is the right amount and on a WAN
- * would not be), selective acknowledgement, window scaling, timestamps,
- * urgent data, and reassembly of out-of-order segments — a segment that
- * arrives early is dropped and the peer retransmits it. TIME_WAIT lasts
- * TCP_TIME_WAIT_MS rather than two maximum segment lifetimes, because a
- * board with TCP_MAX_CONNS connections cannot hold them for minutes.
- * Every one of these is a throughput or robustness limit, never a
+ * What it deliberately does not: selective acknowledgement, window scaling,
+ * timestamps and urgent data. SACK is the one worth wanting, and it is an
+ * improvement on reassembly rather than a substitute for it: without the
+ * queue there is nothing for a receiver to acknowledge selectively, and
+ * with the queue a loss already costs one round trip instead of a window's
+ * worth. TIME_WAIT lasts TCP_TIME_WAIT_MS rather than two maximum segment
+ * lifetimes, because a board with TCP_MAX_CONNS connections cannot hold
+ * them for minutes. Every one of these is a throughput limit, never a
  * correctness shortcut on the wire. */
 #ifndef MINIKERN_CORE_NET_TCP_H
 #define MINIKERN_CORE_NET_TCP_H
@@ -27,6 +29,7 @@
 #include "core/net/net.h"
 
 #define TCP_MAX_CONNS   16u
+#define TCP_HELD_SEGMENTS 4u
 #define TCP_BACKLOG     8u      /* established connections one listener may hold */
 #define TCP_RX_BUF      8192u
 #define TCP_TX_BUF      8192u
@@ -56,6 +59,13 @@ enum tcp_state {
 struct tcp_stack;
 
 /* One connection, or a listener. */
+/* One segment that arrived before its turn. */
+struct tcp_held {
+    uint32_t seq;
+    uint32_t len; /* 0 when the slot is free */
+    uint8_t data[TCP_MSS];
+};
+
 struct tcp_conn {
     struct tcp_stack *stack;
     enum tcp_state state;
@@ -65,10 +75,37 @@ struct tcp_conn {
     uint32_t snd_una;   /* oldest unacknowledged byte */
     uint32_t snd_nxt;   /* next byte to send */
     uint32_t snd_wnd;   /* what the peer will accept */
+    /* Congestion control, Reno's shape (RFC 5681): the peer's window says
+     * what it can *receive*, and these say what the path between us can
+     * *carry*. Sending the first without the second is right on a cable
+     * with nothing on it and wrong on anything shared, where it means
+     * filling a queue until it drops and then doing it again.
+     *
+     * `cwnd` and `ssthresh` are in bytes. Below the threshold each
+     * acknowledgement opens the window by a segment (slow start, which
+     * doubles per round trip); above it, by a segment per round trip
+     * (congestion avoidance). */
+    uint32_t cwnd;
+    uint32_t ssthresh;
+    uint32_t dup_acks;      /* repeats of the same ACK: three mean a loss */
+    uint32_t recover_to;    /* snd_nxt when fast recovery began */
+    bool in_recovery;
     uint32_t rcv_nxt;   /* next byte expected */
     uint32_t irs;       /* the peer's initial sequence number */
 
     uint8_t rx[TCP_RX_BUF];
+    /* Segments that arrived early, held until the gap before them is
+     * filled. Without this a single lost segment throws away everything
+     * sent after it, and the peer resends the lot — which on a path that
+     * loses one packet in a thousand costs far more than the packet.
+     *
+     * Four of them, which is a judgement rather than a law: it covers the
+     * common case (one segment lost out of a burst) and bounds what one
+     * connection can make the kernel hold. A fifth early segment is
+     * dropped, and the peer resends it, which is the behaviour this
+     * replaces — so the limit degrades into the old behaviour rather than
+     * into a failure. */
+    struct tcp_held held[TCP_HELD_SEGMENTS];
     uint32_t rx_len;
     uint8_t tx[TCP_TX_BUF];
     uint32_t tx_len;    /* queued from snd_una onwards, sent or not */
@@ -116,11 +153,13 @@ struct tcp_stats {
     uint32_t drop_malformed;
     uint32_t drop_no_socket;
     uint32_t drop_out_of_window;
+    uint32_t held_out_of_order; /* early segments kept until their turn */
     uint32_t drop_out_of_order;
     uint32_t drop_backlog_full;
     uint32_t drop_bad_reset;
     uint32_t resets_sent;
     uint32_t retransmits;
+    uint32_t fast_retransmits; /* losses caught by three duplicate ACKs */
     uint32_t connections;
 };
 

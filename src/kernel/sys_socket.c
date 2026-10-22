@@ -16,6 +16,14 @@
 #define SO_ERROR        4u
 #define SO_SNDBUF       7u
 #define SO_RCVBUF       8u
+#define SO_RCVTIMEO     20u
+#define SO_SNDTIMEO     21u
+
+/* A timeval as setsockopt takes it. */
+struct user_timeval {
+    uint32_t sec;
+    uint32_t usec;
+};
 #define SO_ACCEPTCONN   30u
 #define IPPROTO_IPV6    41u
 #define SOCK_BUF_SIZE   65536u
@@ -299,15 +307,39 @@ static int32_t sys_shutdown(struct trapframe *tf) {
     return s == NULL ? err : s->ops->shutdown(s, (int)tf->r[1]);
 }
 
-/* Options are accepted and mostly ignored: there is nothing to tune. IPv6
+/* The two options that are not ignored: how long a blocking receive or send
+ * may wait. Everything else is accepted and has nothing to tune; IPv6
  * options say ENOPROTOOPT, as on a kernel without IPv6. */
+static int32_t set_timeout(struct sock *s, uint32_t name, uint32_t uaddr) {
+    struct user_timeval tv;
+    uint32_t ms;
+    if (mm_copy_in(proc_current()->mm, &tv, uaddr, sizeof tv) != KERR_OK) {
+        return KERR_FAULT;
+    }
+    /* A zero timeval means "wait for ever", which is what 0 means inside
+     * (socket.h), so the two agree without a special case. */
+    ms = tv.sec * 1000u + (tv.usec + 999u) / 1000u;
+    if (name == SO_RCVTIMEO) {
+        s->recv_timeout_ms = ms;
+    } else {
+        s->send_timeout_ms = ms;
+    }
+    return KERR_OK;
+}
+
 static int32_t sys_setsockopt(struct trapframe *tf) {
     int err;
     struct sock *s = sock_fd((int32_t)tf->r[0], &err);
     if (s == NULL) {
         return err;
     }
-    return tf->r[1] == IPPROTO_IPV6 ? ENOPROTOOPT : KERR_OK;
+    if (tf->r[1] == IPPROTO_IPV6) {
+        return ENOPROTOOPT;
+    }
+    if (tf->r[1] == SOL_SOCKET && (tf->r[2] == SO_RCVTIMEO || tf->r[2] == SO_SNDTIMEO)) {
+        return set_timeout(s, tf->r[2], tf->r[3]);
+    }
+    return KERR_OK;
 }
 
 static uint32_t option_value(struct sock *s, uint32_t level, uint32_t name, int *err) {
@@ -325,6 +357,12 @@ static uint32_t option_value(struct sock *s, uint32_t level, uint32_t name, int 
     }
     if (level == SOL_SOCKET && name == SO_ACCEPTCONN) {
         return 0;
+    }
+    if (level == SOL_SOCKET && (name == SO_RCVTIMEO || name == SO_SNDTIMEO)) {
+        /* Reported in milliseconds rather than as a timeval, which is a
+         * deliberate narrowing: no caller here reads it back, and the
+         * alternative is a second shape for one number. */
+        return name == SO_RCVTIMEO ? s->recv_timeout_ms : s->send_timeout_ms;
     }
     *err = ENOPROTOOPT;
     return 0;

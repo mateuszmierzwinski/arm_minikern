@@ -19,6 +19,16 @@ struct frame_sink knet_init(const uint8_t mac[ETH_ALEN], const struct netdev_por
 /* Starts DHCP and the tick (once the device is up). */
 void knet_start(uint32_t xid);
 
+/* Brings the interface up with an address given rather than asked for, and
+ * starts no DHCP client at all.
+ *
+ * A board on a segment with no DHCP server is not a strange case: two
+ * machines on a cable with nothing else between them have no server, and
+ * that is exactly how the netboot test proves discovery between two guests
+ * rather than through an emulator's NAT. prefix is the mask's length;
+ * gateway may be 0, which means nothing is routed off the segment. */
+void knet_start_static(ip4_t addr, uint32_t prefix, ip4_t gateway, ip4_t dns);
+
 /* Overrides the resolver the lease advertised, which is what
  * minikern.dns=<ip> is for: a board on a network whose DHCP points at a
  * resolver it cannot reach, and the DNS test, which runs a resolver of its

@@ -1,5 +1,6 @@
 #include "kernel/sched.h"
 
+#include "arch/arm/smp.h"
 #include "core/console.h"
 #include "core/errno.h"
 #include "kernel/irq.h"
@@ -7,6 +8,7 @@
 #include "kernel/mem.h"
 #include "kernel/panic.h"
 #include "kernel/proc.h"
+#include "kernel/vfp.h"
 
 #define SLICE_TICKS 10u          /* 10 ms at TIME_HZ = 1000 */
 #define SWITCH_FRAME_WORDS 10u   /* r4-r12, lr: arm_switch's frame */
@@ -14,8 +16,6 @@
 
 void arm_switch(uint32_t *save_sp, uint32_t new_sp);
 void arm_thread_start(void);
-
-#include "arch/arm/smp.h"
 
 static struct task tasks[SCHED_MAX_TASKS];
 
@@ -44,6 +44,10 @@ static struct task **current_slot(void) {
  * anybody, and the far side of the switch releases it. */
 static struct task *leaving[SMP_MAX_CPUS];
 static bool requeue_on_leave[SMP_MAX_CPUS];
+
+/* Context switches, for comparing against how often the floating-point
+ * state actually had to move (kernel/vfp.h). */
+static uint64_t switches;
 
 /* The first SMP_MAX_CPUS tasks are the cores' idle contexts, one each.
  *
@@ -88,6 +92,12 @@ static void set_tpidruro(uint32_t v) {
 }
 
 static void runq_push(struct task *t) {
+    /* Work has appeared, so a core that powered itself off is wanted back.
+     * The check is a load rather than a call, because this is on every
+     * wakeup and starting a core is an SMC. */
+    if (smp_any_parked()) {
+        smp_wake_parked();
+    }
     t->run_next = NULL;
     if (run_tail != NULL) {
         run_tail->run_next = t;
@@ -164,6 +174,7 @@ void sched_finish_switch(void) {
 }
 
 static void free_task(struct task *t) {
+    vfp_forget(t); /* nobody may save registers into this once it is gone */
     page_free(t->kstack, KSTACK_PAGES);
     *t = (struct task){.state = TASK_UNUSED};
 }
@@ -182,12 +193,15 @@ static void switch_to(struct task *next) {
     if (next == prev) {
         return;
     }
-    if (prev->proc != NULL && prev->state != TASK_ZOMBIE) {
-        arm_vfp_save(&prev->vfp);
-    }
+    /* The floating-point state is **not** moved here: the unit is switched
+     * off instead, and the first floating-point instruction the next thread
+     * runs moves it (kernel/vfp.h). A thread that never does arithmetic —
+     * a goroutine waiting on a channel, the netpoller — never pays for
+     * thirty-two registers it does not use. */
+    switches++;
+    vfp_switch_away();
     proc_switch_mm(prev->state == TASK_ZOMBIE ? NULL : prev->proc, next->proc);
     if (next->proc != NULL) {
-        arm_vfp_restore(&next->vfp);
         set_tpidruro(next->tls);
     }
     current = next;
@@ -337,6 +351,10 @@ static const char *state_name(enum task_state st) {
  * `chan` is the address a sleeper is waiting on, which is what identifies a
  * lost wakeup: the code that was supposed to wake it is the code that owns
  * that address. */
+uint64_t sched_switches(void) {
+    return switches;
+}
+
 bool sched_has_work(void) {
     return run_head != NULL || !is_idle(current);
 }
@@ -398,6 +416,12 @@ void sched_tick(uint64_t now_ns) {
     if (!is_idle(current) && current->slice_left > 0 && --current->slice_left == 0) {
         need_resched = true;
     }
+    /* The retry that makes a lost wake a latency rather than a hang: a
+     * core that was still powering down when it was asked back reported
+     * ALREADY_ON, and this is where it is asked again (smp.h). */
+    if (run_head != NULL && smp_any_parked()) {
+        smp_wake_parked();
+    }
     check_for_a_wedged_kernel();
 }
 
@@ -455,6 +479,21 @@ bool sched_killed(void) {
  *
  * Every core ends up here — the primary at the end of boot, a secondary as
  * soon as it is let in — so this is also where a core waits for work. */
+/* Powers this core off if parking is on and there is nothing to run.
+ *
+ * The lock is released first and taken again afterwards, because a core
+ * that powers off holding it is a kernel that never runs again (klock.h).
+ * When the core really does go, this call does not return: it comes back
+ * through _secondary_start and re-enters the idle loop from the top. */
+static void park_if_idle(void) {
+    if (!smp_may_park()) {
+        return;
+    }
+    klock_release();
+    smp_park_self();
+    klock_acquire();
+}
+
 void sched_idle_loop(void) {
     klock_acquire();
     for (;;) {
@@ -463,6 +502,7 @@ void sched_idle_loop(void) {
             sched_yield();
             continue;
         }
+        park_if_idle();
         irq_wait();  /* gives the lock up while it waits (klock.h rule 5) */
     }
 }

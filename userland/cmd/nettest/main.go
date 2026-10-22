@@ -17,6 +17,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unsafe"
 )
 
 const (
@@ -300,6 +301,130 @@ func resolveName() error {
 	return fmt.Errorf("%s came back as %v, want %s", name, addrs, answer)
 }
 
+// pollWaitsForData proves poll(2) and select(2) work, which Go itself never
+// uses — its netpoller is epoll — so they are called raw.
+//
+// Both are asked the same two questions: a socket with nothing on it must
+// time out and report nothing ready, and the same socket with a datagram
+// waiting must report exactly one. A poll that always says "ready" passes
+// the second and fails the first, which is why the first is here.
+func pollWaitsForData() error {
+	const sysPoll, sysSelect = 168, 142
+	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close() }()
+	raw, err := conn.(*net.UDPConn).SyscallConn()
+	if err != nil {
+		return err
+	}
+	var results [4]int
+	err = raw.Control(func(fd uintptr) {
+		type pollfd struct {
+			fd      int32
+			events  uint16
+			revents uint16
+		}
+		p := pollfd{fd: int32(fd), events: 0x001} // POLLIN
+		n, _, _ := syscall.Syscall(sysPoll, uintptr(unsafe.Pointer(&p)), 1, 50)
+		results[0] = int(n)
+
+		var rset [2]uint32
+		rset[fd/32] = 1 << (fd % 32)
+		tv := syscall.Timeval{Sec: 0, Usec: 50000}
+		n, _, _ = syscall.Syscall6(sysSelect, fd+1, uintptr(unsafe.Pointer(&rset[0])), 0, 0,
+			uintptr(unsafe.Pointer(&tv)), 0)
+		results[1] = int(n)
+	})
+	if err != nil {
+		return err
+	}
+	// Now put something there, and ask again.
+	peer, err := net.Dial("udp", conn.LocalAddr().String())
+	if err != nil {
+		return err
+	}
+	defer func() { _ = peer.Close() }()
+	if _, err = peer.Write([]byte("ready")); err != nil {
+		return err
+	}
+	time.Sleep(20 * time.Millisecond)
+	err = raw.Control(func(fd uintptr) {
+		type pollfd struct {
+			fd      int32
+			events  uint16
+			revents uint16
+		}
+		p := pollfd{fd: int32(fd), events: 0x001}
+		n, _, _ := syscall.Syscall(sysPoll, uintptr(unsafe.Pointer(&p)), 1, 0)
+		results[2] = int(n)
+
+		var rset [2]uint32
+		rset[fd/32] = 1 << (fd % 32)
+		tv := syscall.Timeval{}
+		n, _, _ = syscall.Syscall6(sysSelect, fd+1, uintptr(unsafe.Pointer(&rset[0])), 0, 0,
+			uintptr(unsafe.Pointer(&tv)), 0)
+		results[3] = int(n)
+	})
+	if err != nil {
+		return err
+	}
+	if results[0] != 0 || results[1] != 0 {
+		return fmt.Errorf("an idle socket was reported ready: poll %d, select %d", results[0], results[1])
+	}
+	if results[2] != 1 || results[3] != 1 {
+		return fmt.Errorf("a socket with a datagram was not reported ready: poll %d, select %d",
+			results[2], results[3])
+	}
+	return nil
+}
+
+// receiveTimeoutExpires proves SO_RCVTIMEO: a read on a socket nobody is
+// writing to must give up rather than hang.
+//
+// Every step is a raw syscall, for a reason worth stating: Go opens every
+// socket **non-blocking**, so a read on one returns EAGAIN immediately and
+// would pass this test without the kernel ever waiting. The socket here is
+// a blocking one, which is the only kind the option means anything for.
+func receiveTimeoutExpires() error {
+	fd, _, errno := syscall.Syscall(syscall.SYS_SOCKET, syscall.AF_INET, syscall.SOCK_DGRAM, 0)
+	if errno != 0 {
+		return fmt.Errorf("socket: %v", errno)
+	}
+	defer func() { _, _, _ = syscall.Syscall(syscall.SYS_CLOSE, fd, 0, 0) }()
+	addr := syscall.RawSockaddrInet4{Family: syscall.AF_INET}
+	addr.Addr = [4]byte{127, 0, 0, 1}
+	if _, _, errno = syscall.Syscall(syscall.SYS_BIND, fd, uintptr(unsafe.Pointer(&addr)),
+		unsafe.Sizeof(addr)); errno != 0 {
+		return fmt.Errorf("bind: %v", errno)
+	}
+	tv := syscall.Timeval{Sec: 0, Usec: 150000}
+	if err := syscall.SetsockoptTimeval(int(fd), syscall.SOL_SOCKET, 20 /* SO_RCVTIMEO */, &tv); err != nil {
+		return fmt.Errorf("SO_RCVTIMEO: %w", err)
+	}
+	buf := make([]byte, 16)
+	start := time.Now()
+	// EINTR is normal and must be retried: the Go runtime preempts its own
+	// threads with SIGURG, and a signal lands on a blocking syscall as it
+	// would on Linux. A program that does not retry here is a program that
+	// fails whenever the scheduler happens to tap it on the shoulder.
+	for {
+		_, _, errno = syscall.Syscall(syscall.SYS_READ, fd, uintptr(unsafe.Pointer(&buf[0])), 16)
+		if errno != syscall.EINTR {
+			break
+		}
+	}
+	elapsed := time.Since(start)
+	if errno != syscall.EAGAIN {
+		return fmt.Errorf("a timed-out read said %v, want EAGAIN", errno)
+	}
+	if elapsed < 100*time.Millisecond {
+		return fmt.Errorf("it gave up after %v, which is not waiting at all", elapsed)
+	}
+	return nil
+}
+
 func main() {
 	check("network-up", waitForNetwork())
 	check("udp-loopback", loopback())
@@ -310,6 +435,8 @@ func main() {
 	check("tcp-server", tcpServer())
 	check("resolv-conf", resolverConfig())
 	check("dns", resolveName())
+	check("poll-and-select", pollWaitsForData())
+	check("recv-timeout", receiveTimeoutExpires())
 	if failed {
 		os.Exit(1)
 	}

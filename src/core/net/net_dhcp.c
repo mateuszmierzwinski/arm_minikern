@@ -68,19 +68,38 @@ static void write_bootp(const struct netif *nif, uint8_t *m) {
     put32(m + BOOTP_FIXED, DHCP_MAGIC);
 }
 
+/* True while the client is renewing an address it already holds, which is
+ * what decides how the request is addressed and what it may say. */
+static bool holds_address(const struct netif *nif) {
+    return nif->dhcp.state == DHCP_RENEWING || nif->dhcp.state == DHCP_REBINDING;
+}
+
 static int send_message(struct netif *nif, uint8_t type) {
     static const uint8_t params[] = {OPT_MASK, OPT_ROUTER, OPT_DNS, OPT_LEASE};
     uint8_t m[DHCP_MIN_LEN];
     uint32_t at = BOOTP_FIXED + 4u;
+    bool renewing = holds_address(nif);
     write_bootp(nif, m);
     at = put_option(m, at, OPT_MSG_TYPE, &type, 1);
-    if (type == MSG_REQUEST) {
+    if (type == MSG_REQUEST && !renewing) {
         at = put_option_ip(m, at, OPT_REQUESTED, nif->dhcp.offered);
         at = put_option_ip(m, at, OPT_SERVER_ID, nif->dhcp.server);
     }
     at = put_option(m, at, OPT_PARAMS, params, sizeof params);
     at = put_option(m, at, OPT_HOSTNAME, (const uint8_t *)"minikern", 8);
     m[at] = OPT_END;
+    if (renewing) {
+        /* A renewal carries the address in ciaddr and **no** requested-address
+         * or server-id option, and is sent from the address itself: that is
+         * what tells a server this is an extension rather than a new
+         * request (RFC 2131 §4.3.6). RENEWING goes to the server that
+         * granted the lease; REBINDING has stopped expecting an answer from
+         * it and asks the subnet. */
+        put32(m + 12, nif->ip);
+        return net_udp_send_from(nif, nif->ip,
+                                 nif->dhcp.state == DHCP_RENEWING ? nif->dhcp.server : IP4_BROADCAST,
+                                 DHCP_CLIENT_PORT, DHCP_SERVER_PORT, m, DHCP_MIN_LEN);
+    }
     return net_udp_send(nif, IP4_BROADCAST, DHCP_CLIENT_PORT, DHCP_SERVER_PORT, m, DHCP_MIN_LEN);
 }
 
@@ -97,8 +116,43 @@ void dhcp_start(struct netif *nif, uint32_t xid) {
     transmit(nif);
 }
 
+/* Moves a bound client along its lease's clock: ask the granting server at
+ * T1, ask anyone at T2, and give the address up when it expires.
+ *
+ * Giving it up matters as much as asking: an address whose lease has run
+ * out is someone else's to hand out, and a board that keeps using one is a
+ * conflict that shows up as traffic for another machine arriving here. */
+static void follow_the_lease(struct netif *nif) {
+    if (nif->lease_s == 0 || nif->lease_s == DHCP_LEASE_FOREVER) {
+        return; /* a lease with no term is not renewed */
+    }
+    if (nif->now_ms >= nif->dhcp.expiry_ms) {
+        nif->ip = 0; /* it is not ours any more */
+        nif->dhcp.state = DHCP_SELECTING;
+        nif->dhcp.tries = 0;
+        nif->dhcp.next_send_ms = nif->now_ms;
+        transmit(nif);
+        return;
+    }
+    if (nif->dhcp.state == DHCP_BOUND && nif->now_ms >= nif->dhcp.renew_at_ms) {
+        nif->dhcp.state = DHCP_RENEWING;
+        nif->dhcp.tries = 0;
+        transmit(nif);
+        return;
+    }
+    if (nif->dhcp.state == DHCP_RENEWING && nif->now_ms >= nif->dhcp.rebind_at_ms) {
+        nif->dhcp.state = DHCP_REBINDING;
+        nif->dhcp.tries = 0;
+        transmit(nif);
+    }
+}
+
 void dhcp_tick(struct netif *nif) {
-    bool waiting = nif->dhcp.state == DHCP_SELECTING || nif->dhcp.state == DHCP_REQUESTING;
+    bool waiting = nif->dhcp.state == DHCP_SELECTING || nif->dhcp.state == DHCP_REQUESTING ||
+                   holds_address(nif);
+    if (nif->dhcp.state == DHCP_BOUND || holds_address(nif)) {
+        follow_the_lease(nif);
+    }
     if (waiting && nif->now_ms >= nif->dhcp.next_send_ms) {
         if (nif->dhcp.state == DHCP_REQUESTING && nif->dhcp.tries >= 4u) {
             nif->dhcp.state = DHCP_SELECTING;  /* the server went quiet: start over */
@@ -178,13 +232,28 @@ static void bind_lease(struct netif *nif, const struct dhcp_reply *r) {
     nif->dns = r->dns;
     nif->lease_s = r->lease;
     nif->dhcp.state = DHCP_BOUND;
+    nif->dhcp.tries = 0;
+    /* T1 and T2 as RFC 2131 gives them, from the moment the lease was
+     * granted rather than from when it was asked for. */
+    nif->dhcp.renew_at_ms = nif->now_ms + (uint64_t)r->lease * 500ull;
+    nif->dhcp.rebind_at_ms = nif->now_ms + (uint64_t)r->lease * 875ull;
+    nif->dhcp.expiry_ms = nif->now_ms + (uint64_t)r->lease * 1000ull;
     if (nif->events.dhcp_bound != NULL) {
         nif->events.dhcp_bound(nif->events.self, nif);
     }
 }
 
-/* A NAK from the server we asked sends us back to DISCOVER. */
+/* A NAK from the server we asked sends us back to DISCOVER — including a
+ * NAK of a renewal, which is a server saying the address is no longer ours
+ * and must not be used while we look for another. */
 static void take_nak(struct netif *nif, const struct dhcp_reply *r) {
+    if (holds_address(nif)) {
+        nif->ip = 0;
+        nif->dhcp.state = DHCP_SELECTING;
+        nif->dhcp.tries = 0;
+        nif->dhcp.next_send_ms = nif->now_ms;
+        return;
+    }
     if (nif->dhcp.state == DHCP_REQUESTING && r->server == nif->dhcp.server) {
         nif->dhcp.state = DHCP_SELECTING;
         nif->dhcp.tries = 0;
@@ -210,6 +279,13 @@ void dhcp_input(struct netif *nif, const struct udp_datagram *d) {
         take_offer(nif, &r);
     } else if (nif->dhcp.state == DHCP_REQUESTING && r.type == MSG_ACK && r.yiaddr == nif->dhcp.offered &&
                (r.server == 0 || r.server == nif->dhcp.server)) {
+        bind_lease(nif, &r);
+    } else if (holds_address(nif) && r.type == MSG_ACK && r.yiaddr == nif->ip) {
+        /* A renewal was answered: the same address with a new term. It must
+         * be accepted in these states too, or the clock never moves and the
+         * client renews until the lease runs out underneath it. The address
+         * has to match the one we hold — an ACK naming a different one is
+         * not an answer to what was asked. */
         bind_lease(nif, &r);
     }
 }

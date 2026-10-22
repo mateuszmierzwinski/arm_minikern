@@ -78,11 +78,23 @@ struct arp_entry {
     bool requested;  /* we asked: a reply for this ip will be accepted */
 };
 
+/* A lease of 0xffffffff seconds is "for ever" by convention, and is not
+ * renewed: there is nothing to renew it before. */
+#define DHCP_LEASE_FOREVER 0xffffffffu
+
 enum dhcp_state {
     DHCP_OFF = 0,
     DHCP_SELECTING,  /* DISCOVER sent, waiting for an OFFER */
     DHCP_REQUESTING, /* REQUEST sent, waiting for an ACK */
     DHCP_BOUND,
+    /* A lease is a loan with a term, and these are the two halves of
+     * paying attention to it: at T1 — half the lease — the client asks the
+     * server that granted it to extend it, and at T2 — seven eighths — it
+     * stops being particular and asks anyone. Without either, the address
+     * stops being ours while we go on using it, which is a conflict that
+     * appears as someone else's traffic arriving (RFC 2131 §4.4.5). */
+    DHCP_RENEWING,  /* T1 has passed: asking the server we have, directly */
+    DHCP_REBINDING, /* T2 has passed: asking any server, by broadcast */
 };
 
 struct dhcp_client {
@@ -92,6 +104,9 @@ struct dhcp_client {
     ip4_t server;
     uint64_t next_send_ms;
     uint32_t tries;
+    uint64_t renew_at_ms;  /* T1: half the lease */
+    uint64_t rebind_at_ms; /* T2: seven eighths of it */
+    uint64_t expiry_ms;    /* when the address stops being ours */
 };
 
 /* Why frames were dropped: each is a test assertion and a log line. */

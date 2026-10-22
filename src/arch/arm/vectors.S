@@ -121,4 +121,21 @@ arm_vfp_enable:
     vmsr  fpexc, r0
     bx    lr
 
+/* Switches the unit off, so that the next floating-point instruction traps
+ * as undefined. That trap is how the state is moved between threads only
+ * when one of them actually uses it (kernel/vfp.h). */
+    .global arm_vfp_off
+arm_vfp_off:
+    mov   r0, #0
+    vmsr  fpexc, r0
+    bx    lr
+
+/* Whether it is on for the running thread. */
+    .global arm_vfp_is_on
+arm_vfp_is_on:
+    vmrs  r0, fpexc
+    lsr   r0, r0, #30
+    and   r0, r0, #1
+    bx    lr
+
     .section .note.GNU-stack, "", %progbits

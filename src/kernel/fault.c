@@ -5,6 +5,7 @@
 #include "core/errno.h"
 #include "kernel/proc.h"
 #include "kernel/signal.h"
+#include "kernel/vfp.h"
 
 /* Short-descriptor fault status (ARM ARM B3.13.3): FS[3:0] in bits 0-3,
  * FS[4] in bit 10, WnR (a write) in bit 11. */
@@ -43,7 +44,19 @@ bool fault_handle(struct trapframe *tf, enum trap_kind kind, uint32_t addr, uint
         return true;
     }
     if (rc == KERR_NOMEM) {
-        kprintf("%s[%u]: out of memory at %08x\n", p->name, sched_current()->tid, addr);
+        /* Out of memory is **not** a segmentation fault, and sending one
+         * says the wrong thing: a runtime that catches SIGSEGV — Go's does —
+         * turns it into "invalid memory address", and the real cause is
+         * lost. The process is killed outright instead, with a signal it
+         * cannot catch or misread, and the reason is printed once.
+         *
+         * This is the policy, and it has two halves: memory is handed out
+         * optimistically (a Go runtime reserves half a gigabyte of address
+         * space it will never touch, so refusing by size would refuse every
+         * Go program), and the process that finally cannot be given a page
+         * is the one that dies. */
+        kprintf("%s[%u]: out of memory at %08x, killed\n", p->name, sched_current()->tid, addr);
+        proc_exit_group(SIGKILL);
     }
     signal_force_fault(tf, SIGSEGV, vma_find(&p->mm->vmas, addr) != NULL ? SEGV_ACCERR : SEGV_MAPERR, addr,
                        status);
@@ -51,5 +64,11 @@ bool fault_handle(struct trapframe *tf, enum trap_kind kind, uint32_t addr, uint
 }
 
 void fault_undefined(struct trapframe *tf) {
+    /* A floating-point instruction on a thread whose unit is off arrives
+     * here, and is not an error: the state is moved and the instruction
+     * retried (kernel/vfp.h). Only what is left is really undefined. */
+    if (vfp_claim(sched_current())) {
+        return;
+    }
     signal_force_fault(tf, SIGILL, ILL_ILLOPC, tf->pc, 0);
 }

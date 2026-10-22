@@ -90,6 +90,9 @@ void sched_finish_switch(void);
  * millisecond, not a hope. */
 bool sched_killed(void);
 
+/* How many context switches there have been. */
+uint64_t sched_switches(void);
+
 /* True when this core has something other than the idle task to run, which
  * is how the frequency governor measures load (kernel/thermal.h): the share
  * of ticks on which this was true. */

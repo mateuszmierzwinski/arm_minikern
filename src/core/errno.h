@@ -32,6 +32,7 @@
 #define KERR_RANGE   (-34)
 #define KERR_2BIG        (-7)   /* the argument list is too long */
 #define KERR_NAMETOOLONG (-36)
+#define KERR_LOOP        (-40)  /* too many symbolic links */
 #define KERR_NOSYS   (-38)  /* not implemented */
 #define KERR_NOTEMPTY (-39)
 #define KERR_PROTO   (-71)  /* a peer broke its own protocol */

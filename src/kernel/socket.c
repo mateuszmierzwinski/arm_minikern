@@ -1,5 +1,7 @@
 #include "kernel/socket.h"
 
+#include "kernel/time.h"
+
 #include "core/errno.h"
 #include "kernel/mem.h"
 #include "kernel/net.h"
@@ -86,4 +88,9 @@ void socket_wake(struct sock *s) {
 
 struct netif *socket_netif(void) {
     return knet_interface();
+}
+
+uint64_t sock_deadline(const struct sock *s, bool sending) {
+    uint32_t ms = sending ? s->send_timeout_ms : s->recv_timeout_ms;
+    return ms == 0 ? 0 : time_monotonic_ns() + (uint64_t)ms * 1000000ull;
 }

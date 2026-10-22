@@ -8,10 +8,12 @@
 #include "arch/arm/trap.h"
 #include "core/console.h"
 #include "core/errno.h"
+#include "kernel/proc.h"
 #include "kernel/sched.h"
 
 /* PSCI function identifiers (PSCI 0.2, 32-bit calling convention). */
 #define PSCI_CPU_ON      0x84000003u
+#define PSCI_CPU_OFF     0x84000002u
 #define PSCI_SUCCESS     0
 #define PSCI_ALREADY_ON  (-4)
 
@@ -28,6 +30,10 @@
 static uint8_t stacks[SMP_MAX_CPUS][SMP_STACK_BYTES] __attribute__((aligned(8)));
 static volatile uint32_t online_mask = 1u; /* this core, which is already running */
 static volatile bool released;             /* the boot path has finished */
+static volatile uint32_t parked_mask;      /* cores that powered themselves off */
+static volatile uint32_t wake_mask;        /* parked cores a waker wants back */
+static bool parking_allowed;               /* minikern.cpuoff=1 */
+static uint32_t parks;                     /* how many times a core went off */
 
 /* The bring-up translation table and its physical address with the walk
  * attributes, which _secondary_start loads before the MMU is on.
@@ -104,7 +110,13 @@ static int32_t psci_cpu_on(uint32_t cpu, uint32_t entry) {
  * trap_dispatch like any other, under the one lock. */
 void smp_secondary_main(void) {
     uint32_t cpu = smp_cpu_id();
-    __atomic_or_fetch(&online_mask, 1u << (cpu & 31u), __ATOMIC_RELEASE);
+    uint32_t bit = 1u << (cpu & 31u);
+    __atomic_or_fetch(&online_mask, bit, __ATOMIC_RELEASE);
+    /* A core that was parked and has been started again arrives here, so
+     * these are cleared on the way in rather than by the waker: the waker
+     * cannot know when the core actually came back. */
+    __atomic_and_fetch(&parked_mask, ~bit, __ATOMIC_RELEASE);
+    __atomic_and_fetch(&wake_mask, ~bit, __ATOMIC_RELEASE);
     while (!released) {
         __asm__ volatile("wfe" ::: "memory");
     }
@@ -116,12 +128,96 @@ void smp_secondary_main(void) {
      * immediate, and which faulted inside the kernel while holding the
      * lock, so it deadlocked in silence rather than panicking. */
     mmu_init_cpu();
+    /* It has just set its own translation registers from nothing, so any
+     * record of what this core had installed before is stale (proc.h). A
+     * core that has been parked and started again is the case that needs
+     * it; at boot there is nothing to forget. */
+    proc_forget_installed_mm();
     trap_init_cpu();
     arm_vfp_enable();
     gic_init_cpu();
     timer_start_cpu();
     sched_init_cpu();
     sched_idle_loop();  /* never returns */
+}
+
+/* PSCI CPU_OFF: this core powers itself down. It does not return when it
+ * succeeds, and the core is then started again with CPU_ON — re-entering
+ * at _secondary_start, which is why the whole per-core setup in
+ * smp_secondary_main has to be repeatable. */
+static int32_t psci_cpu_off(void) {
+    register uint32_t r0 __asm__("r0") = PSCI_CPU_OFF;
+    __asm__ volatile("smc #0" : "+r"(r0) :: "memory");
+    return (int32_t)r0;
+}
+
+void smp_allow_parking(bool allow) {
+    parking_allowed = allow;
+}
+
+bool smp_may_park(void) {
+    /* The core that booted never parks. Something has to keep ticking to
+     * retry a wake that raced a power-off, and that is the invariant which
+     * makes a lost wake cost a millisecond instead of wedging the board. */
+    return parking_allowed && released && smp_cpu_id() != 0u;
+}
+
+void smp_park_self(void) {
+    uint32_t cpu = smp_cpu_id();
+    uint32_t bit = 1u << (cpu & 31u);
+    /* `online_mask` is deliberately left alone. A parked core has not gone
+     * away — it comes back the moment there is work — and `smp_scheduling`
+     * is what user space is told when it asks how many CPUs it has. Taking
+     * the bit out made Go size GOMAXPROCS to 1 and then build a workload
+     * that never needed the other cores, so they stayed off and the whole
+     * run used one core: a power optimisation that removed the
+     * parallelism it was meant to be saving power on. */
+    __atomic_or_fetch(&parked_mask, bit, __ATOMIC_RELEASE);
+    parks++;
+    /* A waker may have asked for this core back between the decision and
+     * here. Taking the ask now rather than powering off is the cheap half
+     * of the race; the expensive half — a wake that arrives after this
+     * point — is covered by the retry from the tick. */
+    if ((__atomic_load_n(&wake_mask, __ATOMIC_ACQUIRE) & bit) != 0) {
+        __atomic_and_fetch(&wake_mask, ~bit, __ATOMIC_RELEASE);
+        __atomic_and_fetch(&parked_mask, ~bit, __ATOMIC_RELEASE);
+        return;
+    }
+    (void)psci_cpu_off();
+    /* Only reached if the firmware refused, in which case this core simply
+     * carries on idling — which is what it was doing. */
+    __atomic_and_fetch(&parked_mask, ~bit, __ATOMIC_RELEASE);
+}
+
+bool smp_any_parked(void) {
+    return __atomic_load_n(&parked_mask, __ATOMIC_ACQUIRE) != 0;
+}
+
+void smp_wake_parked(void) {
+    uint32_t still = __atomic_load_n(&parked_mask, __ATOMIC_ACQUIRE);
+    for (uint32_t cpu = 1; cpu < SMP_MAX_CPUS; cpu++) {
+        uint32_t bit = 1u << cpu;
+        if ((still & bit) == 0) {
+            continue;
+        }
+        /* Asked for before the call, so a core still on its way down sees
+         * the ask and stays. */
+        __atomic_or_fetch(&wake_mask, bit, __ATOMIC_RELEASE);
+        /* The entry is a **physical** address: the core comes back with
+         * its MMU off, exactly as it did at boot. Passing the kernel's
+         * virtual address instead started nothing — PSCI refused it, the
+         * core stayed parked, and the test still passed because every core
+         * had one kernel entry from before it ever parked. */
+        if (psci_cpu_on(cpu, virt_to_phys((const void *)_secondary_start)) != PSCI_SUCCESS) {
+            continue; /* ALREADY_ON: still going down, so the tick retries */
+        }
+        __atomic_and_fetch(&wake_mask, ~bit, __ATOMIC_RELEASE);
+        __atomic_and_fetch(&parked_mask, ~bit, __ATOMIC_RELEASE);
+    }
+}
+
+uint32_t smp_parks(void) {
+    return parks;
 }
 
 uint32_t smp_scheduling(void) {

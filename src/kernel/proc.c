@@ -102,6 +102,10 @@ static void drop_user_mm(void) {
     *installed_slot() = NULL;
 }
 
+void proc_forget_installed_mm(void) {
+    *installed_slot() = NULL;
+}
+
 /* A process becomes a zombie rather than disappearing when a parent still
  * exists to ask how it ended. Everything expensive is already gone by then:
  * what is kept is the struct and the exit status. */

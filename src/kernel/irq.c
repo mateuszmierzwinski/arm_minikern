@@ -2,6 +2,8 @@
 
 #include <stdbool.h>
 
+#include "arch/arm/cpu.h"
+#include "kernel/entropy.h"
 #include "kernel/klock.h"
 
 #include "core/console.h"
@@ -24,6 +26,10 @@ int irq_register(uint32_t id, const struct irq_handler *h) {
 }
 
 void irq_dispatch(void) {
+    /* The moment this interrupt arrived, which is the kernel's one real
+     * source of unpredictability: a packet's arrival depends on the other
+     * end, the wire and a clock that is not ours (kernel/entropy.h). */
+    entropy_add_timing(arm_cycle_counter());
     for (;;) {
         uint32_t id = chip.ack(chip.self);
         if (id >= IRQ_MAX_LINES) {

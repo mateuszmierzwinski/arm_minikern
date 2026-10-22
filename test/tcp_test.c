@@ -262,6 +262,71 @@ static void test_duplicates_and_reordering(void) {
     KTEST_CHECK(received == sizeof out && memcmp(in, out, sizeof out) == 0);
 }
 
+/* A segment that arrives before its turn is kept, not thrown away.
+ *
+ * The stack's own counters are the evidence: with reordering on, segments
+ * must be **held** rather than dropped, and the stream must still arrive
+ * whole. Before the reassembly queue existed every one of these was a drop
+ * and a resend, which is correct and costs a round trip per loss. */
+static void test_early_segments_are_held(void) {
+    struct tcp_conn *c, *s, *l;
+    static uint8_t out[8000], in[8000];
+    uint32_t sent = 0, received = 0;
+    fresh();
+    connect_pair(&c, &s, &l);
+    wire.reorder = true;
+    for (uint32_t i = 0; i < sizeof out; i++) {
+        out[i] = (uint8_t)(i * 11u + 3u);
+    }
+    for (uint32_t round = 0; round < 1000 && received < sizeof out; round++) {
+        if (sent < sizeof out) {
+            int32_t n = tcp_send(c, out + sent, sizeof out - sent);
+            sent += n > 0 ? (uint32_t)n : 0u;
+        }
+        run_ms(50);
+        for (int32_t n = tcp_recv(s, in + received, sizeof in - received, false); n > 0;
+             n = tcp_recv(s, in + received, sizeof in - received, false)) {
+            received += (uint32_t)n;
+        }
+    }
+    KTEST_CHECK(received == sizeof out && memcmp(in, out, sizeof out) == 0);
+    KTEST_CHECK(host_b.tcp.stats.held_out_of_order > 0);
+}
+
+/* Congestion control: the window starts at ten segments, grows while
+ * acknowledgements come back, and is **halved** by a loss rather than
+ * carrying on regardless. Sending what the peer's window allows and
+ * nothing else — which is what this replaces — is right on a cable with
+ * nothing on it and wrong on anything shared. */
+static void test_the_window_grows_and_a_loss_halves_it(void) {
+    struct tcp_conn *c, *s, *l;
+    static uint8_t out[16000];
+    uint32_t sent = 0, received = 0, grown;
+    static uint8_t in[16000];
+    fresh();
+    connect_pair(&c, &s, &l);
+    KTEST_CHECK(c->cwnd == 10u * TCP_MSS); /* RFC 6928's initial window */
+    for (uint32_t round = 0; round < 200 && sent < sizeof out; round++) {
+        int32_t n = tcp_send(c, out + sent, sizeof out - sent);
+        sent += n > 0 ? (uint32_t)n : 0u;
+        run_ms(50);
+        for (int32_t got = tcp_recv(s, in + received, sizeof in - received, false); got > 0;
+             got = tcp_recv(s, in + received, sizeof in - received, false)) {
+            received += (uint32_t)got;
+        }
+    }
+    grown = c->cwnd;
+    KTEST_CHECK(grown > 10u * TCP_MSS); /* it opened as data got through */
+    /* Now lose everything until the timer fires: the window must collapse
+     * to one segment and the threshold to half of what was outstanding. */
+    wire.drop_every = 1; /* nothing gets through from here on */
+    (void)tcp_send(c, out, 4000);
+    run_ms(5000);
+    KTEST_CHECK(c->cwnd == TCP_MSS);
+    KTEST_CHECK(c->ssthresh < grown);
+    KTEST_CHECK(c->ssthresh >= 2u * TCP_MSS); /* and never below two */
+}
+
 static void test_peek_leaves_the_data(void) {
     struct tcp_conn *c, *s, *l;
     uint8_t in[16];
@@ -411,6 +476,8 @@ int main(void) {
     KTEST_RUN(test_stream_larger_than_the_buffer);
     KTEST_RUN(test_stream_survives_loss);
     KTEST_RUN(test_duplicates_and_reordering);
+    KTEST_RUN(test_early_segments_are_held);
+    KTEST_RUN(test_the_window_grows_and_a_loss_halves_it);
     KTEST_RUN(test_peek_leaves_the_data);
     KTEST_RUN(test_close_sequence);
     KTEST_RUN(test_write_after_close_is_refused);

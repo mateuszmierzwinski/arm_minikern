@@ -1,5 +1,7 @@
 #include "kernel/signal.h"
 
+#include "kernel/vfp.h"
+
 #include "arch/arm/cpu.h"
 #include "core/console.h"
 #include "core/errno.h"
@@ -165,13 +167,15 @@ static void save_context(struct k_ucontext *uc, const struct trapframe *tf, cons
     uc->ss_flags = t->altstack_size == 0 ? SS_DISABLE : 0;
 }
 
-/* The VFP registers live in the hardware while in the kernel (it never
- * touches them), so they are read straight into the frame. */
+/* The thread's floating-point state goes into the frame — from wherever it
+ * is. It used to be read straight out of the hardware, which was right when
+ * every context switch restored it and is now a way to read whichever
+ * thread last did arithmetic (kernel/vfp.h). */
 static void save_vfp(struct k_ucontext *uc) {
     struct k_vfp_frame *v = (struct k_vfp_frame *)uc->regspace;
     v->magic = VFP_MAGIC;
     v->size = sizeof *v;
-    arm_vfp_save(&v->state);
+    vfp_read(sched_current(), &v->state);
 }
 
 /* Where the handler returns to: sa_restorer when given (musl), else the
@@ -261,7 +265,7 @@ int32_t signal_return(struct trapframe *tf) {
     tf->spsr = (uc.mcontext.cpsr & (CPSR_USER_MASK | CPSR_T)) | MODE_USR;
     t->sig_blocked = uc.sigmask & ~unblockable;
     if (v->magic == VFP_MAGIC) {
-        arm_vfp_restore(&v->state);
+        vfp_write(t, &v->state);
     }
     return (int32_t)tf->r[0];
 }

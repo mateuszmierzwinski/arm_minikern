@@ -193,14 +193,60 @@ static bool reset_is_valid(const struct tcp_conn *c, const struct tcp_seg *seg) 
     return seg->seq == c->rcv_nxt;
 }
 
+/* Opens the congestion window for bytes that arrived.
+ *
+ * Below the threshold, by a segment per acknowledgement — which doubles the
+ * window every round trip, and is called slow start because of where it
+ * starts rather than how it grows. Above it, by a segment per round trip,
+ * approximated the usual way: a segment's worth of window per window's
+ * worth of data. */
+static void open_window(struct tcp_conn *c, uint32_t acked) {
+    if (c->cwnd < c->ssthresh) {
+        c->cwnd += acked < TCP_MSS ? acked : TCP_MSS;
+        return;
+    }
+    c->cwnd += TCP_MSS * (acked < TCP_MSS ? acked : TCP_MSS) / (c->cwnd > 0 ? c->cwnd : TCP_MSS);
+}
+
+/* Three acknowledgements of the same byte mean a segment went missing and
+ * the ones after it arrived — a loss, not congestion collapse. The window
+ * is halved rather than abandoned, the missing segment is sent again at
+ * once, and the connection keeps going: that is fast retransmit, and it is
+ * the difference between losing one segment and stalling for a timeout. */
+static void on_duplicate_ack(struct tcp_conn *c) {
+    if (++c->dup_acks != 3u || c->in_recovery) {
+        return;
+    }
+    c->ssthresh = tcp_in_flight(c) / 2u;
+    c->ssthresh = c->ssthresh < 2u * TCP_MSS ? 2u * TCP_MSS : c->ssthresh;
+    c->cwnd = c->ssthresh + 3u * TCP_MSS; /* the three that got through */
+    c->in_recovery = true;
+    c->recover_to = c->snd_nxt;
+    tcp_retransmit_oldest(c); /* which counts it */
+}
+
 /* Applies an acknowledgement: drops acknowledged bytes from the queue. */
 static void apply_ack(struct tcp_conn *c, const struct tcp_seg *seg) {
     uint32_t acked;
     if (!(seg->flags & TCP_ACK) || seq_le(seg->ack, c->snd_una) || seq_gt(seg->ack, c->snd_nxt)) {
+        if ((seg->flags & TCP_ACK) != 0 && seg->ack == c->snd_una && tcp_in_flight(c) > 0) {
+            on_duplicate_ack(c);
+        }
         c->snd_wnd = (seg->flags & TCP_ACK) ? seg->wnd : c->snd_wnd;
         return;
     }
     acked = seg->ack - c->snd_una;
+    c->dup_acks = 0;
+    if (c->in_recovery && seq_ge(seg->ack, c->recover_to)) {
+        /* Everything outstanding when the loss was noticed has now been
+         * acknowledged: back to the window the loss left us with, rather
+         * than the inflated one recovery was using. */
+        c->in_recovery = false;
+        c->cwnd = c->ssthresh;
+    }
+    if (!c->in_recovery) {
+        open_window(c, acked);
+    }
     c->snd_una = seg->ack;
     c->snd_wnd = seg->wnd;
     c->retries = 0;
@@ -218,32 +264,99 @@ static void apply_ack(struct tcp_conn *c, const struct tcp_seg *seg) {
     }
 }
 
-/* Takes in-order payload into the receive queue. Out-of-order data is
- * dropped: the peer will resend it (there is no reassembly queue). */
+/* Copies bytes that follow rcv_nxt into the receive queue and advances it.
+ * Returns what it took, which is 0 when the queue has no room. */
+static uint32_t accept_bytes(struct tcp_conn *c, uint32_t seq, const uint8_t *data, uint32_t len) {
+    uint32_t skip = c->rcv_nxt - seq; /* bytes we already have */
+    uint32_t n;
+    if (skip >= len) {
+        return 0;
+    }
+    n = len - skip;
+    n = n < tcp_rcv_wnd(c) ? n : tcp_rcv_wnd(c);
+    for (uint32_t i = 0; i < n; i++) {
+        c->rx[c->rx_len + i] = data[skip + i];
+    }
+    c->rx_len += n;
+    c->rcv_nxt += n;
+    return n;
+}
+
+/* Holds a segment that arrived early, if there is a slot and it is not one
+ * we already have. */
+static bool hold_segment(struct tcp_conn *c, const struct tcp_seg *seg) {
+    struct tcp_held *free_slot = NULL;
+    if (seg->len > TCP_MSS) {
+        return false;
+    }
+    for (uint32_t i = 0; i < TCP_HELD_SEGMENTS; i++) {
+        struct tcp_held *h = &c->held[i];
+        if (h->len != 0 && h->seq == seg->seq) {
+            return true; /* already held: a duplicate, not a loss */
+        }
+        free_slot = h->len == 0 && free_slot == NULL ? h : free_slot;
+    }
+    if (free_slot == NULL) {
+        return false; /* full: drop it, and the peer resends */
+    }
+    free_slot->seq = seg->seq;
+    free_slot->len = seg->len;
+    for (uint32_t i = 0; i < seg->len; i++) {
+        free_slot->data[i] = seg->data[i];
+    }
+    return true;
+}
+
+/* Takes everything held that now follows on, repeatedly: filling one gap
+ * can make several held segments contiguous at once. */
+static uint32_t drain_held(struct tcp_conn *c) {
+    uint32_t took = 0;
+    for (bool moved = true; moved;) {
+        moved = false;
+        for (uint32_t i = 0; i < TCP_HELD_SEGMENTS; i++) {
+            struct tcp_held *h = &c->held[i];
+            if (h->len == 0 || seq_gt(h->seq, c->rcv_nxt)) {
+                continue;
+            }
+            if (seq_le(h->seq + h->len, c->rcv_nxt)) {
+                h->len = 0; /* entirely old now */
+                continue;
+            }
+            took += accept_bytes(c, h->seq, h->data, h->len);
+            h->len = 0;
+            moved = true;
+        }
+    }
+    return took;
+}
+
+/* Takes payload into the receive queue.
+ *
+ * A segment that arrives before its turn is **held** rather than dropped:
+ * one lost segment would otherwise throw away everything sent after it and
+ * make the peer resend all of it. What cannot be held — a fifth early
+ * segment — is dropped, which is the behaviour this replaces, so the limit
+ * degrades gracefully instead of failing. */
 static void take_data(struct tcp_conn *c, const struct tcp_seg *seg) {
-    uint32_t skip, n;
+    uint32_t took = 0;
     if (seg->len == 0) {
         return;
     }
     if (seq_gt(seg->seq, c->rcv_nxt)) {
-        c->stack->stats.drop_out_of_order++;
-        tcp_send_ack(c);  /* tell the peer what we are waiting for */
+        if (hold_segment(c, seg)) {
+            c->stack->stats.held_out_of_order++;
+        } else {
+            c->stack->stats.drop_out_of_order++;
+        }
+        tcp_send_ack(c); /* tell the peer what we are still waiting for */
         return;
     }
-    skip = c->rcv_nxt - seg->seq;  /* bytes we already have */
-    if (skip >= seg->len) {
-        tcp_send_ack(c);
-        return;
-    }
-    n = seg->len - skip;
-    n = n < tcp_rcv_wnd(c) ? n : tcp_rcv_wnd(c);
-    for (uint32_t i = 0; i < n; i++) {
-        c->rx[c->rx_len + i] = seg->data[skip + i];
-    }
-    c->rx_len += n;
-    c->rcv_nxt += n;
+    took = accept_bytes(c, seg->seq, seg->data, seg->len);
+    took += drain_held(c);
     tcp_send_ack(c);
-    tcp_changed(c);
+    if (took > 0) {
+        tcp_changed(c);
+    }
 }
 
 /* The peer's FIN, once every byte before it has arrived. */

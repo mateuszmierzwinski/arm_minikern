@@ -46,6 +46,13 @@ struct tcp_conn *tcp_alloc(struct tcp_stack *s) {
             c->state = TCP_CLOSED;
             c->rto_ms = TCP_RTO_MIN_MS;
             c->snd_wnd = TCP_MSS;  /* until the peer tells us its window */
+            /* Ten segments to start with, as RFC 6928 settled on: one was
+             * chosen when a round trip cost a second, and on anything
+             * modern it spends three round trips discovering that the path
+             * is fine. The threshold starts out of the way, so the first
+             * loss is what sets it. */
+            c->cwnd = 10u * TCP_MSS;
+            c->ssthresh = 0xffffffffu;
             return c;
         }
     }

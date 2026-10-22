@@ -7,6 +7,11 @@
 #include "core/ports.h"
 
 /* The console port over UART0; writes "\r\n" for every "\n". */
+/* Programs UART0: clock, reset, 115200 8N1 and FIFOs on. Called before the
+ * console is attached, so the kernel does not depend on the boot loader
+ * having set it up (uart.c). */
+void h3_uart0_init(void);
+
 struct console_port h3_uart0_console(void);
 
 /* Turns on the receive interrupt; each byte received goes to push. */

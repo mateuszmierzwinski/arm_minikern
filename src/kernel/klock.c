@@ -1,6 +1,8 @@
 #include "kernel/klock.h"
 
 #include "core/console.h"
+#include "kernel/sched.h"
+#include "kernel/vfp.h"
 
 #include "arch/arm/smp.h"
 #include "arch/arm/spinlock.h"
@@ -49,4 +51,8 @@ void klock_report(void) {
         kprintf(" %llu", (unsigned long long)per_cpu[cpu]);
     }
     kprintf("\n");
+    kprintf("vfp: state moved %llu times in %llu switches\n", (unsigned long long)vfp_moves(),
+            (unsigned long long)sched_switches());
+    kprintf("cpuoff: %u cores powered off while idle, %u still off\n", smp_parks(),
+            smp_any_parked() ? 1u : 0u);
 }

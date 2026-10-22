@@ -56,9 +56,9 @@ Step by step: each phase in `TASKS.md` ends with something that boots and is tes
 | P5 Netboot | **Done in QEMU, and authenticated (2026-10-22).** Our own MKNB protocol (NETBOOT.md): a unicast sweep finds the server, the archive arrives in windowed blocks and is verified against SHA-256 before anything is mounted. A board can be told which image's digest to accept, and **which key's offers** — Ed25519 verification written from scratch here, with no signing, so the private half stays on the server. The server is a Go program in this tree. |
 | P6 Full Go (gc) | **Done for one core (2026-10-21).** Go 1.26 binaries run unchanged: threads, futex, epoll timers, async preemption by SIGURG, GC, signals. SMP is not started. |
 | P7 Sockets | **Done for UDP and TCP (2026-10-21).** Go's `net` package works: UDP both ways, TCP active and passive open, and a complete HTTP exchange (client *and* server) inside the guest. |
-| P10 SMP | **Done (2026-10-22).** All four Cortex-A7s run user code. One ticket spinlock around the kernel (`kernel/klock.h`) replaces "IRQs masked = locked", taken at `trap_dispatch` and released at `trap_exit`; each core initialises what is its own (vector table, interrupt interface, tick, VFP, address-space regime); TLB maintenance is the broadcast form. Go sees four CPUs and uses them: 4× the work in 1.6× the time, with every core showing kernel entries. Seven single-core assumptions turned out to be bugs — they are listed in TASKS.md P10.3, and `minikern.hangcheck` exists because the last one was invisible without it. |
+| P10 SMP | **Done, and idle cores can power off (2026-10-22).** All four Cortex-A7s run user code. One ticket spinlock around the kernel (`kernel/klock.h`) replaces "IRQs masked = locked", taken at `trap_dispatch` and released at `trap_exit`; each core initialises what is its own (vector table, interrupt interface, tick, VFP, address-space regime); TLB maintenance is the broadcast form. Go sees four CPUs and uses them: 4× the work in 1.6× the time, with every core showing kernel entries. With `minikern.cpuoff=1` an idle core powers itself off (PSCI `CPU_OFF`) and is started again when work appears, which on this chip saves more than stepping the clock; the boot core never parks, so a wake that races a power-off is always retried. Seven single-core assumptions turned out to be bugs — they are listed in TASKS.md P10.3, and `minikern.hangcheck` exists because the last one was invisible without it. |
 | P8 fork/exec | **Done (2026-10-22).** Go's `os/exec` runs programs: `clone(CLONE_VM\|CLONE_VFORK)`, own pipes, `execve`, `wait4`, zombies that keep an exit status for their parent. Measured from a real Go binary rather than guessed, including that refusing `CLONE_PIDFD` makes Go fall back on its own. |
-| P11 Thermal/DVFS | **Policy done, hardware unverifiable here (2026-10-22).** A pure, host-tested policy (temperature overrules load, hysteresis against flapping) and a governor driven through ports, proved end to end against a ramping fake sensor (`minikern.cpufreq=test`). The H3 sensor and PLL adapters have **never run on silicon** — QEMU models neither — so the real path is off unless `minikern.cpufreq=on`. |
+| P11 Thermal/DVFS | **Policy done, idle power done, hardware unverifiable here (2026-10-22).** A pure, host-tested policy (temperature overrules load, hysteresis against flapping) and a governor driven through ports, proved end to end against a ramping fake sensor (`minikern.cpufreq=test`). The H3 sensor and PLL adapters have **never run on silicon** — QEMU models neither — so the real path is off unless `minikern.cpufreq=on`. |
 | P9 Storage | **NBD, and XFS a program can actually use (2026-10-22): reading, formatting, logged writes, creating files, growing them and removing them.** Our own NBD client over our own TCP, a buffer cache, `/dev/nbd0`, a Go NBD server in-tree — and an XFS v5 reader that mounts filesystems Linux made, lists every directory shape and reads files byte for byte, refusing every feature it does not fully understand and every dirty log. A Go program formats a volume over the network (`userland/internal/xfsmk`) and `mount("/dev/nbd0", "/mnt", "xfs", …)` mounts it; `xfs_repair` finds nothing wrong with what the board writes (`XFS.md`). |
 
 A Go program on the board can now also reach a **network block device** and
@@ -67,7 +67,7 @@ the filesystem one `mkfs.xfs` made — and a write that grows a file into blocks
 it already owns goes through the **log**, as a transaction `xfs_logprint`
 decodes field by field (XFS.md §9).
 
-**The goal is met in QEMU:** a standard `GOOS=linux GOARCH=arm` Go binary, and a TinyGo one, run unchanged on a kernel that copies no Linux code — and a Go program can now fetch its own root filesystem over the network and talk TCP and UDP. 47 Bazel test targets prove it on every change.
+**The goal is met in QEMU:** a standard `GOOS=linux GOARCH=arm` Go binary, and a TinyGo one, run unchanged on a kernel that copies no Linux code — and a Go program can now fetch its own root filesystem over the network and talk TCP and UDP. 61 Bazel test targets prove it on every change.
 
 ---
 
@@ -94,7 +94,7 @@ says C follows them "in spirit". This is how minikern applies them:
 | Go code in a C project | The netboot server (`server/`) and the userland programs (`userland/cmd/*`) are Go, inside a C project's tree, because they are parts of *this* system: a protocol has two ends and they must agree. They follow the master Go rules (hexagonal, `interfaces.go`, `models.go`, `errors.go`, flags, tests with benchmarks). |
 | Security posture script (Rule 29) | The script runs Go scanners, so it does not apply yet. It will apply to any Go code this project adds (the `/init` program, a netboot server). For C, `-Wall -Wextra -Werror` is the floor. The CVE-class review (Rule 25) starts with P1, because a network stack is attack surface: malformed frames, ARP/DHCP spoofing, length-field overflows. |
 | Pure-static Go binaries | N/A to the kernel. The Go programs it runs are static ELF by construction. |
-| Versioning (Rule 28) | The series comes from `//:version.bzl` through `local_defines`. The build part is `0` until stamping is wired for C (TASKS.md P0.10). |
+| Versioning (Rule 28) | The series comes from `//:version.bzl` through `local_defines`; the build part is Bazel's build timestamp, written into a generated C file by `build_stamp`. **One deviation:** the rule says `--stamp`, but the Starlark call that reveals it is private API, so the opt-in is our own build setting with the same shape — `--//:stamp`. An unstamped build still reports `0` rather than a number that means nothing. |
 
 **No libc, no third-party code — not even libgcc.** Everything the kernel needs is
 written here: `memcpy` and friends (`src/lib/kmem.c`), 64-bit division
@@ -225,6 +225,10 @@ green. `:qemu_tests` is a `test_suite` naming them all:
 | `xfs_live_test` | P9.2: the XFS reader against filesystems `mkfs.xfs` made, judged by `xfs_repair` |
 | `mkfsxfs_live_test` | P9.3: the Go formatter's output, judged by `xfs_repair` and then read by our own reader |
 | `xfs_qemu_test` | P9.3: the board formats a filesystem over the network, mounts it, reads it — and `xfs_repair` on the host approves it |
+| `netboot_two_guests_test` | P5.6: one board serves another its root filesystem on a segment of their own, with nothing of the host in the conversation |
+| `entropy_qemu_test` | two boots of one image produce different random bytes |
+| `cpuoff_qemu_test` | idle cores power themselves off and come back, four cores still offered, same result |
+| `cpufreq_qemu_test` | P11: the governor against a ramping fake sensor, with and without a supply pin |
 
 **Userland programs** live in `userland/cmd/<name>/main.go` and build with rules_go
 (`goos = "linux"`, `goarch = "arm"`, `pure = "on"`). `minikern_rootfs` (in `minikern.bzl`)
@@ -249,10 +253,12 @@ Kernel command line (all optional):
 | `minikern.netboot.key=<hex>` | the Ed25519 public key whose holder's offers this board will accept, refusing every other — so only one machine can say what it runs |
 | `minikern.rootfs.sha256=<hex>` | accept only a netbooted root filesystem with this digest, refusing every other offer — so answering the sweep first decides nothing |
 | `minikern.nbd=<ip>[:<port>][/<export>]` | attach a network block device as `/dev/nbd0` before init runs (port 10809 by default) |
+| `minikern.ip=<addr>/<prefix>` | bring the interface up with this address and run no DHCP client (with `minikern.gw=` beside it) |
+| `minikern.mac=<xx:xx:xx:xx:xx:xx>` | use this hardware address instead of the one derived from the chip's serial number — needed for two QEMU guests, which share a serial number |
 | `minikern.dns=<ip>` | the resolver `/etc/resolv.conf` should name, instead of the lease's |
 | `minikern.hangcheck=<seconds>` | panic with the task table when every core has been idle this long and something is still asleep — a lost wakeup reported instead of a silent hang |
+| `minikern.cpuoff=1` | let an idle core power itself off with PSCI CPU_OFF, started again when work appears (the boot core never parks) |
 | `minikern.smp=off` | do not start the other three cores at all |
-| `minikern.smp=all` | let them schedule too — experimental, and known to hang (TASKS.md P10.3) |
 | `minikern.netstat=1` | print the interface, TCP and block-cache counters when init exits |
 | `minikern.env.NAME=VALUE` | put `NAME=VALUE` in init's environment |
 
@@ -317,6 +323,7 @@ src/
 │   ├── watchdog.*  feeds the board's watchdog while the tick still arrives
 │   ├── thermal.*   reads the temperature, asks the policy, moves the clock
 │   ├── futex.*, time.*, irq.*, fault.*, random.*, tty.*, panic.*, selftest.*
+│   ├── entropy.*   a pool fed by the times at which interrupts arrive
 │   ├── net.*       the live interface: EMAC frames in, tick, DHCP, echo service
 │   ├── netboot.*   fetches the root filesystem before init runs
 │   ├── dma.*       an uncached window of RAM for descriptor rings and buffers
@@ -532,12 +539,17 @@ syscall interface above. No `/proc/sys` tree is wanted.
 - **TCP** (`core/net/tcp.h`) implements the state machine, sequence arithmetic with
   wraparound, a send queue with one retransmission timer and exponential backoff, a
   real advertised window, the MSS option, RST generation and validation, and a
-  bounded accept backlog. It does **not** do congestion control, SACK, window
-  scaling, timestamps, urgent data, or out-of-order reassembly (an early segment is
-  dropped and the peer resends it). TIME_WAIT is 2 s rather than two maximum segment
-  lifetimes, because 16 connections cannot be held for minutes. Each of those is a
-  throughput limit, never a correctness shortcut on the wire; they are listed in the
-  header so the next reader does not have to find out.
+  bounded accept backlog, **congestion control** in Reno's shape (slow start,
+  congestion avoidance, fast retransmit and fast recovery) and **reassembly** of
+  segments that arrive early — four held per connection, after which one is dropped
+  and the peer resends it, which is what the stack did with all of them before.
+  It does **not** do SACK, window scaling, timestamps or urgent data. SACK is the
+  one worth wanting and it improves on reassembly rather than replacing it: without
+  the queue there is nothing to acknowledge selectively, and with it a loss already
+  costs one round trip instead of a window's worth. TIME_WAIT is 2 s rather than two
+  maximum segment lifetimes, because 16 connections cannot be held for minutes. Each
+  of those is a throughput limit, never a correctness shortcut on the wire; they are
+  listed in the header so the next reader does not have to find out.
 - **The source address must be the one the upper layer checksummed.** IPv4 used to
   stamp `nif->ip` on every packet, which broke every loopback TCP connection: TCP had
   computed its checksum over `127.0.0.1`. `net_ip_send_from` and
@@ -560,9 +572,7 @@ syscall interface above. No `/proc/sys` tree is wanted.
   rest in user space over the UDP sockets it already has. `minikern.dns=`
   overrides the lease and survives it, because a lease arriving later would
   otherwise overwrite exactly the thing the override is for.
-- **Not yet**: DHCP lease renewal (P1.11), IPv6, congestion control, and
-  `SO_RCVTIMEO`-style socket timeouts (Go uses its own deadlines, so nothing needs
-  them yet).
+- **Not yet**: IPv6, and SACK (see above).
 - **QEMU wiring:** `-nic user` for DHCP and egress; `hostfwd=` to reach the guest's
   ports from the host; and, for the guest's *outbound* TCP, an address on the real
   network, because slirp does not forward guest TCP to `10.0.2.2` (§10).
@@ -657,6 +667,22 @@ syscall interface above. No `/proc/sys` tree is wanted.
   *Found by writing a character to the UART's physical address at each step of the
   bring-up:* the core printed its way to the MMU enable and no further, which is
   the only kind of evidence available before there is a console.
+- **Per-core state outlives the core.** A core that powers itself off
+  (`minikern.cpuoff=1`) comes back through `_secondary_start` with its MMU off and
+  `mmu_init_cpu` pointing TTBR0 at the empty table — while `proc.c`'s per-core record
+  of *which address space it has installed* still named the one from before. The next
+  switch to that same process therefore skipped the TTBR0 write, and the core ran user
+  code with no user mapping: a prefetch abort on its first instruction, in SVC with
+  interrupts masked, which looks like a wedged machine rather than a fault. Anything a
+  core caches **about its own registers** has to be invalidated by whatever sets those
+  registers from nothing. It is the vfork bug below from the other direction: there the
+  record was guessed, here it outlived what it described.
+- **A "did it come back?" check must not be satisfiable by "it never left".** The same
+  work proved its wake path by requiring every core to have more than zero kernel
+  entries — which every core already had from the one entry it made before it ever
+  parked, so a wake that started nothing passed. Measure the thing that only happens
+  if the cycle runs: entries in the thousands, and more power-offs than there are
+  cores.
 - **A secondary cannot use the primary's boot table.** `mmu_init` gives the low
   half to user space, so by the time a core is started there is no identity
   mapping for the physical address it is entered at. It gets its own table

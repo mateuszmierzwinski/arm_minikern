@@ -141,9 +141,12 @@ static int tcp_sock_accept(struct sock *s, struct sock **out, bool nonblock) {
         if (nonblock) {
             return KERR_AGAIN;
         }
-        rc = sched_sleep(s, 0, 0, true);
+        rc = sched_sleep(s, 0, sock_deadline(s, false), true);
         if (rc == KERR_INTR) {
             return rc;
+        }
+        if (rc == KERR_TIMEDOUT) {
+            return KERR_AGAIN; /* SO_RCVTIMEO applies to accept too */
         }
     }
     rc = wrap_accepted(c, out);
@@ -181,9 +184,12 @@ static int32_t tcp_sock_send(struct sock *s, const void *buf, uint32_t n, const 
             if (nonblock) {
                 return done > 0 ? (int32_t)done : KERR_AGAIN;
             }
-            rc = sched_sleep(s, 0, 0, true);
-            if (rc == KERR_INTR) {
-                return done > 0 ? (int32_t)done : rc;
+            rc = sched_sleep(s, 0, sock_deadline(s, true), true);
+            if (rc == KERR_INTR || rc == KERR_TIMEDOUT) {
+                /* What was already sent counts: a partial write is not a
+                 * failure, and a caller that is told 0 bytes went when some
+                 * did will send them twice. */
+                return done > 0 ? (int32_t)done : (rc == KERR_INTR ? rc : KERR_AGAIN);
             }
         }
     }
@@ -206,9 +212,12 @@ static int32_t tcp_sock_recv(struct sock *s, void *buf, uint32_t n, struct sock_
         if (nonblock || (flags & MSG_DONTWAIT) != 0) {
             return KERR_AGAIN;
         }
-        rc = sched_sleep(s, 0, 0, true);
+        rc = sched_sleep(s, 0, sock_deadline(s, false), true);
         if (rc == KERR_INTR) {
             return rc;
+        }
+        if (rc == KERR_TIMEDOUT) {
+            return KERR_AGAIN;
         }
     }
 }

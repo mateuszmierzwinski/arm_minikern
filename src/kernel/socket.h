@@ -73,8 +73,19 @@ struct sock {
     bool bound;
     bool connected;
     int error;              /* SO_ERROR: the last asynchronous failure */
+    /* SO_RCVTIMEO and SO_SNDTIMEO, in milliseconds, 0 for "wait for ever".
+     *
+     * Go never sets these — it has its own deadlines — but anything else
+     * does, and a receive with no timeout is how a program written in C
+     * ends up hung on a socket that will never speak again. */
+    uint32_t recv_timeout_ms;
+    uint32_t send_timeout_ms;
     void *proto;            /* the protocol's own state */
 };
+
+/* How long a blocking operation on s may wait, as a deadline in monotonic
+ * nanoseconds: 0 means for ever, which is what sched_sleep understands. */
+uint64_t sock_deadline(const struct sock *s, bool sending);
 
 /* Makes a socket file. KERR_OK with *out, or -errno. */
 int socket_create(int domain, int type, int protocol, struct file **out);

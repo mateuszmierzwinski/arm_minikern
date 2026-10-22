@@ -54,16 +54,33 @@ Legend: `[x]` done · `[ ]` to do · `[~]` partial
 - [x] **P0.7 Exceptions and panic (2026-10-21).** `vectors.S` saves every trap on the
       SVC stack with `srsdb`. Kernel faults dump the registers and panic. Under
       `minikern.selftest=undef|dabt|pabt`, the boot test asserts all three.
-- [ ] **P0.8 Own the UART.** Program UART0 ourselves: the CCU gate and reset bits, a
-      baud divisor from the 24 MHz APB clock, 8N1, FIFO on. Booting no longer
-      depends on U-Boot's setup.
+- [x] **P0.8 Own the UART (2026-10-22).** UART0 is programmed here: its clock gate
+      and reset in the CCU, the divisor for 115200 from the 24 MHz APB2 clock
+      (13 — 0.16% out, where a UART tolerates about 2%), 8N1 and both FIFOs on.
+      Anything still in the shift register is allowed to leave first, or the last
+      line of whoever ran before us becomes rubbish on the wire.
+      Nothing *needed* this: U-Boot leaves the port configured and QEMU needs no
+      setup at all. That is the problem it solves — a kernel that depends on
+      whoever ran before it having set the console up has no console the first
+      time something else boots it, and a silent board is the hardest kind to
+      look at. It is also self-checking: a wrong divisor, gate or frame makes the
+      console go silent, which every test in the project notices at once.
 - [ ] **P0.9 Real hardware.** An SD card with mainline U-Boot (`nanopi_neo`), a
       `boot.scr` that runs `bootm` with `${fdtcontroladdr}`, and a documented flash
       procedure in `README.md`. The banner must appear on the NEO's debug header.
       Optionally, the same SD image under QEMU (`-sd`, U-Boot `orangepi_pc`) to test
       the U-Boot path without the board.
-- [ ] **P0.10 Version stamp.** The build part of `MAJOR.MINOR.BUILD` from Bazel's
-      `{BUILD_TIMESTAMP}` on a `--stamp` build (master Rule 28.1), for C.
+- [x] **P0.10 Version stamp (2026-10-22).** The build part of `MAJOR.MINOR.BUILD`
+      is Bazel's own build timestamp, written into a generated C file by the
+      `build_stamp` rule; the series comes from the monorepo's one constant as
+      before. An ordinary build prints `1.0.0` and a stamped one `1.0.1792665133`.
+      *Deviation from master Rule 28.1, which says `--stamp`:* the Starlark call
+      that tells a rule whether `--stamp` was passed is **private API**, so the
+      opt-in is a build setting of our own with the same shape and default —
+      `bazel build --//:stamp`. The reason the rule
+      gives still holds: an unstamped build says 0 rather than printing a number
+      that means nothing. The stamp file is an input only when stamping, so an
+      ordinary build does not relink the kernel for a number it may not use.
 
 ## P1 — Network up (DHCP lease, answers ping) — done in QEMU (2026-10-21)
 
@@ -98,8 +115,24 @@ Legend: `[x]` done · `[ ]` to do · `[~]` partial
       echo/chargen ping-pong, LAND/martian sources. Each mitigation has a test in
       `net_test`. There is no TCP, DNS or fragment reassembly, so their classes have no
       surface yet: re-run this review when they arrive.
-- [ ] **P1.11 Lease renewal** at T1 and rebinding at T2. Slirp's lease is a day long;
-      a real LAN's may not be.
+- [x] **P1.11 Lease renewal (2026-10-22).** A lease is a loan with a term, and the
+      client now follows its clock: at **T1** — half the lease — it asks the server
+      that granted it, directly, from its own address and with the address in
+      `ciaddr` rather than as a requested-address option (which is what tells a
+      server this is an extension, RFC 2131 §4.3.6); at **T2** it stops expecting
+      that server and asks the subnet; and when the lease runs out it **gives the
+      address up**, because an address past its lease is someone else's to hand
+      out and keeping it is a conflict rather than a convenience. A NAK of a
+      renewal drops it too.
+      Five host cases over a controlled clock, including that an answered renewal
+      puts the clock back without the bound callback firing again. *Learned:* a
+      unicast renewal needs the server's hardware address first, so the ARP
+      exchange comes before the renewal on the wire — which the test has to answer
+      for the renewal to leave at all. And `dhcp_input` had to accept an ACK while
+      renewing: without that the client renews until the lease expires underneath
+      it.
+      Slirp's lease is a day long, so QEMU never exercises this; the host
+      cases are where it is proved, and a real LAN is where it matters.
 - [x] **P1.12 TCP (2026-10-21, with P7).** See P7.3.
 
 ## P2 — Kernel core — done (2026-10-21)
@@ -184,8 +217,27 @@ Legend: `[x]` done · `[ ]` to do · `[~]` partial
             from Go's `crypto/ed25519`, every single-bit flip of a 64-byte
             signature, and the field arithmetic against Python's arbitrary
             precision at p-1, p-2, (p-1)/2 and 2^254.
-- [ ] P5.6 Two-QEMU test over `-netdev socket,mcast=`, so discovery is proven
-      between two guests rather than through slirp's NAT.
+- [x] **P5.6 Two guests on a segment of their own (2026-10-22).** One board runs
+      the server — the same server the host runs, from the same packages,
+      cross-compiled and serving an image out of its own root filesystem — and the
+      other netboots from it with **no initrd at all**, so the only way it can run
+      a program is that the program arrived over the wire. It does: 1648640 bytes
+      in 1610 blocks, and then `hello from gc Go on minikern`.
+      This is what every other netboot test could not prove. The emulator's
+      address translation answers probes for addresses nobody owns and invents
+      hosts (CLAUDE.md §10), so "it found the server" has always meant "it found
+      the host"; here nothing on the host takes part in the conversation.
+      *Two things it needed, both of which are features now.* A **static address**
+      (`minikern.ip=`), because a segment with two machines on it has no DHCP
+      server — and a board on a network without one is not a strange case. And a
+      **hardware address on the command line** (`minikern.mac=`), because QEMU
+      gives every machine the same chip serial number and the address is derived
+      from it: two guests shared one address and neither could talk to the other,
+      which cost 250 probes to notice.
+      *And one thing that was not:* QEMU's multicast backend needs a host route
+      for the group, so two guests joined to one never see each other's frames. A
+      `listen`/`connect` socket pair is the same thing a cable between two boards
+      is, and needs nothing of the host but a port.
 
 ## P6 — Full Go (gc toolchain) — done on one core (2026-10-21)
 
@@ -194,7 +246,7 @@ Legend: `[x]` done · `[ ]` to do · `[~]` partial
       widths), signal delivery with the ARM `rt_sigframe`, `sigaltstack`,
       `rt_sigreturn`, a sigpage trampoline, `tgkill`, `nanosleep`, `sched_yield`,
       epoll + eventfd for the netpoller. `go_abi_qemu_test` covers it.
-- [ ] SMP across the H3's four cores (PSCI CPU_ON): needs real locks (CLAUDE.md §2).
+- [x] SMP across the H3's four cores — done in P10, with the lock it needed.
 
 ## P7 — Sockets for Go's `net` — done for UDP and TCP (2026-10-21)
 
@@ -216,23 +268,68 @@ Legend: `[x]` done · `[ ]` to do · `[~]` partial
       internet. *Learned:* QEMU's `guestfwd` is TCP-only, so the guest cannot be
       pointed at a host program on port 53 without root — the test aims the query
       with a `Dial` of its own and checks the generated file separately.
-- [ ] P7.6 `SO_RCVTIMEO`/`SO_SNDTIMEO` and `poll`/`select`, for programs that are
-      not Go.
+- [x] **P7.6 `poll`, `select` and the socket timeouts (2026-10-22).** Go uses none
+      of them — its netpoller is epoll, which is why epoll came first — so these
+      are for everything else, and they are tested by calling them raw from Go.
+      `poll` and `select` share one implementation of "what is ready, and how long
+      will you wait", because two would drift; `select`'s bitmaps are turned into
+      pollfds and back. A descriptor that is not open is `POLLNVAL` on that entry
+      rather than an error for the whole call.
+      `SO_RCVTIMEO` and `SO_SNDTIMEO` reach every blocking path — receive, send
+      and **accept** — and a timeout answers `EAGAIN`, as Linux does. A partial
+      send that then times out reports what it sent, because a caller told zero
+      will send those bytes twice.
+      *Learned in the test:* Go opens every socket non-blocking, so a read on one
+      returns EAGAIN immediately and would have passed a timeout test without the
+      kernel ever waiting. The test makes a blocking socket with raw syscalls,
+      which is the only kind the option means anything for.
 
 ## P8 — Hardening and gaps (found on the way)
 
-- [ ] **P8.1 `fork`/`execve`/`wait4`**: there is one process today. Go's `os/exec`
-      needs them, and the proof is a QEMU test in which a Go program starts another
-      program, pipes to it and reaps it.
-- [ ] TCP congestion control (it sends what the peer's window allows, which is
-      right on a LAN and wrong on a WAN), SACK, and out-of-order reassembly.
+- [x] **P8.1 `fork`/`execve`/`wait4`** — done below, with the `os/exec` test it
+      asked for.
+- [x] **TCP congestion control and reassembly (2026-10-22).** Two gaps, and they
+      were the same gap twice: the stack trusted the path.
+      **Congestion control** in Reno's shape: a window that starts at ten
+      segments (RFC 6928 — one was chosen when a round trip cost a second),
+      doubles each round trip while below the threshold, then grows by a segment
+      per round trip; three duplicate acknowledgements mean one segment is
+      missing and the rest arrived, so it is resent at once and the window is
+      halved rather than abandoned; a **timeout** is the strong signal and takes
+      the window back to one segment. Sending whatever the peer's window allowed
+      is right on a cable with nothing else on it and, anywhere else, means
+      filling a queue until it drops and then doing it again.
+      **Reassembly**: a segment that arrives early is now held — four of them per
+      connection — until the gap before it is filled, and filling one gap drains
+      everything that has become contiguous. A fifth is dropped, which is exactly
+      the old behaviour, so the limit degrades into what it replaces rather than
+      into a failure. The stack counts what it held, and the test asserts the
+      count rather than trusting that reordering happened.
+      **SACK is deliberately left out**, and the reason is worth keeping: it is an
+      improvement on reassembly rather than a substitute for it. Without the queue
+      there is nothing for a receiver to acknowledge selectively; with it, a loss
+      already costs one round trip instead of a window's worth.
 - [x] **The DMA window's cache state (2026-10-22).** `page_alloc` zeroes through the
       cacheable linear map, so handing that memory to a device left dirty lines to be
       written back over a packet later. It is cleaned and invalidated before the
       attributes change, and the cacheable alias unmapped so no page is reachable
       under two cacheabilities. `minikern.selftest=dma-alias` proves the alias faults.
       *Learned:* a QEMU-only test suite cannot see a cache bug at all (CLAUDE.md §10).
-- [ ] An RTC driver (the H3 has one, and so does QEMU) instead of `minikern.epoch=`.
+- [x] **An RTC driver (2026-10-22).** The board's own clock gives the wall time at
+      boot, so a kernel no longer starts in 1970 and a Go program's
+      `time.Now().Year()` is the current one — which is what the ABI suite now
+      asserts, before it goes on to set the clock.
+      **QEMU models this device** (`allwinner-rtc-sun6i`), so the register layout
+      was measured rather than assumed: a selftest printed the two registers raw
+      and they matched the host's clock to the second, with the year counted from
+      1970 and the weekday in the top bits. The calendar arithmetic is pure and
+      host-tested — the epoch, a leap day, the end of a leap year, 2100 (which is
+      not a leap year), and a day-by-day sweep from 1999 to 2101 where every day
+      must be 86400 seconds after the one before.
+      An unset clock reads as zeroes and is **refused** by the conversion rather
+      than turned into a plausible-looking lie; `minikern.epoch=` still wins when
+      given, because an operator who says what time it is has a reason, and
+      because that is how the tests pin one.
 - [x] **P8.9 `clock_settime` (2026-10-22).** `settimeofday`, `clock_settime` and
       `clock_settime64` set the wall clock; the monotonic clock is the generic timer
       and cannot be moved, which the test checks. An NTP client in Go can now fix
@@ -257,14 +354,64 @@ Legend: `[x]` done · `[ ]` to do · `[~]` partial
       that tried to judge whether work was *progressing* would reboot an idle
       board, which is how watchdogs get turned off. `minikern.hangcheck` remains
       the software half, for the case where the tick is still arriving.
-- [ ] A real entropy source (the H3 crypto engine's PRNG, or timing jitter): today's
-      `getrandom` is xoshiro128** seeded from the timer and chip ID, which is fine for
-      hash seeds and not fine for keys.
-- [ ] `mprotect(PROT_NONE)` drops resident pages instead of keeping them inaccessible
-      (Go does not depend on this).
-- [ ] Out-of-memory policy: today a fault that cannot get a page kills the process.
-- [ ] Relative `..` in paths, symlinks with relative targets.
-- [ ] The VFP state is saved on every switch. Make it lazy once switches are frequent.
+- [x] **A real entropy source: the times at which interrupts arrive (2026-10-22).**
+      The generator was a good sequence from a bad seed — the timer and the chip's
+      serial number — and QEMU gives every machine the same serial number and starts
+      the timer at zero, so **two boots produced the same bytes**. Fine for the hash
+      seeds Go asks for; not fine for a key, which matters in a tree that verifies
+      signatures.
+      The kernel now harvests what it actually has: the cycle counter read at every
+      interrupt, mixed into a pool a word at a time on the interrupt path and read out
+      through SHA-256 in counter mode, so a read neither hands out the pool nor repeats
+      itself. `getrandom` draws from the pool once it has had its fill of samples
+      (128, which a boot passes in its first moments) and mixes it into the generator
+      before then.
+      **The H3 crypto engine was the other candidate and is not usable**: QEMU models
+      no crypto engine, so its register sequence could be written but never run — and
+      an unrunnable driver for the one thing a key depends on is worse than none.
+      *What the test proves and what it does not.* `entropy_qemu_test` boots the same
+      image twice and requires the bytes to differ, which is the mechanism working. It
+      does not prove the bytes are unpredictable, and does not claim to: under an
+      emulator the jitter follows the host's scheduler, and on real hardware it is a
+      packet arriving from another machine and a clock that is not ours. One run can
+      never tell those apart, which is exactly how a test comes to bless a constant.
+- [x] **`mprotect(PROT_NONE)` keeps the pages (2026-10-22).** The page table can
+      say "mapped, and user space may not touch it" (AP = privileged only), so a
+      program that protects a region and unprotects it finds its own bytes rather
+      than zeroes. Dropping them was a different program's behaviour. Go does not
+      depend on it, which is exactly why it has a test of its own.
+- [x] **Out-of-memory policy (2026-10-22).** Two halves, and a test for both:
+      memory is handed out **optimistically** — a Go runtime reserves half a
+      gigabyte of address space it never touches, so refusing by size would refuse
+      every Go program — and the process that finally cannot be given a page is
+      **killed with SIGKILL**, with the reason printed once.
+      It used to get SIGSEGV, which says the wrong thing: a runtime that catches
+      those (Go's does) reports "invalid memory address" and the real cause is
+      lost. On the board, a program reaches 504 MiB of 512 and is then killed by
+      signal 9.
+- [x] **Relative `..` in paths, and symlinks with relative targets
+      (2026-10-22).** `..` is resolved against what came before it, which is what
+      makes a relative path usable — and doing it *before* anything looks at the
+      name is what keeps it from being a way out of the root: `..` at the top has
+      nothing to remove, so it folds away. A symlink with a relative target is now
+      resolved against the link's own directory rather than refused, with the
+      depth **bounded** (a link to itself is the easy loop, two links to each
+      other the next). Every root filesystem carries one link of each kind, so the
+      resolver always has something to resolve, and the ABI suite reads a file
+      through both.
+- [x] **The floating-point state moves only when it is used (2026-10-22).** The
+      unit is switched **off** for the thread being switched to, and the first
+      floating-point instruction it runs traps as undefined — which is where the
+      previous owner's registers are saved, this thread's restored, and the
+      instruction retried. A thread that never does arithmetic (a goroutine on a
+      channel, the netpoller) never pays for thirty-two registers.
+      The kernel reports both numbers so the claim can be checked rather than
+      believed, and the SMP test asserts the relation: **7 moves in 67 switches**.
+      *Two things it cost:* saving the old state before switching the unit on
+      traps again, in kernel mode, where an undefined instruction is a panic; and
+      signal delivery assumed the registers are always live in the hardware, which
+      was true when every switch restored them and became a way to read whichever
+      thread last did arithmetic.
 
 ---
 
@@ -434,11 +581,12 @@ Stage 1 is a big kernel lock on purpose. The payoff is Go running `GOMAXPROCS=4`
       of freezing: `minikern.hangcheck=<seconds>`. The last bug was invisible
       without it — a sleeping thread belonging to a process with no other threads.
 
-- [ ] **P10.4 Finer locks, where profiling asks.** Not before: the one lock holds
-      and `klock_report` gives the contention count (743 of 1508 entries on four
-      cores in the SMP test) to aim at.
-- [ ] **P10.4 Finer locks only where profiling says so** — likely futex, the network
-      stack, the run queue. Not designed up front.
+- [~] **P10.4 Finer locks, where profiling asks — a decision, not a gap.** The one
+      lock holds, and `klock_report` gives the number to aim at when there is a
+      reason to (743 contended of 1508 entries on four cores). Splitting it before
+      a profile says which structure is the contended one would be guessing, and
+      every split is a chance to introduce exactly the kind of bug P10.3 lists.
+(Finer locks are P10.4 below, and deliberately not designed up front.)
 
 ---
 
@@ -486,5 +634,39 @@ is worse than no frequency scaling.
       host cases over every boundary and every kind of rubbish); the pin
       controller itself is **unverified on silicon**, since QEMU does not model
       it.
-- [ ] **P11.4 A governor last, and least.** `wfi` in idle plus PSCI `CPU_OFF` for
-      unused cores saves more on this chip than frequency stepping does.
+- [x] **P11.4 Idle cores power themselves off (2026-10-22).** The claim this task
+      was written around is right, so it is what got built instead of another
+      governor: an idle Cortex-A7 that is **off** draws no core power, while one
+      sitting in `wfi` still has its clock and its voltage. A core with nothing to run
+      calls PSCI `CPU_OFF`, and is started again — re-entering at `_secondary_start`,
+      which is why the per-core setup had to be repeatable — when work appears.
+      `minikern.cpuoff=1`; off by default, because an emulator spends no power and
+      there is no reason to change how every boot schedules until the kernel runs on a
+      board.
+      **The invariant that makes it safe: the boot core never parks.** A wake always
+      races a power-off — firmware reports ALREADY_ON for a core that has decided to
+      go but has not gone — and the answer is not to win that race but to survive
+      losing it: a core that is still ticking retries the wake, so a lost one costs
+      the same millisecond an idle core already costs to notice work. Without a core
+      that cannot park, the last wake could be lost with nobody left to retry it.
+      **Three bugs, and two of them passed a test first.**
+      *The counter lied about what it measured.* Parking cleared the core's bit in the
+      online mask, so `smp_scheduling` fell to 1, Go sized `GOMAXPROCS` to 1 and built
+      a workload that never needed the other cores — which then stayed off. A power
+      optimisation had removed the parallelism it existed to save power on, and the
+      test passed. A parked core is available on demand, so it still counts.
+      *The wake passed a virtual address to firmware that wanted a physical one.*
+      Every core parked once, stayed off, and reported the single kernel entry it had
+      made on the way in — and "every core has more than zero entries" was satisfied
+      by exactly that. The check now wants entries in the thousands and more parks
+      than there are cores, because a core that comes back, finds the work done and
+      parks again is the cycle working.
+      *And the real one: a stale record of what the core had installed.* `mmu_init_cpu`
+      re-entry points TTBR0 at the empty table, while `proc.c`'s per-core record still
+      named the address space from before the power-off — so the next switch to that
+      same process skipped the TTBR0 write and the core ran user code with no user
+      mapping: a prefetch abort on the first instruction, in SVC with interrupts
+      masked, which presents as a wedged machine and not as a fault. It is the vfork
+      bug of P10.3 from the other direction — there the record was guessed, here it
+      outlived the register it described — and it was found by asking every core where
+      its PC was, which is the only tool that has ever worked on this class.

@@ -110,9 +110,12 @@ static int wait_datagram(struct sock *s, bool nonblock) {
         if (nonblock) {
             return KERR_AGAIN;
         }
-        rc = sched_sleep(s, 0, 0, true);
+        rc = sched_sleep(s, 0, sock_deadline(s, false), true);
         if (rc == KERR_INTR) {
             return rc;
+        }
+        if (rc == KERR_TIMEDOUT) {
+            return KERR_AGAIN; /* what a timed-out socket says, as on Linux */
         }
     }
     return KERR_OK;

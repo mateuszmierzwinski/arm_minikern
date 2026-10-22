@@ -40,8 +40,15 @@ static void on_bound(void *self, const struct netif *nif) {
     for (uint32_t m = nif->mask; m & 0x80000000u; m <<= 1) {
         prefix++;
     }
-    kprintf("net: eth0 %s/%u gw %s dns %s (dhcp, lease %u s)\n", ip4_format(nif->ip, ip), prefix,
-            ip4_format(nif->gateway, gw), ip4_format(nif->dns, dns), nif->lease_s);
+    /* Where the address came from, because "dhcp, lease 0 s" for an address
+     * nobody leased is a line that makes a reader doubt the rest. */
+    if (nif->dhcp.state == DHCP_OFF) {
+        kprintf("net: eth0 %s/%u gw %s dns %s (configured, no dhcp)\n", ip4_format(nif->ip, ip), prefix,
+                ip4_format(nif->gateway, gw), ip4_format(nif->dns, dns));
+    } else {
+        kprintf("net: eth0 %s/%u gw %s dns %s (dhcp, lease %u s)\n", ip4_format(nif->ip, ip), prefix,
+                ip4_format(nif->gateway, gw), ip4_format(nif->dns, dns), nif->lease_s);
+    }
     if (dns_override != 0 && knet.nif.dns != dns_override) {
         knet.nif.dns = dns_override;
         kprintf("net: keeping the resolver the command line named (%s)\n",
@@ -91,6 +98,23 @@ void knet_start(uint32_t xid) {
     static const struct tick_hook hook = {.tick = on_tick, .self = &knet};
     knet.nif.now_ms = time_monotonic_ns() / 1000000u;
     dhcp_start(&knet.nif, xid);
+    (void)time_add_hook(&hook);
+}
+
+void knet_start_static(ip4_t addr, uint32_t prefix, ip4_t gateway, ip4_t dns) {
+    static const struct tick_hook hook = {.tick = on_tick, .self = &knet};
+    knet.nif.now_ms = time_monotonic_ns() / 1000000u;
+    knet.nif.ip = addr;
+    knet.nif.mask = prefix >= 32u ? 0xffffffffu : ~((1u << (32u - prefix)) - 1u);
+    knet.nif.gateway = gateway;
+    knet.nif.dns = dns;
+    knet.nif.lease_s = 0; /* nothing granted it, so nothing expires */
+    knet.nif.dhcp.state = DHCP_OFF;
+    if (knet.nif.events.dhcp_bound != NULL) {
+        /* The same notification as a lease: everything above only wants to
+         * know that there is an address now, not where it came from. */
+        knet.nif.events.dhcp_bound(knet.nif.events.self, &knet.nif);
+    }
     (void)time_add_hook(&hook);
 }
 

@@ -123,4 +123,20 @@ int proc_become_single_threaded(struct proc *p);
 /* Renames the process, which is what /proc/self/stat and the logs show. */
 void proc_rename(struct proc *p, const char *name);
 
+/* Forgets which address space this core has installed, without touching
+ * the hardware — for a core that has just set its own translation
+ * registers from nothing and whose record of them is therefore stale.
+ *
+ * A core that powers itself off and is started again (arch/arm/smp.h)
+ * re-enters with `mmu_init_cpu` pointing TTBR0 at the empty table, while
+ * this record still named the address space it had before. The next switch
+ * to that same process then **skipped the TTBR0 write**, and the core ran
+ * user code with no user mapping at all: a prefetch abort on the first
+ * instruction, in SVC with interrupts masked, which looks like a wedged
+ * machine rather than a fault. It is the same mistake as the vfork one
+ * above, arrived at from the other direction — there the record was
+ * guessed, here it outlived the register it described.
+ */
+void proc_forget_installed_mm(void);
+
 #endif

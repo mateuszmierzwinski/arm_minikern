@@ -109,4 +109,9 @@ void tcp_changed(struct tcp_conn *c);
 void tcp_enter(struct tcp_conn *c, enum tcp_state state);
 void tcp_fail(struct tcp_conn *c, int error);
 
+/* Sends the oldest unacknowledged segment again now, without touching the
+ * backoff: what fast retransmit does when three duplicate acknowledgements
+ * say one segment is missing (net_tcp_in.c). */
+void tcp_retransmit_oldest(struct tcp_conn *c);
+
 #endif
