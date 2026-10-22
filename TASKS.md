@@ -210,7 +210,10 @@ Legend: `[x]` done · `[ ]` to do · `[~]` partial
       abandons a server that offers and then stalls, and falls back to the initrd.
 - [x] **P5.4 End-to-end test**, `netboot_qemu_test`: the real server on the host, the
       board with no initrd at all, a Go init running from the fetched archive.
-- [~] **P5.5 Who decides what the board runs.**
+- [x] **P5.5 Who decides what the board runs — done (2026-10-22).** Both halves
+      below: a pinned root digest, and an Ed25519 signature over the offer with the
+      verifier written from scratch here and **no signing**, so the private half never
+      exists on a board.
       - [x] **A pinned root digest (2026-10-22).** `minikern.rootfs.sha256=<hex>`
             accepts only the image with that digest, and refuses every other
             **at the offer** — so a machine that answers the sweep first cannot
@@ -476,8 +479,18 @@ after every test.**
       nothing wrong with it**. *Learned:* five numbers came from xfs_repair's own
       complaints rather than from any document (XFS.md §7) — among them that the log
       record header's cycle-data array is 64 entries, not 56.
-- [~] **P9.4 Writes.** The log first. No log recovery at first: keep refusing a dirty
-      log and let Linux `xfs_repair` deal with a crash until replay exists.
+- [x] **P9.4 Writes — done as scoped (2026-10-22).** All four parts below are done:
+      data into blocks a file already owns, the log, creating a file, and removing one
+      or growing it past its own blocks. `xfs_repair -n` is clean after every test,
+      which is the rule this phase was built around.
+      **Log recovery (replay) is deliberately not here, and that is the scope this
+      task was written with** — "no log recovery at first: keep refusing a dirty log".
+      The safe behaviour is the one implemented: a filesystem whose log is not clean
+      is **refused at mount**, so a crash is Linux's `xfs_repair` to deal with rather
+      than something this kernel guesses at. Replaying another implementation's log
+      correctly is a larger piece of work than writing one, and getting it subtly
+      wrong corrupts a filesystem that was merely dirty. It stays out until there is
+      a reason to want it, like SACK (TCP) and finer locks (P10.4).
       - [x] **P9.4a File data into blocks a file already has (2026-10-22).** XFS does
             not journal data, so this changes no metadata and needs no transaction —
             which is why it is possible before the log exists. A hole, an unwritten
@@ -608,7 +621,7 @@ Stage 1 is a big kernel lock on purpose. The payoff is Go running `GOMAXPROCS=4`
       of freezing: `minikern.hangcheck=<seconds>`. The last bug was invisible
       without it — a sleeping thread belonging to a process with no other threads.
 
-- [~] **P10.4 Finer locks, where profiling asks — a decision, not a gap.** The one
+- [x] **P10.4 Finer locks — the decision is the deliverable (2026-10-22).** The one
       lock holds, and `klock_report` gives the number to aim at when there is a
       reason to (743 contended of 1508 entries on four cores). Splitting it before
       a profile says which structure is the contended one would be guessing, and
