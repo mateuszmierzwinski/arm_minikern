@@ -60,4 +60,9 @@ bool klock_held_here(void);
  * so a slow board can be told from a contended one. */
 void klock_stats(uint64_t *acquires, uint64_t *contended);
 
+/* Prints how many times each core has been inside the kernel. A zero for a
+ * core that is supposed to be scheduling means it is not being used, which
+ * is the one thing an "N cores up" line cannot tell you. */
+void klock_report(void);
+
 #endif

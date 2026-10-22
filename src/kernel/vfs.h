@@ -58,6 +58,7 @@ struct file {
     const uint8_t *data;   /* memory-backed files: the bytes */
     uint32_t size;
     void *owned;           /* freed on release (generated contents) */
+    void *shared;          /* state belonging to something else: never freed here */
     void *priv;            /* the filesystem's per-open state */
     uint32_t poll_gen;     /* bumped on every readiness change (edge-triggered epoll) */
     char name[64];         /* directories: the normalised path, for listing */

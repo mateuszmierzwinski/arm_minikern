@@ -12,6 +12,8 @@
 #define KERR_IO      (-5)
 #define KERR_NOEXEC  (-8)   /* not an executable format we run */
 #define KERR_BADF    (-9)   /* not an open file descriptor */
+#define KERR_PIPE    (-32)  /* writing to a pipe with no reader */
+#define KERR_CHILD   (-10)  /* no child processes */
 #define KERR_AGAIN   (-11)  /* try again (also EWOULDBLOCK) */
 #define KERR_NOMEM   (-12)  /* out of memory */
 #define KERR_ACCES   (-13)  /* permission denied */
@@ -28,6 +30,7 @@
 #define KERR_SPIPE   (-29)  /* not seekable */
 #define KERR_ROFS    (-30)  /* read-only filesystem or device */
 #define KERR_RANGE   (-34)
+#define KERR_2BIG        (-7)   /* the argument list is too long */
 #define KERR_NAMETOOLONG (-36)
 #define KERR_NOSYS   (-38)  /* not implemented */
 #define KERR_NOTEMPTY (-39)

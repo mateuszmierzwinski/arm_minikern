@@ -52,7 +52,7 @@ for _ in $(seq 1 50); do
 done
 grep -q "listening on" "$tmp/server.log" || { cat "$tmp/server.log"; fail "the server did not start"; }
 
-timeout 120 qemu-system-arm -M orangepi-pc -display none -monitor none -serial "file:$log" \
+timeout 300 qemu-system-arm -M orangepi-pc -display none -monitor none -serial "file:$log" \
     -nic user -kernel "$image" -initrd "$rootfs" \
     -append "console=uart0 minikern.halt=poweroff minikern.netstat=1 minikern.nbd=$host_ip:$port/vol" ||
     { echo "---- console"; cat "$log"; echo "---- server"; cat "$tmp/server.log"; fail "qemu did not power off"; }
@@ -111,7 +111,11 @@ grep -q "served \"vol\"" "$tmp/server.log" || fail "the server did not log the s
 command -v mkfs.xfs >/dev/null || { echo "mkfs.xfs is not installed" >&2; exit 1; }
 
 echo "---- phase two: a filesystem with a file in it"
-head -c 262144 /dev/urandom >"$tmp/data.bin"
+# Deliberately **not** a multiple of the block size: the last block then has
+# room in it, and growing a file into room it already owns is a metadata
+# change (its recorded size) without an allocation — which is the write the
+# log makes possible.
+head -c 262000 /dev/urandom >"$tmp/data.bin"
 {
     echo DUMMY
     echo "0 0"
@@ -130,7 +134,7 @@ xfs_repair -n "$vol" >/dev/null 2>&1 || fail "mkfs.xfs made an image xfs_repair 
 pattern_before="$(tr -dc '\176' <"$vol" | wc -c)"
 
 log="$tmp/console2.log"
-timeout 120 qemu-system-arm -M orangepi-pc -display none -monitor none -serial "file:$log" \
+timeout 300 qemu-system-arm -M orangepi-pc -display none -monitor none -serial "file:$log" \
     -nic user -kernel "$image" -initrd "$rootfs" \
     -append "console=uart0 minikern.halt=poweroff minikern.nbd=$host_ip:$port/vol minikern.env.MINIKERN_XFS_MODE=write" ||
     { echo "---- console"; cat "$log"; fail "qemu did not power off in phase two"; }
@@ -143,6 +147,7 @@ expect "PASS read-existing"
 expect "PASS write-data"
 expect "PASS read-back"
 expect "PASS refuse-create"
+expect "PASS grow-into-own-block"
 expect "PASS refuse-grow"
 expect "ALL XFS PASS"
 expect "init exited with status 0"
@@ -168,5 +173,50 @@ echo "0x7e bytes in the volume: $pattern_before before, $pattern_after after"
 # difference.
 [ "$pattern_after" -ge 40000 ] || fail "the board's 40000 bytes are not in the volume"
 [ "$pattern_after" -gt "$pattern_before" ] || fail "the volume did not change at all"
+
+# ── the log, and the inode the board rewrote ───────────────────────────────
+#
+# Two judges neither of which is ours: xfs_logprint reads the records the
+# board wrote, and xfs_db reads the size it recorded.
+echo "---- xfs_logprint reads what the board wrote to the log"
+if ! xfs_logprint -t "$vol" >"$tmp/logprint.log" 2>&1; then
+    cat "$tmp/logprint.log"
+    fail "xfs_logprint could not read the log"
+fi
+cat "$tmp/logprint.log"
+grep -qiE 'bad|corrupt|invalid|error' "$tmp/logprint.log" &&
+    fail "xfs_logprint found something wrong with the log"
+# <CLEAN> is xfs_logprint's own recognition of the unmount record the board
+# wrote at the head: it is the judge saying the log needs no recovery.
+grep -q "state: <CLEAN>" "$tmp/logprint.log" ||
+    fail "xfs_logprint does not consider the log clean"
+
+echo "---- and the transaction record the board wrote before it"
+if ! xfs_logprint -t -i -s 0 "$vol" >"$tmp/logdump.log" 2>&1; then
+    cat "$tmp/logdump.log"
+    fail "xfs_logprint could not read the transaction the board wrote"
+fi
+cat "$tmp/logdump.log"
+# The transaction, read back by a tool that is not ours: one item, an inode
+# core, and the fields of the inode the board actually changed.
+grep -q "#items:1" "$tmp/logdump.log" || fail "the record does not hold one item"
+grep -q "INODE: #regs:2" "$tmp/logdump.log" || fail "the inode item is not two regions"
+grep -q "CORE inode:" "$tmp/logdump.log" || fail "the item does not carry an inode core"
+grep -qE 'magic:IN .*format:2' "$tmp/logdump.log" ||
+    fail "the logged core is not an extents-format inode"
+# 262100 = 0x3ffd4, the size the board grew the file to.
+grep -q "size:0x3ffd4" "$tmp/logdump.log" ||
+    fail "the logged core does not carry the size the board recorded"
+log_bb=$(xfs_db -r -c "sb 0" -c "print logstart" "$vol" | awk '{print $3}')
+log_daddr=$(xfs_logprint -t "$vol" | sed -n 's/.*daddr: \([0-9]*\).*/\1/p')
+echo "the log starts at fsb $log_bb, daddr $log_daddr; its first three blocks:"
+dd if="$vol" bs=512 skip="$log_daddr" count=3 2>/dev/null | hexdump -C | head -36
+
+echo "---- and xfs_db agrees about the size the board recorded"
+xfs_db -r -c "path /data.bin" -c "print core.size" "$vol" >"$tmp/size.log" 2>&1 ||
+    fail "xfs_db could not read the file's inode"
+cat "$tmp/size.log"
+grep -q "core.size = 262100" "$tmp/size.log" ||
+    fail "the size the board grew the file to is not on the disk"
 
 echo PASS

@@ -1,6 +1,7 @@
 #include <stddef.h>
 
 #include "core/errno.h"
+#include "lib/crc32c.h"
 #include "core/xfs/xfs_internal.h"
 
 /* Reading a file's bytes.
@@ -113,6 +114,18 @@ int xfs_flush(struct xfs *fs) {
  * extent allocated but never written, a block past the end of the file —
  * would mean changing the inode, the free-space trees or the extent list,
  * and all of that has to go through the log first (P9.4). */
+static void put_be64(uint8_t *p, uint64_t v) {
+    for (uint32_t i = 0; i < 8; i++) {
+        p[i] = (uint8_t)(v >> (56u - 8u * i));
+    }
+}
+
+static void put_le32(uint8_t *p, uint32_t v) {
+    for (uint32_t i = 0; i < 4; i++) {
+        p[i] = (uint8_t)(v >> (8u * i));
+    }
+}
+
 static int write_chunk(struct xfs *fs, const struct xfs_inode *ip, uint64_t at, const uint8_t *in,
                        uint32_t within, uint32_t chunk) {
     struct xfs_extent e;
@@ -135,6 +148,24 @@ static int write_chunk(struct xfs *fs, const struct xfs_inode *ip, uint64_t at, 
     return KERR_OK;
 }
 
+/* How many bytes the file's existing blocks could hold, which is where a
+ * write may reach without anything being allocated. A file's last block is
+ * usually only partly used — a 10-byte file still owns 4096 — and growing
+ * into that room is a metadata change (the recorded size) but not an
+ * allocation. */
+static uint64_t allocated_bytes(const struct xfs *fs, const struct xfs_inode *ip) {
+    uint64_t end = 0;
+    for (uint64_t block = 0;; block++) {
+        struct xfs_extent e;
+        if (xfs_bmap(fs, ip, block, &e) != KERR_OK) {
+            break;
+        }
+        end = (e.startoff + e.blockcount) << fs->blocklog;
+        block = e.startoff + e.blockcount - 1u;
+    }
+    return end > ip->size ? end : ip->size;
+}
+
 /* Checks a write before any of it happens: all of it must be possible, or
  * none of it is done. A half-written range would be worse than a refusal,
  * because the caller would have no way to know where it stopped. */
@@ -151,8 +182,11 @@ static int write_is_possible(struct xfs *fs, const struct xfs_inode *ip, uint64_
     if (ip->format != XFS_DINODE_FMT_EXTENTS) {
         return KERR_NOTSUP; /* a file held inside its inode would change it */
     }
-    if (off > ip->size || len > ip->size - off) {
-        return KERR_NOSPC; /* growing a file needs the log */
+    if (off > ip->size) {
+        return KERR_NOSPC; /* a hole past the end: that is the allocator's */
+    }
+    if (len > allocated_bytes(fs, ip) - off) {
+        return KERR_NOSPC; /* past the blocks the file already has */
     }
     for (uint64_t block = off >> fs->blocklog; block <= (off + len - 1u) >> fs->blocklog; block++) {
         struct xfs_extent e;
@@ -167,7 +201,42 @@ static int write_is_possible(struct xfs *fs, const struct xfs_inode *ip, uint64_
     return KERR_OK;
 }
 
-int xfs_file_write(struct xfs *fs, const struct xfs_inode *ip, uint64_t off, const void *buf,
+/* Records a file's new size: in the log first, then in its place.
+ *
+ * This is the only metadata a data write changes, and it is where the log
+ * earns its place in the order of things — a crash between the two leaves
+ * the change in the log rather than half done. What this kernel will not do
+ * is **replay** one (xfs_logwrite.c), so it also writes an unmount record
+ * afterwards and the reader goes on refusing a dirty log: Linux's
+ * `xfs_repair` stays the recovery tool.
+ *
+ * The inode's own checksum is recomputed, because a v5 inode carries one
+ * and an inode whose sum does not match is an inode nothing will read —
+ * including this reader, which is how it would be noticed. */
+static int record_new_size(struct xfs *fs, const struct xfs_inode *ip, uint64_t size) {
+    uint64_t block;
+    uint32_t boffset;
+    struct bbuf *b;
+    uint8_t *di;
+    int rc;
+    xfs_inode_place(fs, ip->ino, &block, &boffset);
+    rc = bcache_get(fs->cache, block, &b);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    di = b->data + boffset;
+    put_be64(di + XFS_DI_SIZE, size);
+    put_le32(di + XFS_DI_CRC, 0);
+    put_le32(di + XFS_DI_CRC, crc32c(di, fs->inodesize));
+    rc = xfs_log_inode(fs, ip->ino, block, boffset, di);
+    if (rc == KERR_OK) {
+        bcache_dirty(b);
+    }
+    bcache_put(fs->cache, b);
+    return rc;
+}
+
+int xfs_file_write(struct xfs *fs, struct xfs_inode *ip, uint64_t off, const void *buf,
                    uint32_t len, uint32_t *put) {
     const uint8_t *in = buf;
     uint32_t done = 0;
@@ -190,5 +259,15 @@ int xfs_file_write(struct xfs *fs, const struct xfs_inode *ip, uint64_t off, con
         done += chunk;
     }
     *put = done;
-    return KERR_OK;
+    if (off + done <= ip->size) {
+        return KERR_OK;
+    }
+    rc = record_new_size(fs, ip, off + done);
+    if (rc == KERR_OK) {
+        /* The in-memory inode follows the disk, or nothing above this ever
+         * learns the file grew: a stat would keep reporting the old size
+         * and a read would stop at it. */
+        ip->size = off + done;
+    }
+    return rc;
 }

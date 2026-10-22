@@ -75,6 +75,7 @@ func writePhase() {
 	check("write-data", writeData())
 	check("read-back", readBack())
 	check("refuse-create", refuseCreate())
+	check("grow-into-own-block", growIntoOwnBlock())
 	check("refuse-grow", refuseGrow())
 }
 
@@ -84,6 +85,11 @@ const (
 	writeAt   = 4096
 	writeByte = 0x7e
 	writeLen  = 40000
+	// The host made the file 262000 bytes, which is not a whole number of
+	// 4096-byte blocks: its last block has 144 bytes of room that the file
+	// already owns. Growing into that room changes the recorded size and
+	// nothing else, which is the write the log makes possible.
+	grownBy = 100
 )
 
 // readExisting proves the file is the one the host made before anything is
@@ -153,6 +159,44 @@ func refuseCreate() error {
 	return nil
 }
 
+// growIntoOwnBlock writes past the end of the file but inside the last
+// block it already owns. The size must grow, and the bytes must read back —
+// this is the one metadata change a data write makes, and it goes through
+// the log (core/xfs/xfs_logwrite.c).
+func growIntoOwnBlock() error {
+	f, err := os.OpenFile(target, os.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = f.Close() }()
+	info, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	was := info.Size()
+	want := make([]byte, grownBy)
+	for i := range want {
+		want[i] = byte('g')
+	}
+	if _, err = f.WriteAt(want, was); err != nil {
+		return fmt.Errorf("growing into the file's own last block: %w", err)
+	}
+	if info, err = f.Stat(); err != nil {
+		return err
+	}
+	if info.Size() != was+grownBy {
+		return fmt.Errorf("size is %d, want %d", info.Size(), was+grownBy)
+	}
+	got := make([]byte, grownBy)
+	if _, err = f.ReadAt(got, was); err != nil {
+		return err
+	}
+	if string(got) != string(want) {
+		return fmt.Errorf("the grown part reads back wrong")
+	}
+	return nil
+}
+
 func refuseGrow() error {
 	f, err := os.OpenFile(target, os.O_RDWR, 0)
 	if err != nil {
@@ -163,8 +207,10 @@ func refuseGrow() error {
 	if err != nil {
 		return err
 	}
-	if _, err := f.WriteAt([]byte("past the end"), info.Size()); err == nil {
-		return fmt.Errorf("a write past the end of the file succeeded")
+	// Past the end of the blocks the file owns, which needs the allocator
+	// and must still be refused.
+	if _, err := f.WriteAt(make([]byte, 4096), info.Size()); err == nil {
+		return fmt.Errorf("a write past the file's own blocks succeeded")
 	}
 	return nil
 }

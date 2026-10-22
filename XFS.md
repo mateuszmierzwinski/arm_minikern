@@ -301,3 +301,65 @@ The last one is the whole path: a Go program on the board formats a volume
 that is a file on a server — over this kernel's own TCP, its own NBD client
 and its own buffer cache — asks the kernel to mount it, reads it back, and
 then the host runs `xfs_repair` on that same file and finds nothing to say.
+
+---
+
+## 9. Writing the log, and the four facts that came out of xfs_logprint
+
+A metadata change goes to the log before it goes to its place. What this
+kernel does **not** do is replay one: the reader still refuses a dirty log,
+`xfs_repair` remains the recovery tool, and every batch ends with an unmount
+record so the log is clean again. That refusal buys a real simplification,
+and it is deliberate rather than unfinished — because the log is never left
+dirty, it is never a ring with a head to maintain, so each batch is written
+from the log's first block.
+
+The only metadata a data write changes is the file's recorded size, and that
+is what goes through the log today: a write may reach the end of the blocks
+the file already owns (a 262000-byte file owns 262144 bytes of them), and the
+size it leaves behind is logged, then written in place, with the inode's own
+CRC recomputed.
+
+**Four facts, each one settled by writing records by hand into an image and
+asking `xfs_logprint` about them** — the same method as the rest of this
+document, and the same reason: a judge that is not ours.
+
+| Fact | How it failed first |
+|---|---|
+| The log is addressed in **512-byte basic blocks**, not filesystem blocks, and `h_lsn` names one of those | Writing at a filesystem block put the unmount record eight blocks from where its header claimed. Our own reader still found it — it scans every block — but `xfs_repair` compared the head with the tail and declared the log to hold metadata changes needing replay |
+| The transaction header is an **operation of its own**, after a `START` operation that carries nothing | With the header on the `START` operation, recovery skipped it and read the *next* operation as the header: "bad header magic number" |
+| That header is **16 bytes**, not 12 (magic, type, tid, item count) | At 12 bytes recovery silently did not register an item, and then read the following operation as another header — the same message, from a different cause |
+| **Log items are native-endian**, which is the one place this format is not big-endian | An `ilf_size` of 2 written big-endian was read as 512: "bad number of regions (512) in inode log format" |
+
+The last one is the one worth remembering: a log item is a memory image
+replayed by a kernel of the same endianness, not an on-disk record. The
+logged inode core is 176 bytes at the **same offsets** as the on-disk core
+with every field reversed — and its timestamps are two 32-bit words each, so
+reversing one as a single 64-bit quantity swaps the seconds with the
+nanoseconds.
+
+What `xfs_logprint` now reads back from a record the board wrote, which is
+what `xfs_qemu_test` asserts:
+
+```
+TRANS: tid:0x6d6b7472  #items:1
+INO: cnt:2 total:2 len:56 len:176
+        INODE: #regs:2   ino:0x63  flags:0x1   dsize:0
+        CORE inode:
+                magic:IN  mode:0x81a4  ver:3  format:2
+                uid:0  gid:0  nlink:1 projid:0x00000000
+                atime:1792658684  mtime:1792658684  ctime:1792658684
+                size:0x3ffd4  nblks:0x40  exsize:0  nextents:1  anextents:0
+```
+
+`size:0x3ffd4` is 262100, the size the board grew the file to. Four judges
+agree about that number and none of them is ours: `xfs_logprint` decodes it
+out of the transaction, `xfs_logprint` calls the log `<CLEAN>`, `xfs_repair
+-n` finds nothing wrong with the filesystem, and `xfs_db` reads the size back
+off the inode.
+
+**What is still missing, and what it would take.** Creating a file, growing
+one past its own blocks and removing one all need the *allocator* — the
+free-space btrees, the inode btrees and the AGF/AGI counters — and each of
+those is another log item type beside the inode core. The log machinery is
+now the part that exists; the allocator is the part that does not.

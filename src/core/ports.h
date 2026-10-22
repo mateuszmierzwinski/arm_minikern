@@ -66,4 +66,20 @@ struct irq_chip_port {
     void *self;
 };
 
+/* A temperature sensor: milli-degrees Celsius, or a negative errno. One
+ * reading, no filtering — a policy that wants an average keeps its own. */
+struct thermal_port {
+    int (*read_mC)(void *self, int32_t *mC);
+    void *self;
+};
+
+/* The CPU clock and the regulator that feeds it, as one port: they are
+ * changed together and in an order only the board knows (raise the voltage
+ * before the frequency, lower it after), and splitting them would let a
+ * caller get that order wrong. */
+struct cpuclock_port {
+    int (*set)(void *self, uint32_t khz, uint32_t mv);
+    void *self;
+};
+
 #endif

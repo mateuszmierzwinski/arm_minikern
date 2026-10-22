@@ -212,7 +212,15 @@ Legend: `[x]` done · `[ ]` to do · `[~]` partial
       list, unlink and unlink-while-open. `unlink`/`unlinkat` refuse everywhere
       else, because everywhere else is read-only. The ABI suite exercises it
       through `os.CreateTemp`, `os.ReadDir` and `os.Remove`.
-- [ ] **P8.11 A watchdog driver**, needed before this ever runs unattended.
+- [ ] **P8.11 A watchdog driver**, needed before this ever runs unattended — and
+      waiting for the board on purpose. A watchdog is one register write and a
+      reset nobody can observe in QEMU, which models neither; writing it now would
+      add an untestable driver whose whole job is to reboot the machine. The
+      software half of the same goal does exist and is tested:
+      `minikern.hangcheck=<seconds>` notices a kernel where every core is idle with
+      a sleeper nothing will wake, prints the task and process tables, and panics
+      instead of freezing (it is how P10.3's last bug was found). The hardware half
+      belongs with P0.9.
 - [ ] A real entropy source (the H3 crypto engine's PRNG, or timing jitter): today's
       `getrandom` is xoshiro128** seeded from the timer and chip ID, which is fine for
       hash seeds and not fine for keys.
@@ -268,9 +276,26 @@ after every test.**
             Proved on real images (`xfs_live_test`) and from the board, writing into
             a file `mkfs.xfs` put there, with `xfs_repair -n` clean afterwards and
             the bytes found in the volume (`xfs_qemu_test` phase two).
-      - [ ] **P9.4b The log**: transaction framing, buffer and inode log items, and
-            the commit record — with `xfs_logprint` as the judge. Then creating a
-            file, allocating blocks and growing one become possible.
+      - [x] **P9.4b Writing the log (2026-10-22).** A metadata change — the file's
+            recorded size — goes to the log as a proper transaction and then to its
+            place, with the inode's own CRC recomputed, and an unmount record after
+            it so the log is clean. A write may now reach the end of the blocks a
+            file already owns, which a block-aligned file has none of and a
+            262000-byte one has 144 bytes of.
+            **`xfs_logprint` decodes the record the board wrote** — one item, two
+            regions, `mode:0x81a4 ver:3 format:2`, `nextents:1` and
+            `size:0x3ffd4` — and calls the log `<CLEAN>`; `xfs_repair -n` finds
+            nothing wrong; `xfs_db` reads the new size off the inode. Four facts
+            came out of that tool rather than any document, and the one worth
+            remembering is that **log items are native-endian** while the rest of
+            XFS is big-endian (XFS.md §9).
+            *Also fixed on the way:* the kernel flushes a mounted filesystem when
+            the machine stops. "The program should have called fsync" is not an
+            answer a kernel gets to give.
+      - [ ] **P9.4c The allocator**, which is what creating a file, removing one and
+            growing one past its own blocks all need: the free-space btrees, the
+            inode btrees and the AGF/AGI counters, each with its own log item type
+            beside the inode core. The log machinery now exists; this does not.
 
 ---
 
@@ -310,22 +335,44 @@ Stage 1 is a big kernel lock on purpose. The payoff is Go running `GOMAXPROCS=4`
       syscall; the release belongs at the exit, which both paths share.
       A reschedule IPI is **not** done: an idle core notices work on its next tick
       instead, which is a millisecond of latency rather than a correctness problem.
-- [~] **P10.3 Fix what the single-core assumption bought.** The cores schedule only
-      with `minikern.smp=all`, because that path still hangs shortly after the Go
-      runtime's second thread appears. Two real bugs were found and fixed on the
-      way — `sched_yield` pushed a core's **own idle context** onto the shared run
-      queue (two cores would have run one stack), and it fell back to core 0's idle
-      context whatever core it was on — and the next step is the third:
-      - **Nothing stops two cores popping the same task.** A task is on the queue
-        and still on a core between `runq_push` and the end of `arm_switch`. The fix
-        is to enqueue a yielding task on the **far side** of the switch, where its
-        state is known to be saved, rather than to skip "on a core" tasks at pop
-        time — which was tried, costs the single-core path a bounce through idle,
-        and did not fix the hang on its own.
-      - Then `sched_sleep`/`sched_wake` want reviewing for the same class of race,
-        and `proc_switch_mm` for two cores in one address space.
-      *What is proved meanwhile:* four cores up, the lock correct on the paths all
-      47 tests take, and each core initialising what is its own.
+- [x] **P10.3 Fix what the single-core assumption bought (2026-10-22).** Four cores
+      schedule by default (`minikern.smp=off` goes back to one), Go sees four CPUs
+      through `sched_getaffinity` and sizes GOMAXPROCS from them, and
+      `smp_qemu_test` proves both halves: four goroutines run at once and **every
+      core shows kernel entries** — a count user space cannot fake. Four cores do
+      4× the work in 1.6× the time under TCG.
+      **Seven single-core assumptions, each a real bug:**
+      1. `sched_yield` pushed a core's **own idle context** onto the shared run
+         queue, and fell back to core 0's idle context whatever core it ran on.
+      2. `TTBCR` and `TTBR1` are **per core**, and only the primary set them: a
+         secondary kept `start.S`'s one-table regime, so the first
+         `mmu_switch_user` on it replaced the *whole* address space with a user
+         table and the kernel vanished from under it — an endless prefetch abort
+         whose faulting instruction was the vector table.
+      3. A task stops being `current` before `arm_switch` has saved it, so a
+         second core could pop it (two cores, one stack) or reap it (a freed
+         kernel stack under a running core). Both are answered by one record of
+         "the task this core is leaving", released on the far side of the switch.
+      4. A **freshly started thread** never runs that far side (`arm_thread_start`
+         goes straight out to user mode), so the task it displaced was never
+         re-queued: a lost wakeup that stranded the machine about one boot in six.
+      5. `sched_kill_task` freed any task that was not *this* core's current —
+         including one another core was running.
+      6. The kill mark lived in `t->state`, and the thread's next `sched_sleep`
+         **overwrote it**: the thread then waited for ever as an ordinary sleeper
+         and its exiting process could never end.
+      7. `proc_switch_mm` decided whether to install an address space by comparing
+         the outgoing task's with the incoming one — a guess about the hardware
+         that `mmu_clear_user` falsified. It records what each core has installed
+         now.
+      Found with the QEMU monitor (every core's PC) and then with the kernel's own
+      new hang check, which prints the task and process tables and panics instead
+      of freezing: `minikern.hangcheck=<seconds>`. The last bug was invisible
+      without it — a sleeping thread belonging to a process with no other threads.
+
+- [ ] **P10.4 Finer locks, where profiling asks.** Not before: the one lock holds
+      and `klock_report` gives the contention count (743 of 1508 entries on four
+      cores in the SMP test) to aim at.
 - [ ] **P10.4 Finer locks only where profiling says so** — likely futex, the network
       stack, the run queue. Not designed up front.
 
@@ -333,11 +380,35 @@ Stage 1 is a big kernel lock on purpose. The payoff is Go running `GOMAXPROCS=4`
 
 ## P11 — Thermal, then frequency scaling
 
-- [ ] **P11.1 The THS thermal sensor and a throttle policy.** Four A7s at full clock
-      on a NEO with no heatsink overheat, which is what makes this the first half.
-- [ ] **P11.2 Frequency changes**: reprogram PLL_CPUX and switch VDD_CPUX. On the NEO
-      that regulator is GPIO-switched and two-level, so there are two voltage tiers
-      rather than a curve. **Take the operating points from mainline's H3 OPP table;
-      do not invent them.**
-- [ ] **P11.3 A governor last, and least.** `wfi` in idle plus PSCI `CPU_OFF` for
+**What can and cannot be judged here.** QEMU models neither the thermal sensor nor
+the PLLs, so this is the one feature in the project whose hardware half has no
+test anywhere but on the board — the same position as the EMAC's PHY setup
+(CLAUDE.md §3). The work was therefore split so that the half that can be proved,
+is: the policy is pure and host-tested, the governor is driven through ports, and
+`minikern.cpufreq=test` runs the whole chain against a fake sensor that ramps from
+cold to past critical. The real thing is **off unless asked for**
+(`minikern.cpufreq=on`), because an untested register write that browns out a core
+is worse than no frequency scaling.
+
+- [x] **P11.1 Thermal first, and the policy (2026-10-22).** `core/cpufreq.h`
+      decides: temperature overrules load, a critical reading goes straight to the
+      lowest point, and a hysteresis band below the throttle point stops the CPU
+      flapping across it. 15 host cases, including that a steady hot temperature
+      *settles* instead of oscillating. `kernel/thermal.c` wires sensor → policy →
+      clock and measures load the only honest way: the share of ticks on which a
+      core had work. `board/h3/ths.c` reads the sensor — **register map and
+      conversion unverified on silicon.**
+- [x] **P11.2 Frequency changes (2026-10-22).** `board/h3/cpux.c` parks the cores
+      on the 24 MHz crystal, reprograms PLL_CPUX, waits for lock and switches
+      back, because a core running on a PLL being reprogrammed runs at an
+      undefined frequency. The operating points are **mainline's H3 table**, not
+      invented; only those the NEO's fixed supply can feed are offered, since the
+      GPIO that switches VDD_CPUX is not driven yet. **Unverified on silicon.**
+      `cpufreq_qemu_test` proves the rest: a Go program holds four cores busy
+      while the fake sensor ramps, and every decision the policy can make appears
+      in the log — up under load, down across the threshold, the critical reading
+      reported even with nothing left to give up, and the recovery on the way
+      back down.
+- [ ] **P11.3 The VDD_CPUX GPIO**, which unlocks the points above 816 MHz.
+- [ ] **P11.4 A governor last, and least.** `wfi` in idle plus PSCI `CPU_OFF` for
       unused cores saves more on this chip than frequency stepping does.

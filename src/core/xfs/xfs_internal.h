@@ -57,6 +57,18 @@ int xfs_meta_block(struct xfs *fs, uint64_t fsb, uint32_t magic, uint32_t magic2
  * an unmount record, KERR_NOTSUP when it is anything else. */
 int xfs_log_check(struct xfs *fs);
 
+/* Where an inode lives: the device block holding its chunk, and its byte
+ * offset within that block. The same arithmetic the reader uses, exposed
+ * because a write has to put the inode back where it came from. */
+void xfs_inode_place(const struct xfs *fs, uint64_t ino, uint64_t *device_block, uint32_t *boffset);
+
+/* Writes one inode core to the log as a committed transaction, then an
+ * unmount record after it so the log is clean again (xfs_logwrite.c).
+ * `chunk_block` is the device block holding the inode's chunk and
+ * `boffset` the inode's byte offset within it, which is what recovery
+ * would need to find it. */
+int xfs_log_inode(struct xfs *fs, uint64_t ino, uint64_t chunk_block, uint32_t boffset, const uint8_t *core);
+
 /* One extent record, unpacked. */
 struct xfs_extent {
     uint64_t startoff;   /* logical block within the file */

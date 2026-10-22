@@ -26,6 +26,14 @@ static void locate(const struct xfs *fs, uint64_t ino, uint64_t *fsb, uint32_t *
     *slot = (uint32_t)(ino & (((uint64_t)1 << fs->inopblog) - 1u));
 }
 
+void xfs_inode_place(const struct xfs *fs, uint64_t ino, uint64_t *device_block, uint32_t *boffset) {
+    uint64_t fsb;
+    uint32_t slot;
+    locate(fs, ino, &fsb, &slot);
+    *device_block = xfs_fsb_to_block(fs, fsb);
+    *boffset = slot * fs->inodesize;
+}
+
 /* The inline fork's extent: it ends where the attribute fork begins, or at
  * the end of the inode when there is no attribute fork. */
 static uint32_t fork_bytes(const struct xfs *fs, const uint8_t *di) {

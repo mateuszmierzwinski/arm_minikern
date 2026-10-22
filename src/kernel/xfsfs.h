@@ -49,4 +49,12 @@ bool xfsfs_owns(const struct file *f);
  * data instead of its hash index (XFS.md §3). */
 int32_t xfsfs_getdents(struct file *f, uint8_t *buf, uint32_t cap, uint32_t *advanced);
 
+/* Writes back anything the filesystem still holds, if one is mounted.
+ *
+ * Called when the machine is stopping: a filesystem left dirty because the
+ * last program did not think to call fsync is a filesystem that loses what
+ * it was told, and "the program should have synced" is not an answer a
+ * kernel gets to give. Harmless when nothing is mounted. */
+int xfsfs_flush_all(void);
+
 #endif

@@ -31,6 +31,15 @@ cc_library(
     strip_include_prefix = "src",
 )
 
+# The frequency policy: pure, so it is host-tested, and separate from the
+# board adapters it decides for (which QEMU cannot judge at all).
+cc_library(
+    name = "cpufreq",
+    srcs = ["src/core/cpufreq.c"],
+    hdrs = ["src/core/cpufreq.h"],
+    strip_include_prefix = "src",
+)
+
 cc_library(
     name = "crc32c",
     srcs = ["src/lib/crc32c.c"],
@@ -233,6 +242,7 @@ cc_library(
         ":arch_arm",
         ":block",
         ":core",
+        ":cpufreq",
         ":kernel_hdrs",
         ":kfmt",
         ":xfs",
@@ -243,15 +253,19 @@ cc_library(
 cc_library(
     name = "board_h3",
     srcs = [
+        "src/board/h3/cpux.c",
         "src/board/h3/emac.c",
         "src/board/h3/main.c",
         "src/board/h3/sid.c",
+        "src/board/h3/ths.c",
         "src/board/h3/uart.c",
     ],
     hdrs = [
+        "src/board/h3/cpux.h",
         "src/board/h3/emac.h",
         "src/board/h3/h3.h",
         "src/board/h3/sid.h",
+        "src/board/h3/ths.h",
         "src/board/h3/uart.h",
     ],
     local_defines = ['MINIKERN_VERSION=\\"%s.0\\"' % MINIKERN_VERSION],
@@ -260,6 +274,7 @@ cc_library(
     deps = [
         ":arch_arm",
         ":core",
+        ":cpufreq",
         ":kernel",
         ":kernel_hdrs",
     ],
@@ -343,6 +358,16 @@ cc_test(
     srcs = ["test/bootinfo_test.c"],
     deps = [
         ":core",
+        ":ktest",
+    ],
+)
+
+cc_test(
+    name = "cpufreq_test",
+    size = "small",
+    srcs = ["test/cpufreq_test.c"],
+    deps = [
+        ":cpufreq",
         ":ktest",
     ],
 )
@@ -679,6 +704,21 @@ minikern_rootfs(
 )
 
 minikern_rootfs(
+    name = "freqtest_rootfs",
+    init = "//userland/cmd/freqtest",
+)
+
+minikern_rootfs(
+    name = "exectest_rootfs",
+    init = "//userland/cmd/exectest",
+)
+
+minikern_rootfs(
+    name = "smptest_rootfs",
+    init = "//userland/cmd/smptest",
+)
+
+minikern_rootfs(
     name = "xfstest_rootfs",
     init = "//userland/cmd/xfstest",
 )
@@ -758,6 +798,71 @@ sh_test(
     data = [
         ":hello_gc_rootfs",
         ":minikern.uImage",
+    ],
+    tags = ["manual"],
+)
+
+# P8.1: fork and exec, through Go's os/exec — a child runs, its output and
+# its exit status come back, a pipe carries bytes into it, and the
+# environment and arguments reach the new image.
+sh_test(
+    name = "exec_qemu_test",
+    size = "medium",
+    srcs = ["test/userland_qemu_test.sh"],
+    args = [
+        "$(rootpath :minikern.uImage)",
+        "$(rootpath :exectest_rootfs)",
+        "'ok   a pipe reports end of file when its writer closes'",
+        "'ok   exec runs a child and its output comes back'",
+        "'exit status reaches the parent'",
+        "'ok   a pipe carries bytes to the child'",
+        "'ok   the environment reaches the new image'",
+        "'ok   every argument reaches the new image'",
+        "'ok   execing something that is not there fails cleanly'",
+        "'exectest ok'",
+        "'init exited with status 7'",
+    ],
+    data = [
+        ":exectest_rootfs",
+        ":minikern.uImage",
+    ],
+    tags = ["manual"],
+)
+
+# P11: the frequency governor, as far as anything but the board can judge
+# it. A fake sensor ramps from cold to past critical while a Go program
+# holds every core busy, and every decision the policy can make must appear
+# in the log: up under load, down when it is too warm to rise, and straight
+# to the bottom when it is critical. The two register writes underneath are
+# the part only the NEO can confirm (board/h3/ths.h).
+sh_test(
+    name = "cpufreq_qemu_test",
+    size = "medium",
+    srcs = ["test/cpufreq_qemu_test.sh"],
+    args = [
+        "$(rootpath :minikern.uImage)",
+        "$(rootpath :freqtest_rootfs)",
+    ],
+    data = [
+        ":freqtest_rootfs",
+        ":minikern.uImage",
+    ],
+    tags = ["manual"],
+)
+
+# P10: four cores, from both sides — Go sees them and uses them, and the
+# kernel's own per-core counters show every one of them being used.
+sh_test(
+    name = "smp_qemu_test",
+    size = "medium",
+    srcs = ["test/smp_qemu_test.sh"],
+    args = [
+        "$(rootpath :minikern.uImage)",
+        "$(rootpath :smptest_rootfs)",
+    ],
+    data = [
+        ":minikern.uImage",
+        ":smptest_rootfs",
     ],
     tags = ["manual"],
 )
@@ -935,6 +1040,9 @@ test_suite(
         ":net_sanitized_test",
         ":go_abi_qemu_test",
         ":go_hello_qemu_test",
+        ":cpufreq_qemu_test",
+        ":exec_qemu_test",
+        ":smp_qemu_test",
         ":tinygo_qemu_test",
         ":user_asm_qemu_test",
     ],

@@ -100,7 +100,14 @@ static int32_t xfsfs_write(struct file *f, const void *buf, uint32_t n) {
         return rc;
     }
     f->pos += put;
+    /* The open file's size follows the inode's, which the write has just
+     * moved: `fstat` reads it from here. */
+    f->size = (uint32_t)inode_of(f)->size;
     return (int32_t)put;
+}
+
+int xfsfs_flush_all(void) {
+    return mounted.up && !mounted.read_only ? xfs_flush(&mounted.fs) : KERR_OK;
 }
 
 /* fsync writes the cache back and flushes the device under it. */

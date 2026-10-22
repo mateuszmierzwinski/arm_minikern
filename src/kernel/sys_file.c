@@ -5,6 +5,7 @@
 #include "core/errno.h"
 #include "core/tar.h"
 #include "kernel/mem.h"
+#include "kernel/pipe.h"
 #include "kernel/proc.h"
 #include "kernel/syscall.h"
 
@@ -301,6 +302,39 @@ static int32_t sys_pwrite64(struct trapframe *tf) {
 /* fsync and fdatasync: make what was written durable. A file with nothing
  * behind it (a tty, a memory file) has nothing to do and says so, as Linux
  * does for a device that cannot fail.  */
+/* pipe2: a pipe and two descriptors for it. Go's exec needs one to carry a
+ * failed execve back from the child, so this is part of running a program.
+ *
+ * Either descriptor failing must leave nothing behind: a half-installed pipe
+ * would be a descriptor leak reachable from user space. */
+static int32_t sys_pipe2(struct trapframe *tf) {
+    struct file *ends[2];
+    uint32_t fds[2];
+    int32_t rc = (int32_t)pipe_create(tf->r[1], &ends[0], &ends[1]);
+    bool cloexec = (tf->r[1] & O_CLOEXEC) != 0;
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    for (uint32_t i = 0; i < 2; i++) {
+        rc = fd_install(ends[i], 0, cloexec);
+        if (rc < 0) {
+            while (i-- > 0) {
+                (void)fd_close((int32_t)fds[i]);
+            }
+            file_put(ends[0]);
+            file_put(ends[1]);
+            return rc;
+        }
+        fds[i] = (uint32_t)rc;
+    }
+    if (mm_copy_out(cur()->mm, tf->r[0], fds, sizeof fds) != KERR_OK) {
+        (void)fd_close((int32_t)fds[0]);
+        (void)fd_close((int32_t)fds[1]);
+        return KERR_FAULT;
+    }
+    return 0;
+}
+
 static int32_t sys_fsync(struct trapframe *tf) {
     struct file *f = fd_file((int32_t)tf->r[0]);
     if (f == NULL) {
@@ -613,6 +647,7 @@ const struct syscall_entry sys_file_table[] = {
     {10, "unlink", sys_unlink},
     {21, "mount", sys_mount},
     {118, "fsync", sys_fsync},
+    {359, "pipe2", sys_pipe2},
     {148, "fdatasync", sys_fsync},
     {180, "pread64", sys_pread64},
     {181, "pwrite64", sys_pwrite64},

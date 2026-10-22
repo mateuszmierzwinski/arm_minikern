@@ -25,6 +25,11 @@
 #include "kernel/exec.h"
 #include "kernel/fault.h"
 #include "kernel/irq.h"
+#include "board/h3/cpux.h"
+#include "board/h3/ths.h"
+#include "kernel/klock.h"
+#include "kernel/thermal.h"
+#include "kernel/xfsfs.h"
 #include "kernel/mem.h"
 #include "kernel/net.h"
 #include "kernel/nbd.h"
@@ -146,8 +151,13 @@ static void bring_up_cpu(void) {
     arm_vfp_enable();
 }
 
-/* The trap layer's return-to-user hook: preemption, then signals. */
+/* The trap layer's return-to-user hook: a thread another core has killed
+ * stops here rather than going back to user mode, then preemption, then
+ * signals. */
 static void return_to_user(struct trapframe *tf) {
+    if (sched_killed()) {
+        proc_exit_thread(0);
+    }
     sched_preempt_point();
     signal_deliver(tf);
 }
@@ -321,12 +331,60 @@ static void bring_up_network(void) {
     knet_start(xid);
 }
 
+#define CPUFREQ_INTERVAL_MS 200u  /* decide five times a second */
+
+/* The H3's published operating points, lowest first, as mainline's table
+ * gives them — not invented here (the operator's instruction). Only the
+ * points the NEO's fixed supply can feed are offered, because the GPIO that
+ * switches VDD_CPUX is not driven yet (board/h3/cpux.c). */
+static struct cpufreq_policy h3_cpu_policy(void) {
+    struct cpufreq_policy p = {
+        .opps = {{480000, 1040}, {648000, 1040}, {816000, 1100}},
+        .nopps = 3,
+        .throttle_mC = 80000,
+        .critical_mC = 95000,
+        .hysteresis_mC = 5000,
+        .load_up_pct = 80,
+        .load_down_pct = 20,
+    };
+    return p;
+}
+
+/* Starts the frequency governor if the command line asks.
+ *
+ * It is **off by default**, and that is a statement about evidence rather
+ * than about confidence: QEMU models neither the thermal sensor nor the
+ * PLL, so the adapters have never run anywhere (board/h3/ths.h). `test`
+ * runs the same governor and policy against a ramping fake sensor, which
+ * proves everything except the two register writes; `on` drives the real
+ * hardware and wants the board in front of you. */
+static void bring_up_cpufreq(void) {
+    struct cpufreq_policy policy = h3_cpu_policy();
+    struct thermal_port sensor;
+    struct cpuclock_port clock;
+    bool fake = cmdline_equals(boot_cmdline, "minikern.cpufreq", "test");
+    int rc;
+    if (!fake && !cmdline_equals(boot_cmdline, "minikern.cpufreq", "on")) {
+        return;
+    }
+    sensor = fake ? h3_thermal_fake_port() : h3_thermal_port();
+    clock = fake ? h3_cpuclock_fake_port() : h3_cpuclock_port();
+    rc = thermal_start(&sensor, &clock, &policy, CPUFREQ_INTERVAL_MS);
+    kprintf("cpufreq: %s governor %s\n", fake ? "test" : "hardware",
+            rc == KERR_OK ? "started" : "refused");
+}
+
 /* Reports how init ended, then ends the boot the way the command line asks. */
 static void init_exited(void *self, const struct proc *p) {
     (void)self;
+    /* Whatever the filesystem still holds goes to the device before the
+     * machine stops (kernel/xfsfs.h). */
+    (void)xfsfs_flush_all();
     if (cmdline_equals(boot_cmdline, "minikern.netstat", "1")) {
         knet_report();
         knbd_report();
+        klock_report();
+        thermal_report();
     }
     if ((p->exit_status & 0x7f) != 0) {
         kprintf("minikern: init killed by signal %d\n", p->exit_status & 0x7f);
@@ -449,23 +507,16 @@ void kmain(uint32_t r0, uint32_t machine, uint32_t r2, uint32_t entry_cpsr) {
     bring_up_cores();
     bring_up_network();
     syscall_set_trace(cmdline_equals(boot_cmdline, "minikern.strace", "1"));
+    sched_set_hangcheck((uint32_t)cmdline_number("minikern.hangcheck", 0));
+    bring_up_cpufreq();
     maybe_selftest(boot_cmdline);
     kprintf("minikern: boot complete\n");
     if (!start_init(&info) && halt_requested()) {
         finish();
     }
-    /* Letting the other cores schedule is **not** on by default: the lock
-     * and the bring-up are proved, but running tasks on four cores still
-     * deadlocks somewhere after the second thread starts (TASKS.md P10.3),
-     * and a kernel that works on one core is worth more than one that
-     * might work on four. minikern.smp=all opts into the experiment.
-     *
-     * It is the last thing the boot path does either way, because until
-     * now it has been in the kernel without the lock and a second core in
-     * there would race it (klock.h rule 4). */
-    if (cmdline_equals(boot_cmdline, "minikern.smp", "all")) {
-        kprintf("smp: letting every core schedule (experimental)\n");
-        smp_release();
-    }
+    /* The last thing the boot path does: until now it has been in the
+     * kernel without the lock, and a second core in there would race it
+     * (klock.h rule 4). */
+    smp_release();
     sched_idle_loop();
 }

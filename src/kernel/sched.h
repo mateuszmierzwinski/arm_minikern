@@ -50,6 +50,7 @@ struct task {
     uint32_t altstack_size;
     uint32_t altstack_flags;
     uint32_t slice_left;     /* ticks before a preemption */
+    bool killed;             /* another core ended it; it stops at its next kernel exit */
     struct task *run_next;   /* run queue link */
 };
 
@@ -77,6 +78,31 @@ struct task *sched_current(void);
  * current task is scheduled again. */
 void sched_yield(void);
 
+/* Puts the task this core switched away from back on the run queue, now that
+ * its state is saved. Called on every path that resumes a task: the tail of
+ * the switch itself, and `arm_thread_start` for a thread's first run. */
+void sched_finish_switch(void);
+
+/* True when another core marked this thread dead while it was running — a
+ * sibling's exit_group, which cannot stop a thread on another core
+ * synchronously. Checked on the way back to user mode, so such a thread
+ * ends at its next entry into the kernel: the tick makes that a
+ * millisecond, not a hope. */
+bool sched_killed(void);
+
+/* True when this core has something other than the idle task to run, which
+ * is how the frequency governor measures load (kernel/thermal.h): the share
+ * of ticks on which this was true. */
+bool sched_has_work(void);
+
+/* Prints every live task, what it waits on and which core has it. */
+void sched_dump(void);
+
+/* Panics with that table when every core has been idle for this many
+ * seconds and something is still asleep — a lost wakeup, reported instead
+ * of left to look like slowness. 0 turns it off (minikern.hangcheck). */
+void sched_set_hangcheck(uint32_t seconds);
+
 /* Sleeps on (chan, key) until woken, until deadline_ns (monotonic; 0 = no
  * deadline) or, if interruptible, until a signal. Returns 0, KERR_TIMEDOUT
  * or KERR_INTR. */
@@ -99,7 +125,12 @@ void sched_preempt_point(void);
 __attribute__((noreturn)) void sched_exit_current(void);
 
 /* Removes another (not running) task: it is unlinked and freed. */
-void sched_kill_task(struct task *t);
+/* Ends a task that is not the caller. Returns true when it is gone for
+ * good, and false when it was only marked dead because another core still
+ * has it: it then ends itself at its next entry into the kernel. The caller
+ * must do the bookkeeping that the task itself would otherwise do (its
+ * process's thread count), which is why the answer matters. */
+bool sched_kill_task(struct task *t);
 
 /* The idle loop: runs whatever is runnable, else waits for an interrupt. */
 __attribute__((noreturn)) void sched_idle_loop(void);

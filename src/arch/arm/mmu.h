@@ -10,6 +10,11 @@
  * drops the boot identity map from the kernel table. */
 void mmu_init(void);
 
+/* Joins this core to the kernel's translation regime. Every core runs it
+ * once, before it touches anything mapped by the kernel's table or switches
+ * to a process: the registers it writes are per core (mmu.c). */
+void mmu_init_cpu(void);
+
 /* Makes the table at physical address l1_phys (8 KiB, 8 KiB aligned) the
  * current user address space and flushes the TLB. */
 void mmu_switch_user(uint32_t l1_phys);

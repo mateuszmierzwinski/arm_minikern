@@ -17,7 +17,7 @@ command -v qemu-system-arm >/dev/null || { echo "qemu-system-arm is not installe
 status=0
 timeout 120 qemu-system-arm -M orangepi-pc -display none -monitor none \
     -serial "file:$log" -nic user -kernel "$image" -initrd "$initrd" \
-    -append "console=uart0 minikern.halt=poweroff ${MINIKERN_EXTRA_CMDLINE:-}" || status=$?
+    -append "console=uart0 minikern.halt=poweroff minikern.hangcheck=20 ${MINIKERN_EXTRA_CMDLINE:-}" || status=$?
 cat "$log"
 
 fail() {

@@ -23,6 +23,10 @@ const (
 	sysEpollCreate1 = 357
 	sysEpollCtl     = 251
 	sysUnknown      = 0x1ff
+	sysExecve       = 11
+	sysWait4        = 114
+	sysPipe2        = 359
+	sysClone        = 120
 )
 
 const (
@@ -214,6 +218,89 @@ func faults_(f func()) (faulted bool) {
 	return false
 }
 
+// processes attacks the fork/exec surface, which is the newest and the one
+// that hands user-supplied strings and pointers to the loader.
+//
+// The access-control case is the important one: wait4 must refuse a pid that
+// is not the caller's child. Otherwise any process could harvest the exit
+// status of any other — the broken-access-control class (master Rule 25.3),
+// reached through a pid rather than a URL.
+func processes() {
+	var st [1]uint32
+	expect("execve with a NULL path is EFAULT", sys3(sysExecve, 0, 0, 0), syscall.EFAULT)
+	expect("execve of the kernel's own address is EFAULT", sys3(sysExecve, kernelAddr, 0, 0), syscall.EFAULT)
+	expect("execve of a directory is refused", sys3(sysExecve, strAddr("/dev"), 0, 0), syscall.EACCES)
+	expect("execve of something that is not there is ENOENT",
+		sys3(sysExecve, strAddr("/no/such/file"), 0, 0), syscall.ENOENT)
+	expect("execve of a file that is not an ELF is refused",
+		sys3(sysExecve, strAddr("/etc/hosts"), 0, 0), syscall.ENOEXEC)
+	expect("execve with an argv pointer into the kernel is EFAULT",
+		sys3(sysExecve, strAddr("/init"), kernelAddr, 0), syscall.EFAULT)
+	expect("wait4 for a process that is not my child is ECHILD",
+		sys3(sysWait4, 2, uintptr(unsafe.Pointer(&st[0])), 0), syscall.ECHILD)
+	expect("wait4 for pid 1 from pid 1 is ECHILD", sys3(sysWait4, 1, 0, 0), syscall.ECHILD)
+	expect("wait4 for any child when there are none is ECHILD",
+		sys3(sysWait4, ^uintptr(0), 0, 0), syscall.ECHILD)
+	expect("pipe2 into the kernel's memory is EFAULT", sys3(sysPipe2, kernelAddr, 0, 0), syscall.EFAULT)
+	expect("pipe2 into an unmapped page is EFAULT", sys3(sysPipe2, wrapAddr, 0, 0), syscall.EFAULT)
+	expect("clone asking for a pidfd is refused", sys3(sysClone, 0x1000|0x100, 0, 0), syscall.EINVAL)
+	expect("clone of an address space of its own is refused", sys3(sysClone, 17 /* SIGCHLD */, 0, 0),
+		syscall.ENOSYS)
+	// This program is a Go program, so it has several threads, and execve
+	// here only supports one (kernel/exec.h). The refusal must be clean and
+	// must leave this process running — which is the whole claim, since the
+	// alternative is a new image sharing an address space with threads that
+	// are still in the old one.
+	e := sys3(sysExecve, strAddr("/init"), 0, 0)
+	check("execve from a multi-threaded process is refused, not attempted",
+		e == syscall.EAGAIN, fmt.Sprintf("got errno %d (%v)", int(e), e))
+	execveArgBomb()
+	pipeExhaustion()
+}
+
+// strAddr is the address of a NUL-terminated copy of s, for the raw calls.
+func strAddr(s string) uintptr {
+	b := append([]byte(s), 0)
+	keepAlive = append(keepAlive, b)
+	return uintptr(unsafe.Pointer(&b[0]))
+}
+
+// keepAlive holds the byte slices whose addresses were handed to the kernel,
+// so the collector cannot move or free them while a call is in flight.
+var keepAlive [][]byte
+
+// execveArgBomb hands execve more argument bytes than it will take. The
+// limit must be a refusal, not a kernel that copies until something breaks.
+func execveArgBomb() {
+	const many = 4096
+	argv := make([]uintptr, many+1)
+	big := strAddr(strings.Repeat("a", 1024))
+	for i := 0; i < many; i++ {
+		argv[i] = big
+	}
+	argv[many] = 0
+	e := sys3(sysExecve, strAddr("/init"), uintptr(unsafe.Pointer(&argv[0])), 0)
+	check("an oversized argument list is refused", e == syscall.E2BIG,
+		fmt.Sprintf("got errno %d (%v)", int(e), e))
+}
+
+// pipeExhaustion opens pipes until the descriptor table is full, which must
+// be EMFILE rather than a kernel that allocates until it cannot.
+func pipeExhaustion() {
+	var fds [2]int32
+	opened := 0
+	var last syscall.Errno
+	for i := 0; i < 256; i++ {
+		last = sys3(sysPipe2, uintptr(unsafe.Pointer(&fds[0])), 0, 0)
+		if last != 0 {
+			break
+		}
+		opened += 2
+	}
+	check("pipes run out of descriptors cleanly", last == syscall.EMFILE && opened > 0,
+		fmt.Sprintf("after %d descriptors: errno %d (%v)", opened, int(last), last))
+}
+
 func main() {
 	badPointers()
 	hostileLengths()
@@ -221,6 +308,7 @@ func main() {
 	vmaExhaustion()
 	descriptors()
 	misc()
+	processes()
 	faults()
 	if failed {
 		os.Exit(1)

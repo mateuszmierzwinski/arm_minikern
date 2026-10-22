@@ -3,6 +3,7 @@
 #include "arch/arm/cpu.h"
 #include "arch/arm/gic.h"
 #include "arch/arm/layout.h"
+#include "arch/arm/mmu.h"
 #include "arch/arm/timer.h"
 #include "arch/arm/trap.h"
 #include "core/console.h"
@@ -114,12 +115,17 @@ void smp_secondary_main(void) {
      * instruction faults** — which for a hard-float Go binary is
      * immediate, and which faulted inside the kernel while holding the
      * lock, so it deadlocked in silence rather than panicking. */
+    mmu_init_cpu();
     trap_init_cpu();
     arm_vfp_enable();
     gic_init_cpu();
     timer_start_cpu();
     sched_init_cpu();
     sched_idle_loop();  /* never returns */
+}
+
+uint32_t smp_scheduling(void) {
+    return released ? smp_online() : 1u;
 }
 
 void smp_release(void) {

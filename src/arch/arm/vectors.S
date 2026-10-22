@@ -88,6 +88,7 @@ arm_switch:
  * hook run first (thread_first_run), which may be 0. */
     .global arm_thread_start
 arm_thread_start:
+    bl    sched_finish_switch          @ release the task this core switched away from
     cmp   r4, #0
     blxne r4
     b     trap_exit

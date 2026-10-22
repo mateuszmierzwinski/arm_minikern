@@ -56,12 +56,16 @@ Step by step: each phase in `TASKS.md` ends with something that boots and is tes
 | P5 Netboot | **Done in QEMU (2026-10-21).** Our own MKNB protocol (NETBOOT.md): a unicast sweep finds the server, the archive arrives in windowed blocks and is verified against SHA-256 before anything is mounted. The server is a Go program in this tree. |
 | P6 Full Go (gc) | **Done for one core (2026-10-21).** Go 1.26 binaries run unchanged: threads, futex, epoll timers, async preemption by SIGURG, GC, signals. SMP is not started. |
 | P7 Sockets | **Done for UDP and TCP (2026-10-21).** Go's `net` package works: UDP both ways, TCP active and passive open, and a complete HTTP exchange (client *and* server) inside the guest. |
-| P10 SMP | **Cores up, the lock in place (2026-10-22).** All four Cortex-A7s are started (PSCI `CPU_ON`) and each initialises what is its own — vector table, interrupt interface, tick, VFP. One ticket spinlock around the kernel (`kernel/klock.h`) replaces "IRQs masked = locked", taken at `trap_dispatch` and released at `trap_exit`, with broadcast TLB maintenance. They do **not** schedule yet: `minikern.smp=all` opts into that and it still hangs (TASKS.md P10.3). |
-| P9 Storage | **NBD, XFS read-only and formatting done (2026-10-22).** Our own NBD client over our own TCP, a buffer cache, `/dev/nbd0`, a Go NBD server in-tree — and an XFS v5 reader that mounts filesystems Linux made, lists every directory shape and reads files byte for byte, refusing every feature it does not fully understand and every dirty log. A Go program formats a volume over the network (`userland/internal/xfsmk`) and `mount("/dev/nbd0", "/mnt", "xfs", …)` mounts it; `xfs_repair` finds nothing wrong with what the board writes (`XFS.md`). |
+| P10 SMP | **Done (2026-10-22).** All four Cortex-A7s run user code. One ticket spinlock around the kernel (`kernel/klock.h`) replaces "IRQs masked = locked", taken at `trap_dispatch` and released at `trap_exit`; each core initialises what is its own (vector table, interrupt interface, tick, VFP, address-space regime); TLB maintenance is the broadcast form. Go sees four CPUs and uses them: 4× the work in 1.6× the time, with every core showing kernel entries. Seven single-core assumptions turned out to be bugs — they are listed in TASKS.md P10.3, and `minikern.hangcheck` exists because the last one was invisible without it. |
+| P8 fork/exec | **Done (2026-10-22).** Go's `os/exec` runs programs: `clone(CLONE_VM\|CLONE_VFORK)`, own pipes, `execve`, `wait4`, zombies that keep an exit status for their parent. Measured from a real Go binary rather than guessed, including that refusing `CLONE_PIDFD` makes Go fall back on its own. |
+| P11 Thermal/DVFS | **Policy done, hardware unverifiable here (2026-10-22).** A pure, host-tested policy (temperature overrules load, hysteresis against flapping) and a governor driven through ports, proved end to end against a ramping fake sensor (`minikern.cpufreq=test`). The H3 sensor and PLL adapters have **never run on silicon** — QEMU models neither — so the real path is off unless `minikern.cpufreq=on`. |
+| P9 Storage | **NBD, XFS reading, formatting and logged writes (2026-10-22).** Our own NBD client over our own TCP, a buffer cache, `/dev/nbd0`, a Go NBD server in-tree — and an XFS v5 reader that mounts filesystems Linux made, lists every directory shape and reads files byte for byte, refusing every feature it does not fully understand and every dirty log. A Go program formats a volume over the network (`userland/internal/xfsmk`) and `mount("/dev/nbd0", "/mnt", "xfs", …)` mounts it; `xfs_repair` finds nothing wrong with what the board writes (`XFS.md`). |
 
 A Go program on the board can now also reach a **network block device** and
 read an **XFS filesystem** off it — the volume being a file on a server, and
-the filesystem one `mkfs.xfs` made.
+the filesystem one `mkfs.xfs` made — and a write that grows a file into blocks
+it already owns goes through the **log**, as a transaction `xfs_logprint`
+decodes field by field (XFS.md §9).
 
 **The goal is met in QEMU:** a standard `GOOS=linux GOARCH=arm` Go binary, and a TinyGo one, run unchanged on a kernel that copies no Linux code — and a Go program can now fetch its own root filesystem over the network and talk TCP and UDP. 47 Bazel test targets prove it on every change.
 
@@ -241,6 +245,7 @@ Kernel command line (all optional):
 | `minikern.netboot[=<ip>]` | fetch the root filesystem over the network; with an address, probe only that one and never sweep |
 | `minikern.nbd=<ip>[:<port>][/<export>]` | attach a network block device as `/dev/nbd0` before init runs (port 10809 by default) |
 | `minikern.dns=<ip>` | the resolver `/etc/resolv.conf` should name, instead of the lease's |
+| `minikern.hangcheck=<seconds>` | panic with the task table when every core has been idle this long and something is still asleep — a lost wakeup reported instead of a silent hang |
 | `minikern.smp=off` | do not start the other three cores at all |
 | `minikern.smp=all` | let them schedule too — experimental, and known to hang (TASKS.md P10.3) |
 | `minikern.netstat=1` | print the interface, TCP and block-cache counters when init exits |

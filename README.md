@@ -37,16 +37,25 @@ net: eth0 10.0.2.15/24 gw 10.0.2.2 dns 10.0.2.3 (dhcp, lease 86400 s)
 net: 10.0.2.2 answered ping seq 1
 ```
 
-It is written for one core, with no libc and no libgcc. `memcpy`, 64-bit division,
-the formatter, the allocators, the TAR reader, the Ethernet driver, the IPv4 stack
-and the TCP state machine are all in this tree.
+It runs on **all four cores**, with no libc and no libgcc. `memcpy`, 64-bit division,
+the formatter, the allocators, the TAR reader, the Ethernet driver, the IPv4 stack,
+the TCP state machine, the NBD client, the XFS reader and the pipes are all in this
+tree.
 
-**What it is not.** There is no `fork` or `execve`, so no `os/exec` and no shell; one
-process is started and that is the system. There is no SMP (the kernel runs
-non-preemptible with interrupts masked, which is the lock on one core), no DNS
-resolver (dial an address), no IPv6, no filesystem writes — the root is read-only —
-and TCP has no congestion control, SACK or reassembly. Those limits are listed where
-they bite: `src/core/net/tcp.h`, `CLAUDE.md` §9, `TASKS.md`.
+A Go program can also **run another program**: `os/exec` works, with pipes, exit
+statuses and the environment. And Go sees four CPUs, because there are four — one
+lock around the kernel preserves what a single core guaranteed, and the parallelism
+it buys is in user space, where a Go program spends its time.
+
+**What it is not.** There is no shell and no package of userland tools; `/init` is
+the program you build. One core's worth of kernel runs at a time (that lock), there
+is no IPv6, no DHCP renewal, and TCP has no congestion control, SACK or reassembly.
+Filesystem writes are narrow on purpose: file data into blocks a file already owns,
+and the size that leaves behind — creating a file needs the allocator, which is not
+written. `execve` from a multi-threaded process is refused rather than supported.
+Frequency scaling is policy-complete but its two register writes have never run on
+silicon, so it is off unless asked for. Those limits are listed where they bite:
+`src/core/net/tcp.h`, `src/core/xfs/xfs.h`, `CLAUDE.md` §9, `TASKS.md`.
 
 ## Build and test
 
@@ -63,8 +72,8 @@ host Go is needed for them. TinyGo is optional — only the TinyGo targets need 
 it wants a host Go between 1.19 and 1.25, whose path is `TINYGO_GOROOT` in
 [`toolchain/paths.bzl`](toolchain/paths.bzl): **edit that line to your own install.**
 
-The image (`minikern.elf`, `.bin` and `.uImage`), the 30 host test targets, and the
-17 further ones that need QEMU, `qemu-nbd` or xfsprogs:
+The image (`minikern.elf`, `.bin` and `.uImage`), the 31 host test targets, and the
+20 further ones that need QEMU, `qemu-nbd` or xfsprogs:
 
 ```bash
 bazel build //:minikern
@@ -76,6 +85,8 @@ The QEMU tests shell out to host tools, so they are tagged `manual` and a wildca
 build never runs them — **run `:qemu_tests` by name after any change.** They cover
 both boot paths, the deliberate exceptions, a TinyGo and a gc hello-world, the Go ABI
 suite, 42 hostile syscalls, the network milestone, Go's sockets, a complete netboot,
+`os/exec` running a child end to end, four cores being used with every core's
+kernel entries counted, the frequency governor against a ramping fake sensor,
 every network test again under ASan and UBSan, our NBD client against `qemu-nbd` and
 our NBD server against `nbdinfo`, `nbdcopy` and `qemu-io`, the XFS reader against
 filesystems `mkfs.xfs` made, and the board formatting a filesystem over the network
@@ -167,13 +178,27 @@ syscall.Mount("/dev/nbd0", "/mnt", "xfs", syscall.MS_RDONLY, "")
 ```
 
 XFS was chosen because **Linux can check our work**: `mkfs.xfs` makes the test
-images, `xfs_repair -n` says whether what we wrote is still a valid filesystem, and
-`xfs_db` prints any structure in doubt. That is the standard the tests hold it to —
-including one in which the board formats a filesystem over the network and
-`xfs_repair` on the host finds nothing wrong with it. The reader is read-only and
-**refuses** anything it does not fully understand: a feature flag it has not heard
-of, a dirty log, a btree-format fork. [`XFS.md`](XFS.md) has the measured on-disk
-facts and the whole support matrix.
+images, `xfs_repair -n` says whether what we wrote is still a valid filesystem,
+`xfs_logprint` reads the log, and `xfs_db` prints any structure in doubt. That is
+the standard the tests hold it to — including one in which the board formats a
+filesystem over the network and `xfs_repair` finds nothing wrong with it, and
+another in which the board grows a file and four judges agree about the result,
+none of them ours:
+
+```
+TRANS: tid:0x6d6b7472  #items:1
+        INODE: #regs:2   ino:0x63  flags:0x1
+        CORE inode:
+                magic:IN  mode:0x81a4  ver:3  format:2
+                size:0x3ffd4  nblks:0x40  nextents:1
+```
+
+That is `xfs_logprint` decoding a transaction the board wrote: the file's new size,
+logged before it was written in place. Writes stay narrow and the reader **refuses**
+anything it does not fully understand — an unknown feature flag, a dirty log, a
+btree-format fork — because refusing is what keeps it non-destructive.
+[`XFS.md`](XFS.md) has the measured on-disk facts, the support matrix, and the four
+log facts that came out of `xfs_logprint` rather than any document.
 
 ## Writing an init
 

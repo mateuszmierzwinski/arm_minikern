@@ -1,6 +1,7 @@
 #include "kernel/exec.h"
 
 #include "arch/arm/layout.h"
+#include "arch/arm/trap.h"
 #include "arch/arm/mmu.h"
 #include "core/console.h"
 #include "core/elf.h"
@@ -167,22 +168,92 @@ static int start_thread(struct proc *p, uint32_t entry, uint32_t sp) {
     return KERR_OK;
 }
 
-/* Builds the process image in p from file. */
-static int load_program(struct proc *p, const uint8_t *data, uint32_t size, const struct ustack_args *args,
+/* Builds the program's whole image in mm, which need not be the current
+ * address space: every page is reached through the kernel's linear map. */
+static int load_program(struct mm *mm, const uint8_t *data, uint32_t size, const struct ustack_args *args,
                         uint32_t *entry, uint32_t *sp) {
     struct elf_image img;
     int rc = elf_parse(data, size, USER_TOP, &img);
     if (rc == KERR_OK) {
-        rc = load_segments(p->mm, &img, data);
+        rc = load_segments(mm, &img, data);
     }
     if (rc == KERR_OK) {
-        rc = build_stack(p->mm, &img, args, sp);
+        rc = build_stack(mm, &img, args, sp);
     }
     if (rc == KERR_OK) {
-        rc = map_sigpage(p->mm);
+        rc = map_sigpage(mm);
     }
     *entry = img.entry;
     return rc;
+}
+
+/* Signals that had a handler go back to their default, as execve requires:
+ * the new image never installed them and must not inherit them. One that was
+ * ignored stays ignored, which is Linux's rule too. */
+static void reset_handled_signals(struct proc *p) {
+    for (uint32_t i = 0; i < NSIG; i++) {
+        if (p->actions[i].handler != SIG_IGN_VALUE) {
+            p->actions[i] = (struct k_sigaction){0};
+        }
+    }
+}
+
+/* The start state of the replaced image: nothing of the old frame survives
+ * except the mode, because the new program shares no register with it. */
+static void enter_new_image(struct trapframe *tf, uint32_t entry, uint32_t sp) {
+    *tf = (struct trapframe){.pc = entry, .sp_usr = sp, .spsr = CPSR_USER};
+}
+
+/* Builds the new image off to the side, so that a failure can still be
+ * reported to a process running its old one. */
+static int build_image(const char *path, const struct ustack_args *args, struct mm **out, uint32_t *entry,
+                       uint32_t *sp) {
+    const uint8_t *data;
+    uint32_t size;
+    struct file *f;
+    struct mm *fresh;
+    int rc = open_image(path, &data, &size, &f);
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    fresh = mm_create();
+    rc = fresh == NULL ? KERR_NOMEM : load_program(fresh, data, size, args, entry, sp);
+    file_put(f);
+    if (rc != KERR_OK) {
+        mm_put(fresh);
+        return rc;
+    }
+    *out = fresh;
+    return KERR_OK;
+}
+
+int exec_replace(const char *path, const char *const *argv, uint32_t argc, const char *const *envp, uint32_t envc,
+                 struct trapframe *tf) {
+    struct ustack_args args = {.argv = argv, .argc = argc, .envp = envp, .envc = envc};
+    struct proc *p = proc_current();
+    struct mm *fresh = NULL;
+    uint32_t entry = 0, sp = 0;
+    /* The image is validated before the thread count is looked at, so that
+     * every error about the *file* is the errno Linux gives for it. Deciding
+     * the caller is unsupported first turned "no such file" and "not an
+     * ELF" into EAGAIN, which tells the caller nothing about what it asked
+     * for. */
+    int rc = build_image(path, &args, &fresh, &entry, &sp);
+    if (rc != KERR_OK) {
+        return rc; /* nothing has been committed: the old image runs on */
+    }
+    if (p->nthreads > 1) {
+        mm_put(fresh);
+        return KERR_AGAIN;
+    }
+    proc_adopt_mm(p, fresh);
+    proc_close_on_exec(p);
+    reset_handled_signals(p);
+    p->start_stack = sp;
+    proc_rename(p, argc > 0 ? argv[0] : path);
+    proc_vfork_done(p);
+    enter_new_image(tf, entry, sp);
+    return KERR_OK;
 }
 
 int exec_start(const char *path, const char *const *argv, uint32_t argc, const char *const *envp, uint32_t envc,
@@ -197,7 +268,7 @@ int exec_start(const char *path, const char *const *argv, uint32_t argc, const c
         return rc;
     }
     p = proc_create(argc > 0 ? argv[0] : path);
-    rc = p == NULL ? KERR_NOMEM : load_program(p, data, size, &args, &entry, &sp);
+    rc = p == NULL ? KERR_NOMEM : load_program(p->mm, data, size, &args, &entry, &sp);
     file_put(f);
     if (rc == KERR_OK) {
         p->start_stack = sp;

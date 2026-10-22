@@ -1,8 +1,10 @@
 /* sys_proc — process and thread syscalls: exit, exit_group, clone (threads),
  * the ids, set_tid_address, scheduling, limits, uname, prctl, getrandom,
  * and ARM's private set_tls and cacheflush. */
+#include "arch/arm/smp.h"
 #include "arch/arm/mmu.h"
 #include "core/errno.h"
+#include "kernel/exec.h"
 #include "kernel/mem.h"
 #include "kernel/proc.h"
 #include "kernel/random.h"
@@ -17,7 +19,18 @@
 #define CLONE_PARENT_SETTID  0x00100000u
 #define CLONE_CHILD_CLEARTID 0x00200000u
 #define CLONE_CHILD_SETTID   0x01000000u
+#define CLONE_VFORK          0x00004000u
+#define CLONE_PIDFD          0x00001000u
 #define CLONE_THREAD_MODEL   (CLONE_VM | CLONE_SIGHAND | CLONE_THREAD)
+
+/* How many arguments and how many bytes of them an execve may carry. The
+ * limits exist to be hit: an argument list is user-supplied input, and the
+ * one page it is copied into is the bound (CLAUDE.md §5, bounded parsing). */
+#define EXEC_MAX_ARGS  64u
+#define EXEC_ARG_BYTES 4096u
+
+#define WNOHANG 1u
+#define P_PIDFD 3u
 #define RLIMIT_STACK         3u
 #define RLIMIT_NOFILE        7u
 #define PR_SET_NAME          15u
@@ -54,15 +67,132 @@ static int32_t sys_set_tid_address(struct trapframe *tf) {
     return (int32_t)t->tid;
 }
 
+/* Where an execve's strings are copied to. One pool holds the arguments and
+ * the environment together, which is both the simpler thing and the right
+ * one: the limit a caller must respect is the total, as ARG_MAX is on Linux.
+ *
+ * It is static because 4 KiB must not go on an 8 KiB kernel stack, and that
+ * is safe for the reason every static buffer here is safe: one core is
+ * inside the kernel at a time (kernel/klock.h), and nothing between the
+ * first byte and the last sleeps. */
+struct arg_pool {
+    char buf[EXEC_ARG_BYTES];
+    uint32_t used;
+};
+
+/* Copies a NULL-terminated user vector of user strings into the pool,
+ * filling out[] with pointers into it.
+ *
+ * The pool is a parameter rather than a local static because argv and envp
+ * are two calls into one storage: sharing a buffer but restarting at its
+ * beginning made the environment overwrite the arguments, and the child
+ * execed with "HOME=/" as its program name. */
+static int copy_string_vector(struct arg_pool *pool, uint32_t uvec, const char **out, uint32_t cap,
+                              uint32_t *count) {
+    struct mm *mm = proc_current()->mm;
+    uint32_t n = 0;
+    for (; uvec != 0 && n < cap; n++) {
+        uint32_t ptr = 0;
+        int rc = mm_copy_in(mm, &ptr, uvec + n * 4u, 4);
+        if (rc != KERR_OK) {
+            return rc;
+        }
+        if (ptr == 0) {
+            break;
+        }
+        if (pool->used >= sizeof pool->buf) {
+            return KERR_2BIG;
+        }
+        rc = mm_copy_string_in(mm, pool->buf + pool->used, ptr, (uint32_t)(sizeof pool->buf - pool->used));
+        if (rc < 0) {
+            return rc == KERR_NAMETOOLONG ? KERR_2BIG : rc;
+        }
+        out[n] = pool->buf + pool->used;
+        pool->used += (uint32_t)rc + 1u;
+    }
+    if (n == cap) {
+        return KERR_2BIG;
+    }
+    *count = n;
+    return KERR_OK;
+}
+
+/* execve: the arguments are copied out of the address space before anything
+ * replaces it, because by the end of this they are pointers into memory that
+ * no longer exists (kernel/exec.h). */
+static int32_t sys_execve(struct trapframe *tf) {
+    static struct arg_pool pool;
+    static char path[256];
+    const char *argv[EXEC_MAX_ARGS];
+    const char *envp[EXEC_MAX_ARGS];
+    uint32_t argc = 0, envc = 0;
+    pool.used = 0;
+    /* mm_copy_string_in answers with the string's **length**, not KERR_OK
+     * (mm.h). Reading it as a status made execve "fail" with 5 for a
+     * five-character path — and because a successful execve never returns,
+     * Go's child read that as an error with errno 0 and killed itself. */
+    int rc = mm_copy_string_in(proc_current()->mm, path, tf->r[0], sizeof path);
+    rc = rc < 0 ? rc : KERR_OK;
+    if (rc == KERR_OK) {
+        rc = copy_string_vector(&pool, tf->r[1], argv, EXEC_MAX_ARGS, &argc);
+    }
+    if (rc == KERR_OK) {
+        rc = copy_string_vector(&pool, tf->r[2], envp, EXEC_MAX_ARGS, &envc);
+    }
+    if (rc != KERR_OK) {
+        return rc;
+    }
+    return exec_replace(path, argv, argc, envp, envc, tf);
+}
+
+/* wait4: reaps one ended child and reports how it ended. rusage is accepted
+ * and ignored, which is what every caller here does with it. */
+static int32_t sys_wait4(struct trapframe *tf) {
+    uint32_t status = 0;
+    int rc = proc_wait(tf->r[0], (tf->r[2] & WNOHANG) != 0, &status);
+    if (rc == KERR_AGAIN && (tf->r[2] & WNOHANG) != 0) {
+        return 0; /* WNOHANG with nothing to report is 0, not an error */
+    }
+    if (rc < 0) {
+        return (int32_t)rc;
+    }
+    if (tf->r[1] != 0 && mm_copy_out(proc_current()->mm, tf->r[1], &status, 4) != KERR_OK) {
+        return KERR_FAULT;
+    }
+    return (int32_t)rc;
+}
+
+/* pidfd_open: refused on purpose, and refused by name so that the log does
+ * not report it as a syscall nobody has thought about.
+ *
+ * A pidfd is a descriptor standing for a process, which solves a problem
+ * this kernel does not have: nothing here recycles a pid while a parent
+ * still holds it. Go probes for one, takes ENOSYS for an answer and uses
+ * wait4 instead — measured, not assumed (CLAUDE.md §7). */
+static int32_t sys_pidfd_open(struct trapframe *tf) {
+    (void)tf;
+    return KERR_NOSYS;
+}
+
+/* waitid, for the one use it is put to here: Go probes whether it can wait
+ * on a pidfd before it tries to make one. There are none, so the honest
+ * answer is that there is no such child — which is what Linux answers too
+ * when the descriptor is not one (measured, CLAUDE.md §7). */
+static int32_t sys_waitid(struct trapframe *tf) {
+    return tf->r[0] == P_PIDFD ? KERR_CHILD : KERR_NOSYS;
+}
+
 static int32_t sys_sched_yield(struct trapframe *tf) {
     (void)tf;
     sched_yield();
     return 0;
 }
 
-/* One CPU: the mask is a single word with bit 0 set. Returns its size. */
+/* The cores the scheduler is really using, as a one-word mask. Returns its
+ * size, as Linux does. Go reads this to size GOMAXPROCS, so reporting one
+ * core while running four would waste exactly the parallelism SMP bought. */
 static int32_t sys_sched_getaffinity(struct trapframe *tf) {
-    uint32_t mask = 1;
+    uint32_t mask = (1u << smp_scheduling()) - 1u;
     if (tf->r[1] < sizeof mask) {
         return KERR_INVAL;
     }
@@ -92,12 +222,69 @@ static struct task *clone_thread(struct trapframe *tf, uint32_t flags) {
 }
 
 /* clone(flags, newsp, parent_tid, tls, child_tid): threads only. */
+/* The child of a vfork: a process of its own sharing the parent's address
+ * space, with one thread that returns 0 from this same syscall on the same
+ * user stack. The parent is then suspended until the child execs or exits,
+ * which is what makes sharing a stack safe — and why the suspension is not
+ * optional (proc.h).
+ *
+ * Go's `os/exec` asks for exactly this (`CLONE_VM | CLONE_VFORK`), measured
+ * on linux/arm; see CLAUDE.md §7. */
+static int32_t clone_vfork(struct trapframe *tf, uint32_t flags) {
+    struct proc *parent = proc_current();
+    struct proc *child = proc_vfork(parent, parent->name);
+    struct task *t = child == NULL ? NULL : sched_new_task(child);
+    struct trapframe *ctf;
+    if (t == NULL) {
+        return KERR_AGAIN;
+    }
+    ctf = sched_trapframe(t);
+    *ctf = *tf;
+    ctf->r[0] = 0;
+    ctf->sp_usr = tf->r[1] != 0 ? tf->r[1] : tf->sp_usr;
+    t->tls = sched_current()->tls;
+    arm_vfp_save(&t->vfp);
+    proc_attach_thread(child, t);
+    sched_start(t);
+    /* The child's struct outlives its exit — it becomes a zombie, because
+     * this parent has not reaped it yet — so waiting on a flag inside it is
+     * safe. Uninterruptible: a vfork parent that woke early would run on a
+     * stack the child is still using. */
+    while ((flags & CLONE_VFORK) != 0 && child->vfork_pending) {
+        (void)sched_sleep(&child->ppid, 0, 0, false);
+    }
+    return (int32_t)child->pid;
+}
+
 static int32_t sys_clone(struct trapframe *tf) {
     uint32_t flags = tf->r[0];
-    struct mm *mm = proc_current()->mm;
+    struct proc *self = proc_current();
+    struct mm *mm = self->mm;
     struct task *child;
+    /* A thread must not be born into a group that is already ending.
+     *
+     * exit_group marks its siblings and they stop at their next entry into
+     * the kernel, so a clone can be in flight on another core while the
+     * sweep runs: the new thread then arrives *after* it, keeps the thread
+     * count above zero, and the process never ends — its parent waits in
+     * wait4 for ever and every core goes idle. The caller is itself marked
+     * dead and exits on its way back to user mode, so refusing here costs
+     * it nothing. Found by the hang check printing the task table: a
+     * sleeping thread belonging to a process with no other threads. */
+    if (self->exiting) {
+        return KERR_AGAIN;
+    }
+    if ((flags & CLONE_PIDFD) != 0) {
+        /* No pidfds here. Go asks for one first and falls back when it is
+         * refused, which is measured behaviour, not a hope: see the trace in
+         * CLAUDE.md §7. */
+        return KERR_INVAL;
+    }
+    if ((flags & CLONE_THREAD) == 0 && (flags & CLONE_VM) != 0) {
+        return clone_vfork(tf, flags);
+    }
     if ((flags & CLONE_THREAD_MODEL) != CLONE_THREAD_MODEL) {
-        return KERR_NOSYS;  /* fork and friends: not yet */
+        return KERR_NOSYS;  /* a fork with its own address space: not yet */
     }
     child = clone_thread(tf, flags);
     if (child == NULL) {
@@ -217,6 +404,10 @@ const struct syscall_entry sys_proc_table[] = {
     {202, "getegid32", sys_zero},
     {224, "gettid", sys_gettid},
     {241, "sched_setaffinity", sys_zero},
+    {11, "execve", sys_execve},
+    {114, "wait4", sys_wait4},
+    {280, "waitid", sys_waitid},
+    {434, "pidfd_open", sys_pidfd_open},
     {242, "sched_getaffinity", sys_sched_getaffinity},
     {248, "exit_group", sys_exit_group},
     {256, "set_tid_address", sys_set_tid_address},

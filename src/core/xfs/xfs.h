@@ -166,7 +166,7 @@ int xfs_file_read(struct xfs *fs, const struct xfs_inode *ip, uint64_t off, void
  *
  * The write goes through the buffer cache and is not durable until
  * xfs_flush. */
-int xfs_file_write(struct xfs *fs, const struct xfs_inode *ip, uint64_t off, const void *buf,
+int xfs_file_write(struct xfs *fs, struct xfs_inode *ip, uint64_t off, const void *buf,
                    uint32_t len, uint32_t *put);
 
 /* Makes everything written durable: the cache, then the device. */

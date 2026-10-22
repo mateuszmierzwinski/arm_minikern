@@ -42,6 +42,11 @@ uint32_t smp_start_secondaries(void);
  * scheduling. Called once, at the end of boot, by the core that booted. */
 void smp_release(void);
 
+/* How many cores the scheduler may actually use: every core that has been
+ * released into it, or 1 before that. This is what user space is told when
+ * it asks how many CPUs it has, and Go sizes GOMAXPROCS from it. */
+uint32_t smp_scheduling(void);
+
 /* How many cores have reported themselves, including this one. */
 uint32_t smp_online(void);
 
