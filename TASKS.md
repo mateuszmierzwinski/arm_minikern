@@ -92,11 +92,23 @@ Legend: `[x]` done · `[ ]` to do · `[~]` partial
       (`TOOLS_LIBCRYPTO`/`TOOLS_KWBIMAGE`: no `openssl/engine.h`;
       `TOOLS_MKEFICAPSULE`: no gnutls) plus the assembly `binman` can no longer do
       (setuptools 81 dropped `pkg_resources`). No U-Boot code enters this repository.
-      **What is left, and why it cannot be done here:** the banner on the NEO's debug
-      header, and with it the EMAC's clock/reset/PHY-select bits, the thermal sensor
-      and the PIO pin for VDD_CPUX — QEMU models none of them, so
-      `minikern.cpufreq=on` has still never run on silicon. That needs the board, a
-      3.3 V serial adapter and root to write a card.
+      **The report, and what it narrowed.** `minikern.hwreport=1` prints every value
+      this kernel took from the datasheet **beside what the datasheet says it should
+      be**, so powering a board up produces one artefact a reader can check instead of
+      a vague instruction to try it. Writing it showed that "the EMAC's
+      clock/reset/PHY-select bits are unverified" had been three things lumped into
+      one: the **gates and resets live in the clock block, which QEMU models**, so the
+      bits the driver sets are now read back and compared with the datasheet in
+      `hwreport_qemu_test` — all four correct. Only the **system-control register that
+      selects the internal PHY** (`01c00030`) has no model.
+      **What is left, and why it cannot be done here** — three registers and a pin:
+      the syscon PHY-select register, the thermal sensor's constants (QEMU models no
+      sensor; both `0` and `0xfff` are refused as "no sensor", which is what it reads
+      here), and the PIO pin for VDD_CPUX (QEMU models no PIO). So
+      `minikern.cpufreq=on` has still never read a real temperature or moved a real
+      regulator, and the banner has never appeared on the NEO's own header. That needs
+      the board, a 3.3 V serial adapter and root to write a card — and then one
+      command: boot the card with `minikern.hwreport=1` and read the report.
 - [x] **P0.10 Version stamp (2026-10-22).** The build part of `MAJOR.MINOR.BUILD`
       is Bazel's own build timestamp, written into a generated C file by the
       `build_stamp` rule; the series comes from the monorepo's one constant as

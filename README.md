@@ -276,12 +276,34 @@ picocom -b 115200 /dev/ttyUSB0
 The card's layout is U-Boot at 8 KiB (sector 16, where the BROM looks), and one FAT
 partition at 1 MiB holding `minikern.uImage`, `rootfs.uImage` and `boot.scr`.
 
-### What the board still has to settle
+### What the board still has to settle, and the one command for it
 
-The EMAC's clock, reset and PHY-select bits (`EMAC_EPHY_CLK_REG`) are not modelled by
-QEMU at all, and neither is the thermal sensor or the PIO, so the frequency
-governor's hardware path (`minikern.cpufreq=on`) and the VDD_CPUX pin have never run
-on silicon. Those are the measurements the board is for.
+Boot the card with `minikern.hwreport=1` and send the report back. It prints every
+value this kernel took from the datasheet **beside what the datasheet says it should
+be**, so a mismatch is visible to someone reading a serial log who has never seen the
+code:
+
+```
+hw: midr 410fc075 (datasheet: 410fc075, Cortex-A7 r0p5)
+hw: cntfrq 24000000 Hz (datasheet: 24000000 on silicon; QEMU's -kernel path says 62500000)
+hw: ccu bus_gate0 00020000 (EMAC gate is bit 17, expected set)
+hw: syscon ephy_clk ........ at 01c00030 — the register QEMU does not model
+hw: ths sample 0: raw ... -> ..... mC (plausible at room temperature: 20000-45000)
+```
+
+Three registers and a pin are all that is left unverified, and they are the ones with
+no model to check them against:
+
+- **`EMAC_EPHY_CLK_REG` (`0x01C00030`)**, which selects the internal PHY, powers it
+  and sets its MDIO address. On a board this register is the difference between "link
+  up" and nothing. (The EMAC's clock gates and resets are *not* in this category —
+  they live in the clock block, which QEMU does model, and all four are verified.)
+- **The thermal sensor's offset and slope.** QEMU models no sensor, so the constants
+  have never been compared with a real temperature. Both `0` and `0xfff` are refused
+  as "no sensor", so a wrong reading cannot quietly drive the governor.
+- **The PIO pin that switches VDD_CPUX** (`minikern.vddcpux=`), since QEMU models no
+  PIO. Without it the operating points above 816 MHz are not offered at all, which is
+  the safe direction to be wrong in.
 
 ## Documentation
 

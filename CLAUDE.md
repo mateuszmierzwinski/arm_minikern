@@ -67,7 +67,7 @@ the filesystem one `mkfs.xfs` made — and a write that grows a file into blocks
 it already owns goes through the **log**, as a transaction `xfs_logprint`
 decodes field by field (XFS.md §9).
 
-**The goal is met in QEMU:** a standard `GOOS=linux GOARCH=arm` Go binary, and a TinyGo one, run unchanged on a kernel that copies no Linux code — and a Go program can now fetch its own root filesystem over the network and talk TCP and UDP. 63 Bazel test targets prove it on every change.
+**The goal is met in QEMU:** a standard `GOOS=linux GOARCH=arm` Go binary, and a TinyGo one, run unchanged on a kernel that copies no Linux code — and a Go program can now fetch its own root filesystem over the network and talk TCP and UDP. 64 Bazel test targets prove it on every change.
 
 ---
 
@@ -134,6 +134,10 @@ kernel on 2026-10-21:
 - CCU `0x01C20000`. EMAC clock gate is `BUS_CLK_GATING_REG0` (`+0x60`) bit 17, and its
   reset is `BUS_SOFT_RST_REG0` (`+0x2C0`) bit 17. The internal PHY's gate is
   `BUS_CLK_GATING_REG4` (`+0x70`) bit 0 and its reset `BUS_SOFT_RST_REG2` (`+0x2C8`) bit 2.
+  **All four verified against QEMU's clock model** (`hwreport_qemu_test`, 2026-10-22):
+  the driver sets exactly those bits and they read back. They had been written off as
+  "unverified on silicon" together with the PHY-select register, which was three
+  things treated as one — the gates and resets are in the block QEMU models.
 - System-control `EMAC_EPHY_CLK_REG` (`0x01C00030`) selects the internal PHY,
   powers it up and sets its MDIO address (1). The bit layout must be checked against
   the datasheet. This register is the difference between "link up" and "nothing" on
@@ -233,6 +237,7 @@ green. `:qemu_tests` is a `test_suite` naming them all:
 | `entropy_qemu_test` | two boots of one image produce different random bytes |
 | `cpuoff_qemu_test` | idle cores power themselves off and come back, four cores still offered, same result |
 | `cpufreq_qemu_test` | P11: the governor against a ramping fake sensor, with and without a supply pin |
+| `hwreport_qemu_test` | P0.9: the hardware report is complete, and the EMAC's four clock/reset bits read back as the datasheet says |
 | `cpuclock_qemu_test` | P11: the **real** clock adapter against QEMU's clock block — every operating point set and read back from `PLL_CPUX`, and every refusal |
 | `sdboot_qemu_test` | P0.9: the real chain — BROM → SPL → U-Boot → `boot.scr` → `bootm` with U-Boot's device tree → a Go program from the ramdisk, all from the card image that would be written to a board |
 
@@ -262,6 +267,7 @@ Kernel command line (all optional):
 | `minikern.ip=<addr>/<prefix>` | bring the interface up with this address and run no DHCP client (with `minikern.gw=` beside it) |
 | `minikern.mac=<xx:xx:xx:xx:xx:xx>` | use this hardware address instead of the one derived from the chip's serial number — needed for two QEMU guests, which share a serial number |
 | `minikern.dns=<ip>` | the resolver `/etc/resolv.conf` should name, instead of the lease's |
+| `minikern.hwreport=1` | print every value this kernel took from the datasheet, beside what it should be — the one command to run on a real board |
 | `minikern.hangcheck=<seconds>` | panic with the task table when every core has been idle this long and something is still asleep — a lost wakeup reported instead of a silent hang |
 | `minikern.cpuoff=1` | let an idle core power itself off with PSCI CPU_OFF, started again when work appears (the boot core never parks) |
 | `minikern.smp=off` | do not start the other three cores at all |

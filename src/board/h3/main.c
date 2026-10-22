@@ -14,6 +14,7 @@
 #include "arch/arm/trap.h"
 #include "board/h3/emac.h"
 #include "board/h3/h3.h"
+#include "board/h3/hwreport.h"
 #include "board/h3/rtc.h"
 #include "board/h3/sid.h"
 #include "board/h3/uart.h"
@@ -765,6 +766,9 @@ void kmain(uint32_t r0, uint32_t machine, uint32_t r2, uint32_t entry_cpsr) {
     bring_up_network();
     syscall_set_trace(cmdline_equals(boot_cmdline, "minikern.strace", "1"));
     sched_set_hangcheck((uint32_t)cmdline_number("minikern.hangcheck", 0));
+    if (cmdline_equals(boot_cmdline, "minikern.hwreport", "1")) {
+        h3_hwreport();
+    }
     bring_up_cpufreq();
     bring_up_watchdog();
     maybe_selftest(boot_cmdline);

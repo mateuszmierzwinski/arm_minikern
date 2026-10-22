@@ -309,6 +309,7 @@ cc_library(
         "src/board/h3/emac.c",
         "src/board/h3/main.c",
         "src/board/h3/pio.c",
+        "src/board/h3/hwreport.c",
         "src/board/h3/rtc.c",
         "src/board/h3/sid.c",
         "src/board/h3/ths.c",
@@ -319,6 +320,7 @@ cc_library(
         "src/board/h3/cpux.h",
         "src/board/h3/emac.h",
         "src/board/h3/h3.h",
+        "src/board/h3/hwreport.h",
         "src/board/h3/pio.h",
         "src/board/h3/rtc.h",
         "src/board/h3/sid.h",
@@ -970,6 +972,17 @@ sh_test(
     tags = ["manual"],
 )
 
+# P0.9: the hardware report — and the EMAC clock/reset bits, which the clock
+# block models and so can be checked without the board.
+sh_test(
+    name = "hwreport_qemu_test",
+    size = "medium",
+    srcs = ["test/hwreport_qemu_test.sh"],
+    args = ["$(rootpath :minikern.uImage)"],
+    data = [":minikern.uImage"],
+    tags = ["manual"],
+)
+
 # P11: the real clock adapter against QEMU's clock block — the half of the
 # frequency-scaling hardware path that does have a model to judge it.
 sh_test(
@@ -1301,6 +1314,7 @@ test_suite(
         ":go_hello_qemu_test",
         ":cpufreq_qemu_test",
         ":cpuclock_qemu_test",
+        ":hwreport_qemu_test",
         ":cpuoff_qemu_test",
         ":sdboot_qemu_test",
         ":entropy_qemu_test",
