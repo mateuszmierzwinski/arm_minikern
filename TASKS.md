@@ -117,12 +117,26 @@ Legend: `[x]` done · `[ ]` to do · `[~]` partial
       measurement decide, and they read hotter, so the error throttles early — and the
       report prints **both** for every sample, so one reading from a room of a known
       temperature settles it rather than leaving it to be argued.
-      **What is left, and why it cannot be done here** — two registers, one constant
-      and a pin: the syscon PHY-select register (`01c00030`, QEMU stubs that block),
-      which of the two temperature conversions the silicon actually means, whether the
-      sensor then produces samples at all, and the PIO pin for VDD_CPUX (QEMU models no
-      PIO). So `minikern.cpufreq=on` has still never read a real temperature or moved a
-      real regulator, and the banner has never appeared on the NEO's own header. That
+      **The VDD_CPUX pin is off the list, and not by being verified: the NEO has no
+      such pin.** Its device tree declares no CPU supply regulator at all, where boards
+      that have one declare a `regulator-gpio` named `vdd-cpux` — the Orange Pi One's
+      is on PL6, 1.1 V to 1.3 V, the two levels `cpux.c` already assumed. So the three
+      operating points up to 816 MHz are **the board**, not a limitation of this
+      kernel, and there was never a measurement to take here.
+      Finding that out exposed a worse bug behind it: the pin on the boards that *do*
+      have one is on **PL**, a port in the other pin controller, and `gpio_parse`
+      accepted only PA..PH — so the one pin name anyone would ever pass was rejected as
+      a typo, silently, since a rejected name just means three operating points. A unit
+      test had **asserted** `PL0` was invalid ("PL is past PH on this chip": true of
+      the main controller, wrong about the chip), which pinned the bug in place. PL now
+      routes to the always-on controller at `0x01F02C00`, with its R_CCU gate ungated
+      first — the same trap the sensor fell into.
+      **What is left, and why it cannot be done here** — one register and one constant:
+      the syscon PHY-select register (`01c00030`; QEMU stubs that block, so the write
+      is dropped and the readback is the reset value), and which of the two temperature
+      conversions the silicon means, which is the same question as whether the sensor
+      produces samples at all. So `minikern.cpufreq=on` has still never read a real
+      temperature, and the banner has never appeared on the NEO's own header. That
       needs the board, a 3.3 V serial adapter and root to write a card — and then one
       command: boot the card with `minikern.hwreport=1` and read the report.
 - [x] **P0.10 Version stamp (2026-10-22).** The build part of `MAJOR.MINOR.BUILD`

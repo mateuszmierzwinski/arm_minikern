@@ -142,6 +142,14 @@ kernel on 2026-10-21:
   powers it up and sets its MDIO address (1). The bit layout must be checked against
   the datasheet. This register is the difference between "link up" and "nothing" on
   real hardware, while QEMU does not model it at all.
+- **Pin controllers: there are two.** PA..PH are the main one (`0x01C20800`); **PL is
+  port 0 of the always-on one** (`0x01F02C00`), which needs its clock ungated from the
+  R_CCU (`0x01F01400 + 0x28`, bit 0) first. That matters because **the CPU-supply
+  switch on every H3 board that has one is on PL** — the Orange Pi One's is PL6, 1.1 V
+  to 1.3 V. **The NanoPi NEO has no CPU supply regulator at all**, so its three
+  operating points up to 816 MHz are the board rather than a limitation of this
+  kernel. (Established from the device trees of an implementation that runs on this
+  hardware, 2026-10-22; see §10.)
 - **Thermal sensor (`0x01C25000`)**: needs its bus clock ungated (`0x068` bit 8), its
   reset released (`0x2D0` bit 8) and its module clock enabled (`0x074` bit 31, divider
   0 for 24 MHz) before any of its registers mean anything. **This kernel did none of
@@ -665,6 +673,16 @@ syscall interface above. No `/proc/sys` tree is wanted.
   `test/tools/netecho`, a Go program, and verify the host side independently first.
 - **`filter-dump` cannot attach to a board's built-in NIC**, so there is no easy
   pcap of the EMAC. `minikern.netstat=1` and the TCP counters exist for that reason.
+- **A feature can be unusable on every board it was written for, silently.**
+  `minikern.vddcpux=<pin>` exists to unlock the operating points above 816 MHz. The
+  pin that does that is on **PL** on every H3 board that has one, and `gpio_parse`
+  accepted only PA..PH — so the single pin name anyone would ever pass was rejected as
+  a typo, and a rejected name just means "three operating points", which looks like
+  normal operation. Worse, a unit test **asserted** `PL0` was invalid, with the
+  comment "PL is past PH on this chip": true of the main pin controller, wrong about
+  the chip, and it pinned the bug in place. Meanwhile the NEO this kernel targets has
+  no such regulator at all, so the feature had no board it worked on. A test that
+  encodes an assumption protects the assumption, not the user.
 - **A driver can be complete and still never have been switched on.** `ths.c` wrote
   the thermal sensor's control registers without ungating its bus clock, releasing its
   reset or starting its module clock — none of which QEMU models, so nothing could show

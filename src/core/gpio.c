@@ -4,9 +4,15 @@ static bool is_digit(char c) {
     return c >= '0' && c <= '9';
 }
 
-/* The port letter's index, or -1. */
+/* The port letter's index, or -1. PA..PH are the main controller; **PL** is
+ * the always-on one, and is accepted because that is where a board's
+ * CPU-supply switch is (gpio.h). The letters between H and L have no
+ * controller on this chip and are refused. */
 static int port_of(char c) {
     char up = c >= 'a' && c <= 'z' ? (char)(c - 'a' + 'A') : c;
+    if (up == 'L') {
+        return (int)GPIO_PORT_L;
+    }
     return up >= 'A' && up < (char)('A' + GPIO_PORTS) ? up - 'A' : -1;
 }
 

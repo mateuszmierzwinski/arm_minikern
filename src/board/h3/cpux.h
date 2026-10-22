@@ -29,12 +29,27 @@
 /* Names the pin that switches VDD_CPUX, which unlocks the operating points
  * the lower supply cannot feed.
  *
- * Which pin it is belongs to the board, not the chip: it is in the
- * schematic in front of you and differs between boards that share this
- * H3, so it is given on the kernel command line
- * (`minikern.vddcpux=`) rather than compiled in as a guess. Without it,
- * only the points the fixed supply can feed are offered — which is the
- * safe direction to be wrong in. */
+ * Which pin it is belongs to the board, not the chip, so it is given on the
+ * kernel command line (`minikern.vddcpux=`) rather than compiled in as a
+ * guess. Without it, only the points the fixed supply can feed are offered
+ * — the safe direction to be wrong in.
+ *
+ * **Two board facts, both established 2026-10-22 from the device trees of
+ * an implementation that runs on this hardware:**
+ *
+ * The **NanoPi NEO has no such pin.** Its device tree declares no CPU
+ * supply regulator at all, where boards that have one declare a
+ * `regulator-gpio` named `vdd-cpux` (the Orange Pi One's is on **PL6**,
+ * 1.1 V to 1.3 V — the two levels this file already assumed). So on the
+ * NEO the three operating points up to 816 MHz are not a limitation of
+ * this kernel: they are the board, and `minikern.vddcpux=` has nothing to
+ * name.
+ *
+ * And the pin is on **PL**, a port in the *other* pin controller — which
+ * this kernel's parser rejected outright until it was told about it
+ * (core/gpio.h). The feature was therefore unusable on every board that
+ * has the thing it was written for, and the failure was silent: a rejected
+ * pin name just means three operating points. */
 void h3_cpuclock_use_vdd_pin(struct gpio_pin pin);
 
 /* The port over the real PLL and regulator. */

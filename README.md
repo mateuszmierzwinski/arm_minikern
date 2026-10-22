@@ -310,9 +310,13 @@ no model to check them against:
   they live in the clock block, which QEMU models, and all three are verified. They
   were also missing entirely until 2026-10-22, which would have presented on a board
   as a sensor that never produced a reading.)
-- **The PIO pin that switches VDD_CPUX** (`minikern.vddcpux=`), since QEMU models no
-  PIO. Without it the operating points above 816 MHz are not offered at all, which is
-  the safe direction to be wrong in.
+**Not** the CPU supply pin: the NanoPi NEO has no CPU supply regulator at all — its
+device tree declares none, where boards that have one declare a `regulator-gpio` named
+`vdd-cpux` (the Orange Pi One's is PL6, 1.1 V to 1.3 V). So on a NEO the three
+operating points up to 816 MHz are the board, not a limitation of this kernel, and
+`minikern.vddcpux=` has nothing to name. On a board that does have one, the pin is on
+PL, which is a port in the other pin controller — supported since 2026-10-22, and
+rejected as a typo before that.
 
 ## Documentation
 
